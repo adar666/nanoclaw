@@ -22,6 +22,11 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 const registry = new Map<string, ChannelRegistration>();
 const activeAdapters = new Map<string, ChannelAdapter>();
 
+/** The setupFn passed to initChannelAdapters, retained so
+ *  restartChannelAdapters can rebuild the same ChannelSetup (onInbound /
+ *  onInboundEvent / onMetadata / onAction closures) for a forced reconnect. */
+let storedSetupFn: ((adapter: ChannelAdapter) => ChannelSetup) | null = null;
+
 /** Register a channel adapter factory. Called by channel modules on import. */
 export function registerChannelAdapter(name: string, registration: ChannelRegistration): void {
   registry.set(name, registration);
@@ -233,6 +238,7 @@ export function getChannelContainerConfig(name: string): ChannelRegistration['co
  * Skips adapters that return null (missing credentials).
  */
 export async function initChannelAdapters(setupFn: (adapter: ChannelAdapter) => ChannelSetup): Promise<void> {
+  storedSetupFn = setupFn;
   for (const [name, registration] of registry) {
     try {
       const adapter = await registration.factory();
@@ -294,4 +300,34 @@ export async function teardownChannelAdapters(): Promise<void> {
     }
   }
   activeAdapters.clear();
+}
+
+/**
+ * Force every active adapter to tear down and re-establish its connection
+ * in place — same registry key, same ChannelSetup closures (rebuilt via the
+ * setupFn stored by initChannelAdapters). Does not touch the registry or
+ * re-run adapter factories.
+ *
+ * For polling adapters (e.g. Telegram) this is the only way to recover from
+ * a silently-dead long-poll socket: after a host process is suspended and
+ * resumed (laptop sleep/wake), an in-flight HTTP request's TCP connection
+ * can be gone with no local error — nothing tells Node the socket died, so
+ * the adapter sits "connected" forever without receiving updates. Call this
+ * when something external (the wake watchdog) detects that condition.
+ */
+export async function restartChannelAdapters(reason: string): Promise<void> {
+  if (!storedSetupFn) {
+    log.warn('restartChannelAdapters called before any adapter started — skipping', { reason });
+    return;
+  }
+  const setupFn = storedSetupFn;
+  for (const [key, adapter] of activeAdapters) {
+    try {
+      await adapter.teardown();
+      await adapter.setup(setupFn(adapter));
+      log.info('Channel adapter reconnected', { channel: key, reason });
+    } catch (err) {
+      log.error('Failed to reconnect channel adapter', { channel: key, reason, err });
+    }
+  }
 }

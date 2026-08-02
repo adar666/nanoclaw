@@ -557,6 +557,13 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
 
     async teardown() {
       gatewayAbort?.abort();
+      // chat.shutdown() only calls adapter.disconnect(), which polling
+      // adapters like Telegram's don't implement — it never actually stops
+      // an in-progress long-poll. Without this, a stuck poll survives
+      // teardown+setup: startPolling() no-ops while pollingActive is still
+      // true, so a forced reconnect (see restartChannelAdapters) would be a
+      // silent no-op after a real network stall (e.g. system sleep/wake).
+      await (adapter as { stopPolling?: () => Promise<void> }).stopPolling?.();
       await chat.shutdown();
       log.info('Chat SDK bridge shut down', { adapter: adapter.name });
     },
