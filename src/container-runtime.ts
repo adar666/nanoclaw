@@ -3,7 +3,6 @@
  * All runtime-specific logic lives here so swapping runtimes means changing one file.
  */
 import { execSync } from 'child_process';
-import os from 'os';
 
 import { CONTAINER_INSTALL_LABEL } from './config.js';
 import { log } from './log.js';
@@ -13,11 +12,13 @@ export const CONTAINER_RUNTIME_BIN = 'docker';
 
 /** CLI args needed for the container to resolve the host gateway. */
 export function hostGatewayArgs(): string[] {
-  // On Linux, host.docker.internal isn't built-in — add it explicitly
-  if (os.platform() === 'linux') {
-    return ['--add-host=host.docker.internal:host-gateway'];
-  }
-  return [];
+  // Explicit even on macOS/Windows: Docker Desktop normally resolves
+  // host.docker.internal via its embedded DNS server, but a custom `dns`
+  // override in daemon.json (e.g. corporate/VPN resolvers) bypasses that
+  // resolver entirely. `host-gateway` is a documented sentinel supported
+  // on all platforms since Docker 20.10 and is a no-op when the magic
+  // name already resolves.
+  return ['--add-host=host.docker.internal:host-gateway'];
 }
 
 /** Returns CLI args for a readonly bind mount. */
