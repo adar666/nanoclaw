@@ -121,3 +121,35 @@ export function getCurrentInReplyTo(): string | null {
   if (!Number.isFinite(age) || age > IN_REPLY_TO_MAX_AGE_MS) return null;
   return row.value;
 }
+
+/**
+ * Did `send_message`/`send_file` fire since the last time this was
+ * consumed? Same cross-process problem as IN_REPLY_TO_KEY above: the MCP
+ * tools (mcp-tools/core.ts) run in a separate subprocess from the poll
+ * loop that reads this, so it has to go through outbound.db, not module
+ * state.
+ *
+ * Exists to fix a real duplicate-reply bug: dispatchResultText's
+ * `hasUnwrapped` check (poll-loop.ts) only sees text-block `<message>`
+ * sends parsed from the FINAL turn text — it has no idea a mid-turn
+ * `send_message` tool call already delivered the actual answer. A model
+ * that calls send_message and then naturally appends a short unwrapped
+ * closing remark (typical LLM behavior after a tool call) used to get
+ * told "your response was not delivered — please re-send it wrapped,"
+ * and would comply by re-wrapping and re-sending essentially the same
+ * content as a second message. Consuming this flag at the 'result'
+ * checkpoint suppresses that nudge whenever a tool delivery already
+ * happened this turn — read-and-clear, so it never leaks into a later,
+ * genuinely separate turn's check.
+ */
+const TOOL_DELIVERED_KEY = 'tool_delivered_since_last_result';
+
+export function markToolDelivery(): void {
+  setValue(TOOL_DELIVERED_KEY, '1');
+}
+
+export function consumeToolDelivery(): boolean {
+  const delivered = getValue(TOOL_DELIVERED_KEY) === '1';
+  if (delivered) deleteValue(TOOL_DELIVERED_KEY);
+  return delivered;
+}

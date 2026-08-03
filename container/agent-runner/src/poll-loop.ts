@@ -11,6 +11,7 @@ import { getInboundDb, touchHeartbeat, clearStaleProcessingAcks } from './db/con
 import {
   clearContinuation,
   clearCurrentInReplyTo,
+  consumeToolDelivery,
   migrateLegacyContinuation,
   setContinuation,
   setCurrentInReplyTo,
@@ -502,7 +503,22 @@ export async function processQuery(
         // at all — either way the turn is finished.
         markCompleted(initialBatchIds);
         if (event.text) {
-          const { sent, hasUnwrapped, taskBlocks } = dispatchResultText(event.text, routing);
+          // Read-and-clear BEFORE dispatchResultText: send_message/send_file
+          // (mcp-tools/core.ts, a separate subprocess) stamp this the moment
+          // they deliver, and it must not survive past this checkpoint into
+          // a later, genuinely separate turn's check.
+          const toolDeliveredThisTurn = consumeToolDelivery();
+          const { sent, hasUnwrapped: rawHasUnwrapped, taskBlocks } = dispatchResultText(event.text, routing);
+          // dispatchResultText only sees text-block <message> sends parsed
+          // from THIS event's final text — it has no idea a mid-turn
+          // send_message tool call already delivered the real answer. Left
+          // uncorrected, a model that calls send_message and then appends a
+          // short unwrapped closing remark (normal after a tool call) gets
+          // told "not delivered, please re-send wrapped" and complies by
+          // re-sending essentially the same content as a second message —
+          // the direct-message-plus-summary duplicate this fixes. See
+          // db/session-state.ts's consumeToolDelivery doc comment.
+          const hasUnwrapped = rawHasUnwrapped && !toolDeliveredThisTurn;
           const willRetryTaskBlocks = shouldNudgeTaskBlocks(routing.taskRun, taskBlocks, taskBlockNudged);
           // One-door task delivery: the final text becomes the run log entry
           // while explicit append-log calls remain optional additive notes.

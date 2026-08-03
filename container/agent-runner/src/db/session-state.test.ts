@@ -3,7 +3,9 @@ import { beforeEach, describe, expect, test } from 'bun:test';
 import { getOutboundDb, initTestSessionDb } from './connection.js';
 import {
   clearContinuation,
+  consumeToolDelivery,
   getContinuation,
+  markToolDelivery,
   migrateLegacyContinuation,
   setContinuation,
 } from './session-state.js';
@@ -96,5 +98,33 @@ describe('session-state — legacy migration', () => {
 
     const second = migrateLegacyContinuation('claude');
     expect(second).toBe('once');
+  });
+});
+
+describe('session-state — tool delivery flag (duplicate-reply fix)', () => {
+  test('false when nothing was marked', () => {
+    expect(consumeToolDelivery()).toBe(false);
+  });
+
+  test('true after markToolDelivery, exactly once — consuming clears it', () => {
+    markToolDelivery();
+    expect(consumeToolDelivery()).toBe(true);
+    expect(consumeToolDelivery()).toBe(false);
+  });
+
+  test('a second markToolDelivery after a consume is visible again — one flag per turn, not a one-shot latch', () => {
+    markToolDelivery();
+    expect(consumeToolDelivery()).toBe(true);
+
+    markToolDelivery();
+    expect(consumeToolDelivery()).toBe(true);
+    expect(consumeToolDelivery()).toBe(false);
+  });
+
+  test('calling markToolDelivery twice before a consume still reads as delivered once', () => {
+    markToolDelivery();
+    markToolDelivery();
+    expect(consumeToolDelivery()).toBe(true);
+    expect(consumeToolDelivery()).toBe(false);
   });
 });

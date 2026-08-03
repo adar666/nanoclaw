@@ -5,6 +5,7 @@ import { getPendingMessages, markCompleted } from './db/messages-in.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { formatMessages, extractRouting } from './formatter.js';
 import { isCorruptionError, processQuery } from './poll-loop.js';
+import { markToolDelivery } from './db/session-state.js';
 import { MockProvider } from './providers/mock.js';
 import type { AgentQuery, ProviderEvent } from './providers/types.js';
 
@@ -435,6 +436,37 @@ describe('error result with no <message> envelope', () => {
     expect(getUndeliveredMessages()).toHaveLength(0);
     expect(pushes).toHaveLength(1);
     expect(pushes[0]).toContain('was not delivered');
+  });
+
+  // Regression test for the real duplicate-reply bug: send_message (run in a
+  // separate MCP subprocess) stamps consumeToolDelivery's flag directly in
+  // outbound.db the moment it delivers — dispatchResultText has no way to see
+  // that a mid-turn tool call already answered, so an unwrapped closing
+  // remark after it used to get nudged into a second, redundant send.
+  it('does NOT nudge an unwrapped closing remark when send_message already delivered this turn', async () => {
+    markToolDelivery();
+    const { query, pushes } = makeResultQuery({
+      type: 'result',
+      text: 'sent it above, let me know if you need anything else',
+    });
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
+
+    expect(pushes).toHaveLength(0);
+  });
+
+  it('the tool-delivery flag does not survive past the turn it was set for', async () => {
+    markToolDelivery();
+    const first = makeResultQuery({ type: 'result', text: 'closing remark after send_message' });
+    await processQuery(first.query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
+    expect(first.pushes).toHaveLength(0); // suppressed, as above
+
+    // A later, genuinely separate turn with no tool call this time must
+    // still be nudged normally — the flag must not leak forward.
+    const second = makeResultQuery({ type: 'result', text: 'bare text, no envelope, no tool call' });
+    await processQuery(second.query, ERR_ROUTING, ['m2'], 'claude', undefined, 'prompt', undefined);
+    expect(second.pushes).toHaveLength(1);
+    expect(second.pushes[0]).toContain('was not delivered');
   });
 });
 
