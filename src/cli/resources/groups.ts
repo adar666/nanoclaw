@@ -463,10 +463,15 @@ registerResource({
         const row = getContainerConfig(id);
         if (!row) throw new Error(`No container config for group: ${id}`);
 
+        // Always write an explicit boolean, never omit the key — mount-security's
+        // validateMount() only grants RW when `mount.readonly === false` exactly;
+        // an omitted/undefined key is force-readonly (fail closed), so leaving it
+        // out here would silently produce a mount that can never become writable
+        // no matter what the allowlist permits.
         const mount: AdditionalMountConfig = {
           hostPath,
           containerPath,
-          ...(args.ro || args.readonly ? { readonly: true } : {}),
+          readonly: Boolean(args.ro || args.readonly),
         };
         const existing = JSON.parse(row.additional_mounts) as AdditionalMountConfig[];
         if (!existing.some((m) => m.hostPath === hostPath && m.containerPath === containerPath)) {

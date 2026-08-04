@@ -258,4 +258,22 @@ describe('groups config add-mount / remove-mount (host-only)', () => {
     expect(rm.ok).toBe(true);
     expect(JSON.parse(getContainerConfig(GID)!.additional_mounts)).toEqual([]);
   });
+
+  it('a read-write mount (no --ro) writes an explicit readonly: false, not an omitted key', async () => {
+    // Regression test: mount-security's validateMount() only grants RW when
+    // mount.readonly === false EXACTLY — an omitted/undefined key is treated
+    // as force-readonly (fail closed). If add-mount ever goes back to
+    // omitting the key for the RW case, this silently breaks every RW mount
+    // request with no error anywhere in the chain.
+    const GID = 'ag-mount-rw';
+    createAgentGroup({ id: GID, name: 'm', folder: 'm', agent_provider: null, created_at: now() });
+    ensureContainerConfig(GID);
+    const args = { id: GID, host: '/data/writable.db', container: 'writable.db' };
+
+    const add = await dispatch({ id: 'r1', command: 'groups-config-add-mount', args }, { caller: 'host' });
+    expect(add.ok).toBe(true);
+    expect(JSON.parse(getContainerConfig(GID)!.additional_mounts)).toEqual([
+      { hostPath: '/data/writable.db', containerPath: 'writable.db', readonly: false },
+    ]);
+  });
 });
