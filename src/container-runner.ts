@@ -11,6 +11,7 @@ import { promisify } from 'util';
 import { OneCLI } from '@onecli-sh/sdk';
 
 import {
+  CLAUDE_TRANSCRIPT_ROTATE_BYTES,
   CONTAINER_CPU_LIMIT,
   CONTAINER_IMAGE,
   CONTAINER_IMAGE_BASE,
@@ -483,6 +484,15 @@ async function buildContainerArgs(
   // Environment — only vars read by code we don't own.
   // Everything NanoClaw-specific is in container.json (read by runner at startup).
   args.push('-e', `TZ=${containerConfig.timezone ?? TIMEZONE}`);
+
+  // Exception to the above: the Claude provider's own transcriptRotateBytes()
+  // reads this directly from its own process.env (claude.ts), and it's a
+  // deliberately GLOBAL operator knob, not per-group config — see
+  // src/config.ts's doc comment. Forwarded only when set; empty means the
+  // provider's own 12MB default, unchanged.
+  if (CLAUDE_TRANSCRIPT_ROTATE_BYTES) {
+    args.push('-e', `CLAUDE_TRANSCRIPT_ROTATE_BYTES=${CLAUDE_TRANSCRIPT_ROTATE_BYTES}`);
+  }
 
   // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
   if (providerContribution.env) {

@@ -19,6 +19,7 @@ const envConfig = readEnvFile([
   'NANOCLAW_EGRESS_LOCKDOWN',
   'NANOCLAW_EGRESS_NETWORK',
   'ONECLI_GATEWAY_CONTAINER',
+  'CLAUDE_TRANSCRIPT_ROTATE_BYTES',
 ]);
 
 /**
@@ -86,6 +87,17 @@ export const CONTAINER_MEMORY_LIMIT = process.env.CONTAINER_MEMORY_LIMIT || envC
 // blocks it from spawning subprocesses, and neither is reported as a PID limit.
 // Empty = no cap.
 export const CONTAINER_PIDS_LIMIT = process.env.CONTAINER_PIDS_LIMIT ?? envConfig.CONTAINER_PIDS_LIMIT ?? '2048';
+
+// Global override for the Claude provider's transcript-rotation threshold
+// (container/agent-runner/src/providers/claude.ts's transcriptRotateBytes(),
+// default 12MB). NOT per-group — see docs/build-and-runtime.md "Transcript
+// rotation" for why. Empty = no flag added = the provider's own 12MB
+// default, today's unbounded-in-practice behavior for a normal chat
+// session. Forwarded into the container via container-runner.ts (the
+// container has no blanket host .env passthrough — only vars explicitly
+// listed there reach it).
+export const CLAUDE_TRANSCRIPT_ROTATE_BYTES =
+  process.env.CLAUDE_TRANSCRIPT_ROTATE_BYTES || envConfig.CLAUDE_TRANSCRIPT_ROTATE_BYTES || '';
 
 // Egress lockdown — force all agent traffic through the OneCLI gateway on a
 // no-internet Docker network. Off by default; consumed by src/egress-lockdown.ts.

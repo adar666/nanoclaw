@@ -67,6 +67,20 @@ Both paths end with Bun running the same source file from `/app/src/index.ts`.
 
 Any failure fails the PR.
 
+## Transcript rotation
+
+The Claude provider (`container/agent-runner/src/providers/claude.ts`) archives and rotates a session's SDK transcript off two triggers: the SDK's own `PreCompact` hook, and a cold-resume check comparing the transcript file against `transcriptRotateBytes()` (default 12MB) / `transcriptRotateAgeMs()` (default 14 days) — whichever fires first starts a fresh SDK conversation while keeping the same NanoClaw session/thread alive. In a working chat-style session, 12MB is effectively "never" — measured on a real 8-round back-and-forth, the transcript reached ~635KB with per-turn context roughly doubling from round 1 to round 8, and the worst latency spike coincided with the largest jump. 12MB was never in reach.
+
+`CLAUDE_TRANSCRIPT_ROTATE_BYTES` (`src/config.ts`, forwarded into the container by `container-runner.ts` — see "why global, not per-group" below) lowers that threshold. Set in `.env`:
+
+```
+CLAUDE_TRANSCRIPT_ROTATE_BYTES=512000   # 500KB
+```
+
+**Global, not per-group, deliberately.** `container_configs` has no rotation field, and adding one — a schema column, `ncl groups config` plumbing, threading it through `container.json` materialization — is real, non-trivial work for a benefit a single blanket `.env` value already gets for free: every agent group gets the same lower threshold, cheaply, as a safety net against unbounded context growth in any long chat-style session, not just the one that surfaced the problem. Per-group configurability wasn't built because nothing yet needs one group's threshold to differ from another's; if that changes, the schema work is well-scoped (see `container_configs` in `src/db/container-configs.ts`) but deliberately not done speculatively.
+
+**Why 500KB, not lower:** chosen empirically from the one real session measured, not derived — it's a starting point to observe, not a proven-safe number. Lowering further trades off against how expensive/lossy the SDK's own `PreCompact` summarization actually is, which isn't something we have visibility into yet. Start conservative, tighten only after watching it fire a few times in practice.
+
 ## Key invariants
 
 - **Session DBs must use `journal_mode=DELETE`.** WAL's `-shm` memory-map doesn't cross VirtioFS between host and guest. See the doc comment at the top of `container/agent-runner/src/db/connection.ts` and `src/session-manager.ts`.
