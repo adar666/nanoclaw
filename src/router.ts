@@ -31,6 +31,12 @@ import { findSessionForAgent } from './db/sessions.js';
 import { startTypingRefresh, stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { resolveSession, writeSessionMessage, writeOutboundDirect } from './session-manager.js';
+import { getDeliveryAdapter } from './delivery.js';
+import {
+  hasTranscribableVoiceAttachment,
+  applyVoiceTranscription,
+  VOICE_NOTE_ACK_TEXT,
+} from './voice-transcription.js';
 import { wakeContainer } from './container-runner.js';
 import { getSession } from './db/sessions.js';
 import type { AgentGroup, MessagingGroup, MessagingGroupAgent } from './types.js';
@@ -481,6 +487,26 @@ async function deliverToAgent(
     threadId: effectiveThreadId,
   };
 
+  // Hebrew voice-note transcription (Telegram voice notes only — see
+  // src/voice-transcription.ts). The ack fires immediately, fire-and-forget:
+  // a slow or failing adapter call must never delay or block the message
+  // it's announcing.
+  const hasVoiceNote = hasTranscribableVoiceAttachment(event.message.content);
+  if (hasVoiceNote) {
+    const adapter = getDeliveryAdapter();
+    if (adapter) {
+      void adapter
+        .deliver(
+          deliveryAddr.channelType,
+          deliveryAddr.platformId,
+          deliveryAddr.threadId,
+          'chat-sdk',
+          JSON.stringify({ text: VOICE_NOTE_ACK_TEXT }),
+        )
+        .catch((err) => log.warn('Voice-note ack failed to send', { err }));
+    }
+  }
+
   // Command gate: classify slash commands before they reach the container.
   // Filtered commands are dropped silently. Denied admin commands get a
   // permission-denied response written directly to messages_out.
@@ -504,8 +530,10 @@ async function deliverToAgent(
     }
   }
 
+  const messageId = messageIdForAgent(event.message.id, agent.agent_group_id);
+
   writeSessionMessage(session.agent_group_id, session.id, {
-    id: messageIdForAgent(event.message.id, agent.agent_group_id),
+    id: messageId,
     kind: event.message.kind,
     timestamp: event.message.timestamp,
     platformId: deliveryAddr.platformId,
@@ -514,6 +542,10 @@ async function deliverToAgent(
     content: event.message.content,
     trigger: wake ? 1 : 0,
   });
+
+  if (hasVoiceNote) {
+    await applyVoiceTranscription(session.agent_group_id, session.id, messageId);
+  }
 
   log.info('Message routed', {
     sessionId: session.id,

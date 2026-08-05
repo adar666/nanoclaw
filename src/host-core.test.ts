@@ -39,6 +39,20 @@ vi.mock('./container-runner.js', () => ({
   killContainer: vi.fn(),
 }));
 
+const mockDeliver = vi.fn();
+// Partial mock: other modules (approvals, agent-to-agent) import additional
+// delivery.js exports (onDeliveryAdapterReady, registerDeliveryAction, ...)
+// at module-init time, so a full-replacement mock breaks their loading.
+vi.mock('./delivery.js', async () => {
+  const actual = await vi.importActual<typeof import('./delivery.js')>('./delivery.js');
+  return { ...actual, getDeliveryAdapter: vi.fn(() => ({ deliver: mockDeliver })) };
+});
+
+vi.mock('./voice-transcription.js', async () => {
+  const actual = await vi.importActual<typeof import('./voice-transcription.js')>('./voice-transcription.js');
+  return { ...actual, applyVoiceTranscription: vi.fn().mockResolvedValue(undefined) };
+});
+
 // Override DATA_DIR for tests
 vi.mock('./config.js', async () => {
   const actual = await vi.importActual('./config.js');
@@ -1430,5 +1444,125 @@ describe('delivery', () => {
 
     expect(undelivered).toHaveLength(1);
     expect(JSON.parse(undelivered[0].content).text).toBe('Agent response');
+  });
+});
+
+describe('router — voice-note transcription', () => {
+  beforeEach(async () => {
+    mockDeliver.mockReset().mockResolvedValue(undefined);
+    // wakeContainer and applyVoiceTranscription are module-level singleton
+    // mocks and this suite has no global resetMocks/clearMocks config, so
+    // their call history accumulates across every test in the file (and,
+    // for applyVoiceTranscription, across the tests within this describe
+    // block too). Clear them here so per-test assertions (`not.toHaveBeenCalled`,
+    // and `wakeOrder` below) reflect only this test's own calls.
+    const { wakeContainer } = await import('./container-runner.js');
+    vi.mocked(wakeContainer).mockClear();
+    const { applyVoiceTranscription } = await import('./voice-transcription.js');
+    vi.mocked(applyVoiceTranscription).mockClear();
+    createAgentGroup({
+      id: 'ag-voice',
+      name: 'Voice Agent',
+      folder: 'voice-agent',
+      agent_provider: null,
+      created_at: now(),
+    });
+    createMessagingGroup({
+      id: 'mg-voice',
+      channel_type: 'telegram',
+      platform_id: 'tg-chat-1',
+      name: 'Voice Chat',
+      is_group: 0,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+    createMessagingGroupAgent({
+      id: 'mga-voice',
+      messaging_group_id: 'mg-voice',
+      agent_group_id: 'ag-voice',
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'shared',
+      priority: 0,
+      created_at: now(),
+    });
+  });
+
+  function voiceEvent(id: string): InboundEvent {
+    return {
+      channelType: 'telegram',
+      platformId: 'tg-chat-1',
+      threadId: null,
+      message: {
+        id,
+        kind: 'chat-sdk',
+        content: JSON.stringify({
+          text: '',
+          attachments: [{ type: 'audio', mimeType: 'audio/ogg', size: 999 }],
+        }),
+        timestamp: now(),
+      },
+    };
+  }
+
+  it('sends the Hebrew ack and calls applyVoiceTranscription before the container wakes', async () => {
+    const { routeInbound } = await import('./router.js');
+    const { applyVoiceTranscription, VOICE_NOTE_ACK_TEXT } = await import('./voice-transcription.js');
+    const { wakeContainer } = await import('./container-runner.js');
+
+    await routeInbound(voiceEvent('msg-voice-1'));
+    // Flush the fire-and-forget ack promise's microtask queue.
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(mockDeliver).toHaveBeenCalledWith(
+      'telegram',
+      'tg-chat-1',
+      null,
+      'chat-sdk',
+      JSON.stringify({ text: VOICE_NOTE_ACK_TEXT }),
+    );
+    expect(applyVoiceTranscription).toHaveBeenCalledWith(
+      'ag-voice',
+      expect.any(String),
+      expect.stringContaining('msg-voice-1'),
+    );
+
+    const ackOrder = mockDeliver.mock.invocationCallOrder[0];
+    const transcribeOrder = (applyVoiceTranscription as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+    const wakeOrder = (wakeContainer as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+    expect(transcribeOrder).toBeLessThan(wakeOrder);
+    expect(ackOrder).toBeLessThan(wakeOrder);
+  });
+
+  it('does not send an ack or call applyVoiceTranscription for a plain text message', async () => {
+    const { routeInbound } = await import('./router.js');
+    const { applyVoiceTranscription } = await import('./voice-transcription.js');
+
+    await routeInbound({
+      channelType: 'telegram',
+      platformId: 'tg-chat-1',
+      threadId: null,
+      message: { id: 'msg-plain-1', kind: 'chat-sdk', content: JSON.stringify({ text: 'hi' }), timestamp: now() },
+    });
+
+    expect(mockDeliver).not.toHaveBeenCalled();
+    expect(applyVoiceTranscription).not.toHaveBeenCalled();
+  });
+
+  it('a failed ack does not block message delivery', async () => {
+    mockDeliver.mockRejectedValue(new Error('telegram rate limited'));
+    const { routeInbound } = await import('./router.js');
+    const { wakeContainer } = await import('./container-runner.js');
+
+    await expect(routeInbound(voiceEvent('msg-voice-2'))).resolves.toBeUndefined();
+    expect(wakeContainer).toHaveBeenCalled();
+
+    const dbPath = inboundDbPath('ag-voice', findSession('mg-voice', null)!.id);
+    const db = new Database(dbPath);
+    const row = db.prepare('SELECT * FROM messages_in WHERE id LIKE ?').get('%msg-voice-2%');
+    db.close();
+    expect(row).toBeDefined();
   });
 });
