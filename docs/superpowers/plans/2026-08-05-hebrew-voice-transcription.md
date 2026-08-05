@@ -1377,7 +1377,63 @@ Expected: both clean.
 
 Expected: `SMOKE TEST PASSED: <hebrew text>`.
 
-- [ ] **Step 4: Restart the NanoClaw service so the running process picks up the change**
+- [ ] **Step 4: Verify the packaged skill's docs haven't drifted from the live source**
+
+This exact failure shape already happened once in this plan: Task 5's
+`SKILL.md` and `router.host-core.test.snippet.md` were packaged from plan
+text written *before* Task 2's review found the missing-`mg.instance` bug,
+so they briefly documented stale, already-fixed code. Reading carefully
+didn't catch it — a mechanical check does. Since the plan text that
+generates a skill's docs is written once and the source it describes can
+change underneath it (exactly what happened here), this check belongs in
+every future run of this pattern, not just this one.
+
+Extract every fenced ` ```ts ` code block from the skill's `SKILL.md` and
+`router.host-core.test.snippet.md`, and confirm each is a verbatim
+(byte-for-byte) substring of the live file it's meant to mirror:
+
+```bash
+S=.claude/skills/add-hebrew-transcription
+rm -rf /tmp/skill-drift-check
+mkdir -p /tmp/skill-drift-check
+
+awk '/^```ts$/{n++; f="/tmp/skill-drift-check/skill-block" n ".ts"; capture=1; next} /^```$/{capture=0} capture{print > f}' "$S/SKILL.md"
+awk '/^```ts$/{n++; f="/tmp/skill-drift-check/snippet-block" n ".ts"; capture=1; next} /^```$/{capture=0} capture{print > f}' "$S/router.host-core.test.snippet.md"
+
+drift_found=0
+for f in /tmp/skill-drift-check/skill-block*.ts; do
+  [ -s "$f" ] || continue
+  block=$(cat "$f")
+  live=$(cat src/router.ts)
+  if [[ "$live" != *"$block"* ]]; then
+    echo "DRIFT: $f is not a verbatim substring of src/router.ts"
+    drift_found=1
+  fi
+done
+for f in /tmp/skill-drift-check/snippet-block*.ts; do
+  [ -s "$f" ] || continue
+  block=$(cat "$f")
+  live=$(cat src/host-core.test.ts)
+  if [[ "$live" != *"$block"* ]]; then
+    echo "DRIFT: $f is not a verbatim substring of src/host-core.test.ts"
+    drift_found=1
+  fi
+done
+rm -rf /tmp/skill-drift-check
+
+if [ "$drift_found" = "1" ]; then
+  echo "FAIL: packaged skill docs have drifted from the live source"
+  exit 1
+fi
+echo "OK: all packaged code snippets are verbatim substrings of the live source"
+```
+
+Expected: `OK: all packaged code snippets are verbatim substrings of the
+live source`, no `DRIFT:` lines. If any block doesn't match, fix the
+skill's `.md` file (not the live source) so it reflects reality, then
+re-run this check.
+
+- [ ] **Step 5: Restart the NanoClaw service so the running process picks up the change**
 
 ```bash
 source setup/lib/install-slug.sh
@@ -1389,7 +1445,7 @@ tail -30 logs/nanoclaw.log
 
 Expected: `state = running`, a `pid`, clean startup log (no new errors).
 
-- [ ] **Step 5: Manual end-to-end check — ask the user to send a real Telegram voice note**
+- [ ] **Step 6: Manual end-to-end check — ask the user to send a real Telegram voice note**
 
 This is the one step that can't be automated: ask the user to send a short
 Hebrew voice note to one of the three agents (e.g. Yulanda, the original
@@ -1408,7 +1464,7 @@ pnpm exec tsx scripts/q.ts data/v2-sessions/<agent-group>/<session>/inbound.db \
   "SELECT content FROM messages_in ORDER BY seq DESC LIMIT 1"
 ```
 
-- [ ] **Step 6: No commit** — this task is verification only. If Step 5 surfaces a bug, fix it as a new commit outside this plan's scope (or loop back to the relevant task above if it's small).
+- [ ] **Step 7: No commit** — this task is verification only. If Step 6 surfaces a bug, fix it as a new commit outside this plan's scope (or loop back to the relevant task above if it's small).
 
 ---
 
