@@ -5,9 +5,13 @@ Add these two mocks near the file's existing top-level `vi.mock` calls
 
 ```ts
 const mockDeliver = vi.fn();
-vi.mock('./delivery.js', () => ({
-  getDeliveryAdapter: vi.fn(() => ({ deliver: mockDeliver })),
-}));
+// Partial mock: other modules (approvals, agent-to-agent) import additional
+// delivery.js exports (onDeliveryAdapterReady, registerDeliveryAction, ...)
+// at module-init time, so a full-replacement mock breaks their loading.
+vi.mock('./delivery.js', async () => {
+  const actual = await vi.importActual<typeof import('./delivery.js')>('./delivery.js');
+  return { ...actual, getDeliveryAdapter: vi.fn(() => ({ deliver: mockDeliver })) };
+});
 
 vi.mock('./voice-transcription.js', async () => {
   const actual = await vi.importActual<typeof import('./voice-transcription.js')>('./voice-transcription.js');

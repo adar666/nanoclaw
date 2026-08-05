@@ -68,19 +68,35 @@ Edit `src/router.ts`. Add to the import block (after the existing
 
 ```ts
 import { getDeliveryAdapter } from './delivery.js';
-import { hasTranscribableVoiceAttachment, applyVoiceTranscription, VOICE_NOTE_ACK_TEXT } from './voice-transcription.js';
+import {
+  hasTranscribableVoiceAttachment,
+  applyVoiceTranscription,
+  VOICE_NOTE_ACK_TEXT,
+} from './voice-transcription.js';
 ```
 
 In `deliverToAgent`, right after `deliveryAddr` is computed and before the
 `// Command gate:` comment, insert:
 
 ```ts
+  // Hebrew voice-note transcription (Telegram voice notes only — see
+  // src/voice-transcription.ts). The ack fires immediately, fire-and-forget:
+  // a slow or failing adapter call must never delay or block the message
+  // it's announcing.
   const hasVoiceNote = hasTranscribableVoiceAttachment(event.message.content);
   if (hasVoiceNote) {
     const adapter = getDeliveryAdapter();
     if (adapter) {
       void adapter
-        .deliver(deliveryAddr.channelType, deliveryAddr.platformId, deliveryAddr.threadId, 'chat-sdk', JSON.stringify({ text: VOICE_NOTE_ACK_TEXT }))
+        .deliver(
+          deliveryAddr.channelType,
+          deliveryAddr.platformId,
+          deliveryAddr.threadId,
+          'chat-sdk',
+          JSON.stringify({ text: VOICE_NOTE_ACK_TEXT }),
+          undefined,
+          mg.instance,
+        )
         .catch((err) => log.warn('Voice-note ack failed to send', { err }));
     }
   }
@@ -96,7 +112,13 @@ right after it:
 
   writeSessionMessage(session.agent_group_id, session.id, {
     id: messageId,
-    // ...unchanged fields
+    kind: event.message.kind,
+    timestamp: event.message.timestamp,
+    platformId: deliveryAddr.platformId,
+    channelType: deliveryAddr.channelType,
+    threadId: deliveryAddr.threadId,
+    content: event.message.content,
+    trigger: wake ? 1 : 0,
   });
 
   if (hasVoiceNote) {
