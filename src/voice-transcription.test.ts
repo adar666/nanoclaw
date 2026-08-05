@@ -27,6 +27,7 @@ import {
 } from './voice-transcription.js';
 import { initSessionFolder, writeSessionMessage, inboundDbPath } from './session-manager.js';
 import { initTestDb, closeDb, runMigrations, createAgentGroup } from './db/index.js';
+import { deriveAttachmentName } from './attachment-naming.js';
 import Database from 'better-sqlite3';
 
 const TEST_DIR = '/tmp/nanoclaw-test-voice-transcription';
@@ -52,9 +53,9 @@ describe('isTranscribableVoiceAttachment', () => {
   });
 
   it('is false for an uploaded audio file (carries name)', () => {
-    expect(
-      isTranscribableVoiceAttachment({ type: 'audio', mimeType: 'audio/ogg', name: 'song.ogg', size: 123 }),
-    ).toBe(false);
+    expect(isTranscribableVoiceAttachment({ type: 'audio', mimeType: 'audio/ogg', name: 'song.ogg', size: 123 })).toBe(
+      false,
+    );
   });
 
   it('is false for a non-ogg mime type', () => {
@@ -63,6 +64,42 @@ describe('isTranscribableVoiceAttachment', () => {
 
   it('is false for a non-audio attachment', () => {
     expect(isTranscribableVoiceAttachment({ type: 'image', mimeType: 'audio/ogg', size: 123 })).toBe(false);
+  });
+
+  // Post-extraction detection: after writeSessionMessage extracts voice note
+  // attachments, they get derived names. These tests ensure the regex pattern
+  // correctly identifies post-extraction voice notes.
+  it('is true for post-extraction derived voice note name (attachment-<timestamp>.ogg)', () => {
+    expect(
+      isTranscribableVoiceAttachment({
+        type: 'audio',
+        mimeType: 'audio/ogg',
+        name: 'attachment-1699999999999.ogg',
+        localPath: 'inbox/msg-id/attachment-1699999999999.ogg',
+      }),
+    ).toBe(true);
+  });
+
+  it('is false for post-extraction explicitly-named uploaded audio (non-pattern filename)', () => {
+    expect(
+      isTranscribableVoiceAttachment({
+        type: 'audio',
+        mimeType: 'audio/ogg',
+        name: 'song.ogg',
+        localPath: 'inbox/msg-id/song.ogg',
+      }),
+    ).toBe(false);
+  });
+
+  it('matches the derived name pattern produced by deriveAttachmentName for voice notes', () => {
+    // This test ensures the regex in isTranscribableVoiceAttachment stays in
+    // sync with the naming convention in src/attachment-naming.ts. If
+    // deriveAttachmentName changes its output format, this test should fail
+    // loudly to prevent silent transcription detection failures.
+    const voiceNoteAttachment = { type: 'audio', mimeType: 'audio/ogg' };
+    const derivedName = deriveAttachmentName(voiceNoteAttachment);
+    const attachment = { ...voiceNoteAttachment, name: derivedName };
+    expect(isTranscribableVoiceAttachment(attachment)).toBe(true);
   });
 });
 
@@ -125,16 +162,15 @@ describe('transcribeVoiceNote', () => {
   });
 
   it('converts then transcribes, forcing Hebrew, and returns trimmed stdout', async () => {
-    mockedExecFile().mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: (...a: unknown[]) => void) => {
-      cb(null, { stdout: '', stderr: '' });
-    });
     // First call is ffmpeg (no meaningful stdout), second is whisper-cli.
     let call = 0;
-    mockedExecFile().mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: (...a: unknown[]) => void) => {
-      call++;
-      if (call === 1) return cb(null, { stdout: '', stderr: '' });
-      cb(null, { stdout: '  שלום עולם  \n', stderr: '' });
-    });
+    mockedExecFile().mockImplementation(
+      (_cmd: string, _args: string[], _opts: unknown, cb: (...a: unknown[]) => void) => {
+        call++;
+        if (call === 1) return cb(null, { stdout: '', stderr: '' });
+        cb(null, { stdout: '  שלום עולם  \n', stderr: '' });
+      },
+    );
 
     const result = await transcribeVoiceNote('/tmp/x.ogg', {
       whisperCli: FAKE_WHISPER,
@@ -148,9 +184,11 @@ describe('transcribeVoiceNote', () => {
   });
 
   it('returns error when ffmpeg fails', async () => {
-    mockedExecFile().mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: (...a: unknown[]) => void) => {
-      cb(new Error('ffmpeg exploded'), { stdout: '', stderr: '' });
-    });
+    mockedExecFile().mockImplementation(
+      (_cmd: string, _args: string[], _opts: unknown, cb: (...a: unknown[]) => void) => {
+        cb(new Error('ffmpeg exploded'), { stdout: '', stderr: '' });
+      },
+    );
     const result = await transcribeVoiceNote('/tmp/x.ogg', {
       whisperCli: FAKE_WHISPER,
       ffmpeg: FAKE_FFMPEG,
@@ -160,10 +198,12 @@ describe('transcribeVoiceNote', () => {
   });
 
   it('returns timeout when a step is killed for exceeding the deadline', async () => {
-    mockedExecFile().mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: (...a: unknown[]) => void) => {
-      const err = Object.assign(new Error('killed'), { killed: true, signal: 'SIGTERM' });
-      cb(err, { stdout: '', stderr: '' });
-    });
+    mockedExecFile().mockImplementation(
+      (_cmd: string, _args: string[], _opts: unknown, cb: (...a: unknown[]) => void) => {
+        const err = Object.assign(new Error('killed'), { killed: true, signal: 'SIGTERM' });
+        cb(err, { stdout: '', stderr: '' });
+      },
+    );
     const result = await transcribeVoiceNote('/tmp/x.ogg', {
       whisperCli: FAKE_WHISPER,
       ffmpeg: FAKE_FFMPEG,
@@ -175,10 +215,12 @@ describe('transcribeVoiceNote', () => {
 
   it('returns error when whisper-cli produces empty output', async () => {
     let call = 0;
-    mockedExecFile().mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: (...a: unknown[]) => void) => {
-      call++;
-      cb(null, { stdout: call === 1 ? '' : '   \n', stderr: '' });
-    });
+    mockedExecFile().mockImplementation(
+      (_cmd: string, _args: string[], _opts: unknown, cb: (...a: unknown[]) => void) => {
+        call++;
+        cb(null, { stdout: call === 1 ? '' : '   \n', stderr: '' });
+      },
+    );
     const result = await transcribeVoiceNote('/tmp/x.ogg', {
       whisperCli: FAKE_WHISPER,
       ffmpeg: FAKE_FFMPEG,

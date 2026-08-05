@@ -73,7 +73,14 @@ export function isTranscribableVoiceAttachment(att: Record<string, unknown>): bo
   if (!att.name) {
     return true;
   }
-  // Post-extraction: check if name looks auto-derived (attachment-<timestamp>.ogg)
+  // Post-extraction: check if name looks auto-derived (attachment-<timestamp>.ogg).
+  // The pattern must match the format produced by deriveAttachmentName() in
+  // src/attachment-naming.ts. If that module's naming convention changes, this
+  // detection will silently fail — see the test that validates this coupling.
+  // Edge case: a user-uploaded file literally named "attachment-<digits>.ogg"
+  // will be misdetected as a voice note, but this is acceptable given the low
+  // likelihood and the architectural constraint that attachment metadata is
+  // lost after extraction.
   const name = String(att.name);
   return /^attachment-\d+\.ogg$/.test(name);
 }
