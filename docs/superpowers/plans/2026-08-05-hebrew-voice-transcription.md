@@ -1464,6 +1464,47 @@ pnpm exec tsx scripts/q.ts data/v2-sessions/<agent-group>/<session>/inbound.db \
   "SELECT content FROM messages_in ORDER BY seq DESC LIMIT 1"
 ```
 
+- [ ] **Step 6b: Manual regression check — plain text messages must be completely unaffected**
+
+Task 6's instructions.prepend.md addition tells the agent to confirm
+consequential content back before acting when a message carries the
+`[VOICE-TRANSCRIPT]`/`[VOICE-TRANSCRIPT-FAILED: reason]` tag. That
+guidance must be strictly gated on the tag's presence — a plain typed
+message never had the tag and must produce byte-identical behavior to
+before this feature existed. This matters most for `dm-with-uriel`
+(Yulanda): she can now write sender rules and start the recorder off
+spoken input, so an over-broad reading of "confirm before acting" that
+leaks into ordinary typed messages — the agent hedging, re-confirming, or
+second-guessing normal requests it would have just acted on before — would
+be a worse regression than the transcription-accuracy problem the
+instruction exists to prevent.
+
+Ask the user to send one ordinary plain-text message (not a voice note) to
+each of the three real agent groups (`dm-with-uriel`, `dm-with-partner`,
+`household`) — something that would normally just get acted on directly,
+ideally including at least one message to Yulanda that would trigger a
+consequential action (e.g. "recall the last email from X" or a sender-rule
+edit) so the check exercises the exact class of action the instruction
+addendum is about. Confirm for each:
+1. No confirmation-loop or hedging language appears that wasn't there
+   before this feature (compare against how the same agent handled a
+   similar plain-text request prior to this change, if recent chat history
+   allows a comparison).
+2. The agent acts on the request normally — it does not ask "did you mean
+   to send a voice note" or otherwise reference transcription at all.
+3. `inbound.db` for that message's session confirms the row's `content.text`
+   has no `[VOICE-TRANSCRIPT...]` tag (sanity-check that detection
+   correctly didn't fire for a text-only message):
+
+```bash
+pnpm exec tsx scripts/q.ts data/v2-sessions/<agent-group>/<session>/inbound.db \
+  "SELECT content FROM messages_in ORDER BY seq DESC LIMIT 1"
+```
+
+This step needs the user to actually send the three messages — it can't be
+simulated from the controller session without impersonating them on a real
+channel.
+
 - [ ] **Step 7: No commit** — this task is verification only. If Step 6 surfaces a bug, fix it as a new commit outside this plan's scope (or loop back to the relevant task above if it's small).
 
 ---
