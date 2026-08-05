@@ -1409,3 +1409,230 @@ pnpm exec tsx scripts/q.ts data/v2-sessions/<agent-group>/<session>/inbound.db \
 ```
 
 - [ ] **Step 6: No commit** — this task is verification only. If Step 5 surfaces a bug, fix it as a new commit outside this plan's scope (or loop back to the relevant task above if it's small).
+
+---
+
+## Task 8: Verify recorder control end-to-end from Telegram; fix the same PATH bug if it's there
+
+Unrelated feature, same bug class, found in passing while investigating this
+plan's own PATH issue. The recorder feature (`src/modules/recorder/`,
+built earlier today, never tested end-to-end) triggers negotiator's
+`run.sh`, which backgrounds `node run.js`, which bare-`spawn`s `ffmpeg` in
+three places in the sibling `negotiator` repo (`src/capture.js:41`,
+`src/wav-split.js:43`, `src/devices.js:9`) — none of them on NanoClaw's
+launchd job's PATH (`/usr/local/bin:/usr/bin:/bin:/Users/uriel/.local/bin`,
+confirmed via the plist; `/opt/homebrew/bin/ffmpeg` is not in it). `node`
+itself happens to resolve (`/usr/local/bin/node` is on that PATH), so
+`run.sh start` would report success and negotiator's process would stay
+alive — while capturing no audio. This is invisible to `pnpm test`:
+`recorder.test.ts` mocks `node:child_process`'s `execFile` entirely, so it
+asserts argv shape, never real binary resolution.
+
+**Files:**
+- Modify: `src/modules/recorder/apply.ts:33-39` (add a shared `SPAWN_ENV` constant), `:69-73`, `:110`, `:130-134` (pass it)
+- Modify: `src/modules/recorder/recorder.test.ts:142-150`, `:193-208` (assert the widened `PATH` is actually passed)
+
+**Interfaces:** no new exports — `SPAWN_ENV` is a module-private constant, not consumed outside `apply.ts`.
+
+- [ ] **Step 1: Reproduce the bug live, before touching any code**
+
+Send a Telegram message to the `dm-with-uriel` agent asking it to start a
+test recording (the guard in `src/modules/recorder/guard.ts:22-27` only
+allows this agent group — sending it from any other chat will be denied,
+which is expected and not the thing under test here). E.g.: "תתחילי הקלטת בדיקה, מישהו בשם בדיקה".
+
+Wait ~5 seconds, then check what actually happened on the host:
+
+```bash
+cat ~/Projects/negotiator/.run/negotiator.pid 2>/dev/null
+kill -0 "$(cat ~/Projects/negotiator/.run/negotiator.pid 2>/dev/null)" 2>&1 && echo "process alive" || echo "process dead"
+ls -t ~/Projects/negotiator/logs/run-*.log | head -1 | xargs tail -30
+```
+
+Expected (bug present): the pidfile exists and the process is alive (`node
+run.js` resolved fine), but the log tail shows an `ENOENT`/`spawn ffmpeg
+ENOENT`-shaped error, or no audio-segment activity — success reported to
+Telegram, no real capture happening. This is the "confusing" failure mode
+the earlier investigation predicted: it doesn't crash, it just doesn't
+work.
+
+Stop the (non-functional) test recording before proceeding:
+
+```bash
+~/Projects/negotiator/run.sh stop --no-summary
+```
+
+(`--no-summary` skips negotiator's own transcript-summarization step,
+which has nothing to summarize since no audio was captured.)
+
+If Step 1 shows the recording actually worked (audio segments present, no
+ENOENT in the log) — the bug isn't present, possibly because something
+already fixed the PATH elsewhere. **Stop here, don't apply Steps 2-5, and
+tell the user the recorder already works** rather than making an
+unnecessary change.
+
+- [ ] **Step 2: Write the failing test assertions**
+
+Edit `src/modules/recorder/recorder.test.ts`. In the `applyRecorderStart`
+describe block, extend the existing "invokes run.sh" test:
+
+```ts
+  it('invokes run.sh with a fixed binary and them/context as argv values, never a shell string', async () => {
+    const session = fakeSession('ag-uriel');
+    await applyRecorderStart({ them: 'דניס', context: 'HoursReportWebApp' }, session);
+
+    expect(mockExecFile).toHaveBeenCalledTimes(1);
+    const [bin, args, opts] = mockExecFile.mock.calls[0]!;
+    expect(bin).toMatch(/run\.sh$/);
+    expect(args).toEqual(['start', '--', '--lang', 'he', '--them', 'דניס', '--context', 'HoursReportWebApp']);
+    // /opt/homebrew/bin isn't on NanoClaw's launchd job's PATH — negotiator's
+    // run.sh backgrounds a bare `ffmpeg` spawn three levels down, which
+    // would silently fail to resolve without this. See apply.ts's SPAWN_ENV.
+    expect((opts as { env?: Record<string, string> }).env?.PATH).toContain('/opt/homebrew/bin');
+  });
+```
+
+And in `applyRecorderStop / stopAndIngest`, extend the "stops, marks the
+row stopped..." test:
+
+```ts
+  it('stops, marks the row stopped, chains into the second-brain ingest, and notifies "stopped"', async () => {
+    const session = fakeSession('ag-uriel');
+    await applyRecorderStart({ them: 'דניס', context: 'x' }, session);
+    mockExecFile.mockClear();
+    mockNotifyAgent.mockClear();
+
+    await applyRecorderStop({}, session);
+
+    expect(mockExecFile).toHaveBeenCalledTimes(2); // run.sh stop, then the ingest
+    const [stopBin, stopArgs, stopOpts] = mockExecFile.mock.calls[0]!;
+    expect(stopBin).toMatch(/run\.sh$/);
+    expect(stopArgs).toEqual(['stop']);
+    expect((stopOpts as { env?: Record<string, string> }).env?.PATH).toContain('/opt/homebrew/bin');
+    const [ingestBin, ingestArgs] = mockExecFile.mock.calls[1]!;
+    expect(ingestArgs).toContain('--dir');
+    expect(ingestArgs.some((a: string) => a.includes('ingest-recorder'))).toBe(true);
+    void ingestBin;
+
+    const running = getRunningRecorderSession();
+    expect(running).toBeUndefined();
+    expect(mockNotifyAgent).toHaveBeenCalledWith(session, expect.stringContaining('stopped'));
+  });
+```
+
+- [ ] **Step 3: Run tests to verify they fail**
+
+Run: `pnpm exec vitest run src/modules/recorder/recorder.test.ts`
+Expected: FAIL on both new `PATH` assertions — `apply.ts` doesn't pass an
+`env` option to `execFileAsync` yet, so `opts.env` is `undefined`.
+
+- [ ] **Step 4: Fix `apply.ts`**
+
+Edit `src/modules/recorder/apply.ts`. Add the shared env constant right
+after the existing root constants (after the `NEGOTIATOR_LOGS_DIR` line):
+
+```ts
+const NEGOTIATOR_ROOT = process.env.NEGOTIATOR_ROOT || join(homedir(), 'Projects', 'negotiator');
+const SECOND_BRAIN_ROOT = process.env.SECOND_BRAIN_ROOT || join(homedir(), 'Projects', 'second-brain');
+const NEGOTIATOR_LOGS_DIR = join(NEGOTIATOR_ROOT, 'logs');
+
+// Homebrew on Apple Silicon lives at /opt/homebrew, which is NOT on
+// NanoClaw's launchd job's PATH (/usr/local/bin:/usr/bin:/bin:/Users/uriel/.local/bin
+// — confirmed via ~/Library/LaunchAgents/com.nanoclaw-v2-*.plist). run.sh
+// backgrounds `node run.js` bare (resolves fine, /usr/local/bin/node is on
+// that PATH) which in turn bare-spawns `ffmpeg` three levels down
+// (negotiator's capture.js/wav-split.js/devices.js) — NOT on that PATH.
+// Every execFileAsync call below passes this widened PATH so the whole
+// downstream chain inherits it, without touching the sibling negotiator
+// repo. Same class of bug, same fix, as voice-transcription.ts's absolute
+// binary paths — see docs/superpowers/specs/2026-08-05-hebrew-voice-transcription-design.md.
+const SPAWN_ENV = {
+  ...process.env,
+  PATH: `${process.env.PATH ?? ''}:/opt/homebrew/bin`,
+};
+```
+
+Then add `env: SPAWN_ENV` to each of the three `execFileAsync` calls'
+options objects:
+
+```ts
+    await execFileAsync(
+      join(NEGOTIATOR_ROOT, 'run.sh'),
+      ['start', '--', '--lang', 'he', '--them', them, '--context', context],
+      { cwd: NEGOTIATOR_ROOT, timeout: 15_000, env: SPAWN_ENV },
+    );
+```
+
+```ts
+    await execFileAsync(join(NEGOTIATOR_ROOT, 'run.sh'), ['stop'], {
+      cwd: NEGOTIATOR_ROOT,
+      timeout: 30_000,
+      env: SPAWN_ENV,
+    });
+```
+
+```ts
+    const { stdout } = await execFileAsync(
+      process.execPath,
+      [join(SECOND_BRAIN_ROOT, 'dist/bin/ingest-recorder.js'), '--dir', NEGOTIATOR_LOGS_DIR],
+      { cwd: SECOND_BRAIN_ROOT, timeout: 60_000, env: SPAWN_ENV },
+    );
+```
+
+(The ingest call doesn't need `ffmpeg`, but passing the same widened
+`PATH` is harmless and keeps all three call sites consistent rather than
+special-casing one.)
+
+- [ ] **Step 5: Run tests to verify they pass**
+
+Run: `pnpm exec vitest run src/modules/recorder/recorder.test.ts`
+Expected: PASS, all cases including the two new `PATH` assertions.
+
+- [ ] **Step 6: Typecheck**
+
+Run: `pnpm exec tsc --noEmit -p tsconfig.json`
+Expected: `TypeScript: No errors found`
+
+- [ ] **Step 7: Rebuild and restart, then re-verify live**
+
+Since this changes host code, rebuild and restart the running service so
+the fix is actually live before re-testing:
+
+```bash
+pnpm run build
+source setup/lib/install-slug.sh
+launchctl kickstart -k gui/$(id -u)/$(launchd_label)
+sleep 3
+```
+
+Repeat Step 1's live Telegram test (start a recording, wait ~5s, check the
+pidfile/process/log tail, stop it). Expected this time: the log tail shows
+no `ENOENT`, and — the real confirmation — actual transcript activity:
+
+```bash
+ls -t ~/Projects/negotiator/logs/transcript-*.jsonl 2>/dev/null | head -1
+```
+
+Expected: a transcript file from just now exists and is non-empty. Stop
+the recording (`~/Projects/negotiator/run.sh stop`) and confirm the
+agent's Telegram reply reports it stopped and ingested successfully (per
+`apply.ts`'s `stopAndIngest` wording), not the ingest-failure branch.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add src/modules/recorder/apply.ts src/modules/recorder/recorder.test.ts
+git commit -m "fix: recorder control silently failed to capture audio under launchd
+
+Same class of bug as voice-transcription.ts: NanoClaw's launchd job's
+PATH doesn't include /opt/homebrew/bin. node itself resolved fine (on
+PATH), so run.sh start reported success and the negotiator process
+stayed alive — but its downstream bare ffmpeg spawns (capture.js,
+wav-split.js, devices.js) couldn't resolve, so no audio was ever
+captured. Confirmed live before fixing, not just inferred. Every
+execFileAsync call in apply.ts now passes a widened PATH so the whole
+run.sh -> node run.js -> ffmpeg chain inherits it, with no changes
+needed in the sibling negotiator repo.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
+```
