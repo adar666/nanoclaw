@@ -1522,6 +1522,8 @@ describe('router — voice-note transcription', () => {
       null,
       'chat-sdk',
       JSON.stringify({ text: VOICE_NOTE_ACK_TEXT }),
+      undefined,
+      'telegram', // mg.instance — createMessagingGroup defaults instance to channel_type
     );
     expect(applyVoiceTranscription).toHaveBeenCalledWith(
       'ag-voice',
@@ -1534,6 +1536,61 @@ describe('router — voice-note transcription', () => {
     const wakeOrder = (wakeContainer as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
     expect(transcribeOrder).toBeLessThan(wakeOrder);
     expect(ackOrder).toBeLessThan(wakeOrder);
+  });
+
+  it("threads the messaging group's named instance through the ack delivery (no cross-instance bot identity)", async () => {
+    createMessagingGroup({
+      id: 'mg-voice-named',
+      channel_type: 'telegram',
+      platform_id: 'tg-chat-2',
+      instance: 'telegram-support',
+      name: 'Voice Chat (support instance)',
+      is_group: 0,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+    createMessagingGroupAgent({
+      id: 'mga-voice-named',
+      messaging_group_id: 'mg-voice-named',
+      agent_group_id: 'ag-voice',
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'shared',
+      priority: 0,
+      created_at: now(),
+    });
+
+    const { routeInbound } = await import('./router.js');
+    const { VOICE_NOTE_ACK_TEXT } = await import('./voice-transcription.js');
+
+    await routeInbound({
+      channelType: 'telegram',
+      instance: 'telegram-support',
+      platformId: 'tg-chat-2',
+      threadId: null,
+      message: {
+        id: 'msg-voice-named-1',
+        kind: 'chat-sdk',
+        content: JSON.stringify({
+          text: '',
+          attachments: [{ type: 'audio', mimeType: 'audio/ogg', size: 999 }],
+        }),
+        timestamp: now(),
+      },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(mockDeliver).toHaveBeenCalledWith(
+      'telegram',
+      'tg-chat-2',
+      null,
+      'chat-sdk',
+      JSON.stringify({ text: VOICE_NOTE_ACK_TEXT }),
+      undefined,
+      'telegram-support',
+    );
   });
 
   it('does not send an ack or call applyVoiceTranscription for a plain text message', async () => {

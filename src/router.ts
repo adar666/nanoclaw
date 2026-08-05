@@ -502,6 +502,8 @@ async function deliverToAgent(
           deliveryAddr.threadId,
           'chat-sdk',
           JSON.stringify({ text: VOICE_NOTE_ACK_TEXT }),
+          undefined,
+          mg.instance,
         )
         .catch((err) => log.warn('Voice-note ack failed to send', { err }));
     }
