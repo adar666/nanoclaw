@@ -7,15 +7,43 @@ import Database from 'better-sqlite3';
 import { describe, expect, it } from 'vitest';
 
 import { deleteOrphanProcessingClaims, getProcessingClaims } from './db/session-db.js';
+import fs from 'fs';
+import path from 'path';
+
 import {
   ABSOLUTE_CEILING_MS,
   CLAIM_STUCK_MS,
+  SPAWN_STAGGER_MS,
   _resetStuckProcessingRowsForTesting,
   decideStuckAction,
   parseSqliteUtc,
   shouldCloseTaskSession,
 } from './host-sweep.js';
 import type { Session } from './types.js';
+
+describe('spawn stagger wiring (structural)', () => {
+  // sweepSession() drives wakeContainer/docker spawn and needs a real inbound
+  // DB + session dir to exercise directly (heavier than this fix warrants —
+  // the actual retry logic it triggers is unit-tested via isRetryableMountRace
+  // in container-runner.test.ts). Guard the wiring structurally instead: the
+  // stagger must be gated on sweepSession's own "did I just wake something"
+  // signal, not applied unconditionally to every session on every tick —
+  // otherwise idle groups pay a real per-tick delay for no reason.
+  it('gates the stagger delay on sweepSession returning true', () => {
+    const src = fs.readFileSync(path.join(process.cwd(), 'src', 'host-sweep.ts'), 'utf-8');
+    const loop = src.indexOf('const justWoke = await sweepSession(session);');
+    const gate = src.indexOf('if (justWoke) {', loop);
+    const stagger = src.indexOf('SPAWN_STAGGER_MS', gate);
+    expect(loop).toBeGreaterThan(-1);
+    expect(gate).toBeGreaterThan(loop);
+    expect(stagger).toBeGreaterThan(gate);
+  });
+
+  it('SPAWN_STAGGER_MS is a small, sane delay (not zero, not sweep-tick-sized)', () => {
+    expect(SPAWN_STAGGER_MS).toBeGreaterThan(0);
+    expect(SPAWN_STAGGER_MS).toBeLessThan(5000);
+  });
+});
 
 const BASE = Date.parse('2026-04-20T12:00:00.000Z');
 
@@ -47,6 +75,36 @@ describe('decideStuckAction', () => {
     if (res.action !== 'kill-ceiling') return;
     expect(res.ceilingMs).toBe(ABSOLUTE_CEILING_MS);
     expect(res.heartbeatAgeMs).toBeGreaterThan(ABSOLUTE_CEILING_MS);
+  });
+
+  it('honors a shorter per-group ceilingMs override (idle_timeout_minutes)', () => {
+    const FIFTEEN_MIN_MS = 15 * 60 * 1000;
+    // Fresh under the instance default (30 min) but past the group's 15-min override.
+    const heartbeatMtimeMs = BASE - FIFTEEN_MIN_MS - 1_000;
+    const res = decideStuckAction({
+      now: BASE,
+      heartbeatMtimeMs,
+      containerState: null,
+      claims: [],
+      ceilingMs: FIFTEEN_MIN_MS,
+    });
+    expect(res.action).toBe('kill-ceiling');
+    if (res.action !== 'kill-ceiling') return;
+    expect(res.ceilingMs).toBe(FIFTEEN_MIN_MS);
+  });
+
+  it('never kills an in-flight Bash tool call early, even under a shorter group override', () => {
+    const FIFTEEN_MIN_MS = 15 * 60 * 1000;
+    const declaredBashMs = 20 * 60 * 1000; // agent declared a 20-min Bash timeout
+    const heartbeatMtimeMs = BASE - FIFTEEN_MIN_MS - 1_000; // past the 15-min override
+    const res = decideStuckAction({
+      now: BASE,
+      heartbeatMtimeMs,
+      containerState: { current_tool: 'Bash', tool_declared_timeout_ms: declaredBashMs, tool_started_at: null },
+      claims: [],
+      ceilingMs: FIFTEEN_MIN_MS,
+    });
+    expect(res).toEqual({ action: 'ok' });
   });
 
   it('skips the ceiling check when no heartbeat file exists (fresh container not yet ticked)', () => {

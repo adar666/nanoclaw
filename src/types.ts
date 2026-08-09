@@ -26,6 +26,7 @@ export interface ContainerConfigRow {
   additional_mounts: string; // JSON: AdditionalMountConfig[]
   cli_scope: string; // 'disabled' | 'group' | 'global'
   timezone: string | null; // IANA id; NULL = follow the install-global timezone
+  idle_timeout_minutes: number | null; // NULL = follow the instance-global absolute ceiling (host-sweep.ts)
   updated_at: string;
 }
 

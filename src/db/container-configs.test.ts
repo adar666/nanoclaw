@@ -69,4 +69,17 @@ describe('ensureContainerConfig provider stamping', () => {
     updateContainerConfigScalars('ag-tz', { timezone: null });
     expect(getContainerConfig('ag-tz')?.timezone).toBeNull();
   });
+
+  it('sets and clears the idle-timeout override (NULL = follow the instance-global ceiling)', () => {
+    makeGroup('ag-idle');
+    ensureContainerConfig('ag-idle');
+    expect(getContainerConfig('ag-idle')?.idle_timeout_minutes).toBeNull();
+
+    updateContainerConfigScalars('ag-idle', { idle_timeout_minutes: 15 });
+    expect(getContainerConfig('ag-idle')?.idle_timeout_minutes).toBe(15);
+
+    // `ncl groups config update --idle-timeout-minutes ""` maps to null — the clear path.
+    updateContainerConfigScalars('ag-idle', { idle_timeout_minutes: null });
+    expect(getContainerConfig('ag-idle')?.idle_timeout_minutes).toBeNull();
+  });
 });

@@ -36,6 +36,22 @@ function parseTimezoneFlag(value: unknown): string | null | undefined {
   return tz;
 }
 
+/**
+ * Parse a --idle-timeout-minutes flag: undefined = not passed, null = explicit
+ * clear (empty string → follow the instance-global absolute ceiling), otherwise
+ * a positive integer number of minutes.
+ */
+function parseIdleTimeoutFlag(value: unknown): number | null | undefined {
+  if (value === undefined) return undefined;
+  const s = String(value);
+  if (s === '') return null;
+  const minutes = Number(s);
+  if (!Number.isInteger(minutes) || minutes <= 0) {
+    throw new Error(`invalid --idle-timeout-minutes: "${s}" must be a positive integer; pass "" to clear`);
+  }
+  return minutes;
+}
+
 /** Deserialize JSON columns for display. */
 function presentConfig(row: ContainerConfigRow): Record<string, unknown> {
   return {
@@ -53,6 +69,7 @@ function presentConfig(row: ContainerConfigRow): Record<string, unknown> {
     additional_mounts: JSON.parse(row.additional_mounts),
     cli_scope: row.cli_scope,
     timezone: row.timezone,
+    idle_timeout_minutes: row.idle_timeout_minutes,
     updated_at: row.updated_at,
   };
 }
@@ -281,7 +298,8 @@ registerResource({
       description:
         'Update container config scalar fields. Changes are saved but do NOT take effect until you run `ncl groups restart`. ' +
         'Use --id <group-id> and any of: --provider, --model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, ' +
-        '--timezone (IANA id like "Europe/Lisbon"; "" clears back to the install default; scheduled-task times follow it immediately, message display after restart).',
+        '--timezone (IANA id like "Europe/Lisbon"; "" clears back to the install default; scheduled-task times follow it immediately, message display after restart), ' +
+        '--idle-timeout-minutes (positive integer; overrides the 30-min absolute-ceiling sweep for this group only; "" clears back to the instance default; takes effect on next spawn, no restart needed for already-running containers to eventually be swept under the new value).',
       handler: async (args) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
@@ -299,11 +317,14 @@ registerResource({
             | 'max_messages_per_prompt'
             | 'cli_scope'
             | 'timezone'
+            | 'idle_timeout_minutes'
           >
         > = {};
         if (args.provider !== undefined) updates.provider = args.provider as string;
         const timezone = parseTimezoneFlag(args.timezone);
         if (timezone !== undefined) updates.timezone = timezone;
+        const idleTimeoutMinutes = parseIdleTimeoutFlag(args['idle-timeout-minutes'] ?? args.idle_timeout_minutes);
+        if (idleTimeoutMinutes !== undefined) updates.idle_timeout_minutes = idleTimeoutMinutes;
         if (args.model !== undefined) updates.model = args.model as string;
         if (args.effort !== undefined) updates.effort = args.effort as string;
         if (args.image_tag !== undefined) updates.image_tag = args.image_tag as string;
@@ -320,7 +341,7 @@ registerResource({
 
         if (Object.keys(updates).length === 0) {
           throw new Error(
-            'Nothing to update — provide at least one of: --provider, --model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, --timezone',
+            'Nothing to update — provide at least one of: --provider, --model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, --timezone, --idle-timeout-minutes',
           );
         }
 
