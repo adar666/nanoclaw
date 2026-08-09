@@ -19,6 +19,7 @@ vi.mock('./config.js', async () => {
 import {
   isTranscribableVoiceAttachment,
   hasTranscribableVoiceAttachment,
+  isVoiceReplyToBot,
   transcribeVoiceNote,
   applyVoiceTranscription,
   VOICE_TRANSCRIPT_TAG,
@@ -115,6 +116,36 @@ describe('hasTranscribableVoiceAttachment', () => {
 
   it('is false on invalid JSON', () => {
     expect(hasTranscribableVoiceAttachment('not json')).toBe(false);
+  });
+});
+
+describe('isVoiceReplyToBot', () => {
+  function voiceContent(replyTo?: { isBot?: boolean }): string {
+    return JSON.stringify({
+      text: '',
+      attachments: [{ type: 'audio', mimeType: 'audio/ogg', size: 999 }],
+      ...(replyTo ? { replyTo } : {}),
+    });
+  }
+
+  it('is true for a voice note replying to the bot', () => {
+    expect(isVoiceReplyToBot(voiceContent({ isBot: true }))).toBe(true);
+  });
+
+  it('is false for a voice note replying to a human (isBot: false)', () => {
+    expect(isVoiceReplyToBot(voiceContent({ isBot: false }))).toBe(false);
+  });
+
+  it('is false for a voice note with no reply at all', () => {
+    expect(isVoiceReplyToBot(voiceContent())).toBe(false);
+  });
+
+  it('is false for a text message replying to the bot (no voice attachment)', () => {
+    expect(isVoiceReplyToBot(JSON.stringify({ text: 'hi', replyTo: { isBot: true } }))).toBe(false);
+  });
+
+  it('is false on invalid JSON', () => {
+    expect(isVoiceReplyToBot('not json')).toBe(false);
   });
 });
 

@@ -45,6 +45,15 @@ function normalizeThreads(v: unknown): number {
   throw new Error(`--threads must be true or false, got "${v}"`);
 }
 
+/** --voice-always-engage accepts true/false (or 1/0); stored as INTEGER 1/0.
+ *  Omitted = column NULL = off (voice notes still need a reply-to-bot
+ *  gesture or the wiring's own engage check). */
+function normalizeVoiceAlwaysEngage(v: unknown): number {
+  if (v === true || v === 'true' || v === '1' || v === 1) return 1;
+  if (v === false || v === 'false' || v === '0' || v === 0) return 0;
+  throw new Error(`--voice-always-engage must be true or false, got "${v}"`);
+}
+
 registerResource({
   name: 'wiring',
   plural: 'wirings',
@@ -117,6 +126,13 @@ registerResource({
       updatable: true,
     },
     {
+      name: 'voice_always_engage',
+      type: 'boolean',
+      description:
+        'True = a transcribable voice attachment (Telegram voice note) engages this wiring unconditionally, bypassing engage_mode/engage_pattern entirely — the same effect as a reply-to-bot voice note, without requiring the reply gesture. Never affects text messages. NULL/false (default) = voice notes still need a reply-to-bot gesture or the normal engage check.',
+      updatable: true,
+    },
+    {
       name: 'priority',
       type: 'number',
       description: 'Fanout order when multiple agents are wired to the same messaging group — higher priority first.',
@@ -136,6 +152,9 @@ registerResource({
   preUpdate: (updates, current) => {
     const mg = requireMessagingGroup(current.messaging_group_id);
     if (updates.threads !== undefined) updates.threads = normalizeThreads(updates.threads);
+    if (updates.voice_always_engage !== undefined) {
+      updates.voice_always_engage = normalizeVoiceAlwaysEngage(updates.voice_always_engage);
+    }
 
     const merged: EngageValues = { ...current, ...updates };
     // Legacy rows can be engage_mode='pattern' with a NULL pattern (the
@@ -159,7 +178,7 @@ registerResource({
     create: {
       access: 'approval',
       description:
-        'Wire a messaging group to an agent group. Identify the messaging group by --messaging-group-id OR --channel-type + --platform-id (+ --instance); identify the agent by --agent-group-id OR --agent-group <folder>. Idempotent on (messaging group, agent group). Engagement flags: --engage-mode, --engage-pattern, --session-mode, --sender-scope, --ignored-message-policy, --threads, --priority. Omitted engage flags default from the channel adapter declaration.',
+        'Wire a messaging group to an agent group. Identify the messaging group by --messaging-group-id OR --channel-type + --platform-id (+ --instance); identify the agent by --agent-group-id OR --agent-group <folder>. Idempotent on (messaging group, agent group). Engagement flags: --engage-mode, --engage-pattern, --session-mode, --sender-scope, --ignored-message-policy, --threads, --voice-always-engage, --priority. Omitted engage flags default from the channel adapter declaration.',
       handler: async (args) => {
         // Resolve the messaging group.
         let mgId = args.messaging_group_id as string | undefined;
@@ -207,11 +226,15 @@ registerResource({
         }
         if (args.engage_pattern !== undefined) values.engage_pattern = args.engage_pattern;
         if (args.threads !== undefined) values.threads = args.threads;
+        if (args.voice_always_engage !== undefined) values.voice_always_engage = args.voice_always_engage;
         if (args.priority !== undefined) values.priority = Number(args.priority);
 
         // Pass-2 parity: context-aware defaults + cross-column validation.
         const mg = requireMessagingGroup(values.messaging_group_id);
         if (values.threads !== undefined) values.threads = normalizeThreads(values.threads);
+        if (values.voice_always_engage !== undefined) {
+          values.voice_always_engage = normalizeVoiceAlwaysEngage(values.voice_always_engage);
+        }
 
         const channelKey = mg.instance ?? mg.channel_type;
         // Undeclared (stale) channels: leave engage_mode unset so the static

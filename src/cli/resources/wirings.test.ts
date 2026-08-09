@@ -171,6 +171,43 @@ describe('wirings — threads and priority columns', () => {
   });
 });
 
+describe('wirings — voice_always_engage column', () => {
+  it('omitted --voice-always-engage stores NULL (off)', async () => {
+    const row = await create({ messaging_group_id: 'mg-group', agent_group_id: 'ag-1' });
+    expect(getMessagingGroupAgent(row.id as string)!.voice_always_engage).toBeNull();
+  });
+
+  it('--voice-always-engage true/false stores 1/0 on create', async () => {
+    const on = await create({ messaging_group_id: 'mg-group', agent_group_id: 'ag-1', voice_always_engage: 'true' });
+    expect(getMessagingGroupAgent(on.id as string)!.voice_always_engage).toBe(1);
+    const off = await create({ messaging_group_id: 'mg-dm', agent_group_id: 'ag-1', voice_always_engage: 'false' });
+    expect(getMessagingGroupAgent(off.id as string)!.voice_always_engage).toBe(0);
+  });
+
+  it('rejects a non-boolean --voice-always-engage value on create', async () => {
+    await expect(
+      create({ messaging_group_id: 'mg-group', agent_group_id: 'ag-1', voice_always_engage: 'bogus' }),
+    ).rejects.toThrow(/--voice-always-engage must be true or false/);
+  });
+
+  it('--voice-always-engage is updatable, and does not touch engage_mode/engage_pattern', async () => {
+    const row = await create({ messaging_group_id: 'mg-group', agent_group_id: 'ag-1' }); // mention-sticky
+    const updated = (await update({ id: row.id, voice_always_engage: 'true' })) as {
+      voice_always_engage: number;
+      engage_mode: string;
+    };
+    expect(updated.voice_always_engage).toBe(1);
+    expect(updated.engage_mode).toBe('mention-sticky');
+  });
+
+  it('rejects a non-boolean --voice-always-engage value on update', async () => {
+    const row = await create({ messaging_group_id: 'mg-dm', agent_group_id: 'ag-1' });
+    await expect(update({ id: row.id, voice_always_engage: 'bogus' })).rejects.toThrow(
+      /--voice-always-engage must be true or false/,
+    );
+  });
+});
+
 describe('wirings-update — same validation as create', () => {
   it('rejects switching to pattern mode when no engage_pattern exists', async () => {
     const row = await create({ messaging_group_id: 'mg-group', agent_group_id: 'ag-1' }); // sticky, no pattern

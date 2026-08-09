@@ -39,9 +39,6 @@ export const MODEL_PATH = path.join(
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 
-/** Fixed literal — the agent hasn't run yet when this fires, so this is not agent-generated. */
-export const VOICE_NOTE_ACK_TEXT = '🎙️ קיבלתי הודעה קולית, מעבדת…';
-
 export const VOICE_TRANSCRIPT_TAG = '[VOICE-TRANSCRIPT]';
 
 export function voiceTranscriptFailedTag(reason: TranscribeFailure['reason']): string {
@@ -95,6 +92,29 @@ export function hasTranscribableVoiceAttachment(contentStr: string): boolean {
   }
   const attachments = parsed.attachments as Array<Record<string, unknown>> | undefined;
   return Array.isArray(attachments) && attachments.some(isTranscribableVoiceAttachment);
+}
+
+/**
+ * True when the inbound content is a transcribable voice note AND a
+ * Telegram-level reply to one of the agent's own messages (`replyTo.isBot`,
+ * set in `chat-sdk-bridge.ts` from Telegram's `reply_to_message.from.is_bot`).
+ *
+ * This is the ONLY signal that promotes an untriggered voice note to
+ * "engage" in a group with a text-prefix trigger (see router.ts
+ * routeInbound). A voice note that is not a reply-to-bot is never
+ * transcribed — no whisper-cli invocation — matching the group's existing
+ * semantics that only a triggering message gets processed. Deliberately
+ * blind to *what* the reply text says; the reply gesture itself is the
+ * trigger, not its content.
+ */
+export function isVoiceReplyToBot(contentStr: string): boolean {
+  if (!hasTranscribableVoiceAttachment(contentStr)) return false;
+  try {
+    const parsed = JSON.parse(contentStr) as { replyTo?: { isBot?: boolean } };
+    return parsed.replyTo?.isBot === true;
+  } catch {
+    return false;
+  }
 }
 
 interface TranscribeOpts {

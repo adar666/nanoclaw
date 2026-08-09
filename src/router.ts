@@ -31,12 +31,7 @@ import { findSessionForAgent } from './db/sessions.js';
 import { startTypingRefresh, stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { resolveSession, writeSessionMessage, writeOutboundDirect } from './session-manager.js';
-import { getDeliveryAdapter } from './delivery.js';
-import {
-  hasTranscribableVoiceAttachment,
-  applyVoiceTranscription,
-  VOICE_NOTE_ACK_TEXT,
-} from './voice-transcription.js';
+import { hasTranscribableVoiceAttachment, applyVoiceTranscription, isVoiceReplyToBot } from './voice-transcription.js';
 import { wakeContainer } from './container-runner.js';
 import { getSession } from './db/sessions.js';
 import type { AgentGroup, MessagingGroup, MessagingGroupAgent } from './types.js';
@@ -304,6 +299,21 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
   const parsed = safeParseContent(event.message.content);
   const messageText = parsed.text ?? '';
 
+  // Voice notes carry no text to test a pattern trigger against — a reply to
+  // one of the agent's own Telegram messages is the substitute gesture (see
+  // isVoiceReplyToBot). Computed once per event, independent of which agent
+  // is being evaluated below: it's a property of the inbound message, not
+  // the wiring. A voice note that ISN'T a reply-to-bot gets no override here
+  // and falls through to each wiring's normal evaluateEngage — for a
+  // pattern-triggered group that means dropped, untranscribed, same as today.
+  const voiceReplyToBot = isVoiceReplyToBot(event.message.content);
+  // Separately: whether this event carries a transcribable voice attachment
+  // at all (reply or not) — needed below for the per-wiring
+  // voice_always_engage override, which unlike voiceReplyToBot depends on
+  // the wiring, not just the event. Never true for a text-only message, so
+  // it can never affect the text-trigger path.
+  const hasVoiceAttachment = hasTranscribableVoiceAttachment(event.message.content);
+
   // Per-wiring thread policy inputs, resolved once per event. Each wiring's
   // threads override (NULL = inherit) resolves against the channel's declared
   // defaults, hard-bounded by the live adapter's raw capability. Undeclared
@@ -335,7 +345,15 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
     );
     const effectiveThreadId = threadsEnabled ? event.threadId : null;
 
-    const engages = evaluateEngage(agent, messageText, isMention, mg, effectiveThreadId);
+    // voice_always_engage is per-wiring (unlike voiceReplyToBot, which is a
+    // property of the event) — an operator can opt one wiring into "any
+    // voice note engages" (e.g. a shared household chat where the reply
+    // gesture is more friction than the false-positive risk is worth)
+    // without touching any other wiring's behavior, in this group or any
+    // other. Gated on hasVoiceAttachment so it can never fire for text.
+    const voiceAlwaysEngage = hasVoiceAttachment && agent.voice_always_engage === 1;
+    const engages =
+      voiceReplyToBot || voiceAlwaysEngage || evaluateEngage(agent, messageText, isMention, mg, effectiveThreadId);
 
     const accessOk = engages && (!accessGate || accessGate(event, userId, mg, agent.agent_group_id).allowed);
     const scopeOk = engages && (!senderScopeGate || senderScopeGate(event, userId, mg, agent).allowed);
@@ -488,26 +506,9 @@ async function deliverToAgent(
   };
 
   // Hebrew voice-note transcription (Telegram voice notes only — see
-  // src/voice-transcription.ts). The ack fires immediately, fire-and-forget:
-  // a slow or failing adapter call must never delay or block the message
-  // it's announcing.
+  // src/voice-transcription.ts). No ack sent — transcription is fast enough
+  // (warm: ~2.4s) that announcing receipt isn't worth the extra message.
   const hasVoiceNote = hasTranscribableVoiceAttachment(event.message.content);
-  if (hasVoiceNote) {
-    const adapter = getDeliveryAdapter();
-    if (adapter) {
-      void adapter
-        .deliver(
-          deliveryAddr.channelType,
-          deliveryAddr.platformId,
-          deliveryAddr.threadId,
-          'chat-sdk',
-          JSON.stringify({ text: VOICE_NOTE_ACK_TEXT }),
-          undefined,
-          mg.instance,
-        )
-        .catch((err) => log.warn('Voice-note ack failed to send', { err }));
-    }
-  }
 
   // Command gate: classify slash commands before they reach the container.
   // Filtered commands are dropped silently. Denied admin commands get a

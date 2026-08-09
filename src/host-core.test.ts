@@ -53,6 +53,16 @@ vi.mock('./voice-transcription.js', async () => {
   return { ...actual, applyVoiceTranscription: vi.fn().mockResolvedValue(undefined) };
 });
 
+// Default no-op (matches "no eligible attachment" — the common case for
+// every existing test in this file); the media-ingestion describe block
+// below overrides the resolved value per test. Fully mocked rather than
+// vi.importActual'd — src/media-ingestion.test.ts already covers the real
+// detection/tenant-resolution/CLI-invocation logic; this file only needs to
+// prove router.ts calls it correctly and stores what it returns.
+vi.mock('./media-ingestion.js', () => ({
+  ingestTelegramMedia: vi.fn().mockResolvedValue(null),
+}));
+
 // Override DATA_DIR for tests
 vi.mock('./config.js', async () => {
   const actual = await vi.importActual('./config.js');
@@ -1507,93 +1517,26 @@ describe('router — voice-note transcription', () => {
     };
   }
 
-  it('sends the Hebrew ack and calls applyVoiceTranscription before the container wakes', async () => {
+  it('calls applyVoiceTranscription before the container wakes, with no ack sent', async () => {
     const { routeInbound } = await import('./router.js');
-    const { applyVoiceTranscription, VOICE_NOTE_ACK_TEXT } = await import('./voice-transcription.js');
+    const { applyVoiceTranscription } = await import('./voice-transcription.js');
     const { wakeContainer } = await import('./container-runner.js');
 
     await routeInbound(voiceEvent('msg-voice-1'));
-    // Flush the fire-and-forget ack promise's microtask queue.
-    await new Promise((resolve) => setImmediate(resolve));
 
-    expect(mockDeliver).toHaveBeenCalledWith(
-      'telegram',
-      'tg-chat-1',
-      null,
-      'chat-sdk',
-      JSON.stringify({ text: VOICE_NOTE_ACK_TEXT }),
-      undefined,
-      'telegram', // mg.instance — createMessagingGroup defaults instance to channel_type
-    );
+    expect(mockDeliver).not.toHaveBeenCalled();
     expect(applyVoiceTranscription).toHaveBeenCalledWith(
       'ag-voice',
       expect.any(String),
       expect.stringContaining('msg-voice-1'),
     );
 
-    const ackOrder = mockDeliver.mock.invocationCallOrder[0];
     const transcribeOrder = (applyVoiceTranscription as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
     const wakeOrder = (wakeContainer as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
     expect(transcribeOrder).toBeLessThan(wakeOrder);
-    expect(ackOrder).toBeLessThan(wakeOrder);
   });
 
-  it("threads the messaging group's named instance through the ack delivery (no cross-instance bot identity)", async () => {
-    createMessagingGroup({
-      id: 'mg-voice-named',
-      channel_type: 'telegram',
-      platform_id: 'tg-chat-2',
-      instance: 'telegram-support',
-      name: 'Voice Chat (support instance)',
-      is_group: 0,
-      unknown_sender_policy: 'public',
-      created_at: now(),
-    });
-    createMessagingGroupAgent({
-      id: 'mga-voice-named',
-      messaging_group_id: 'mg-voice-named',
-      agent_group_id: 'ag-voice',
-      engage_mode: 'pattern',
-      engage_pattern: '.',
-      sender_scope: 'all',
-      ignored_message_policy: 'drop',
-      session_mode: 'shared',
-      priority: 0,
-      created_at: now(),
-    });
-
-    const { routeInbound } = await import('./router.js');
-    const { VOICE_NOTE_ACK_TEXT } = await import('./voice-transcription.js');
-
-    await routeInbound({
-      channelType: 'telegram',
-      instance: 'telegram-support',
-      platformId: 'tg-chat-2',
-      threadId: null,
-      message: {
-        id: 'msg-voice-named-1',
-        kind: 'chat-sdk',
-        content: JSON.stringify({
-          text: '',
-          attachments: [{ type: 'audio', mimeType: 'audio/ogg', size: 999 }],
-        }),
-        timestamp: now(),
-      },
-    });
-    await new Promise((resolve) => setImmediate(resolve));
-
-    expect(mockDeliver).toHaveBeenCalledWith(
-      'telegram',
-      'tg-chat-2',
-      null,
-      'chat-sdk',
-      JSON.stringify({ text: VOICE_NOTE_ACK_TEXT }),
-      undefined,
-      'telegram-support',
-    );
-  });
-
-  it('does not send an ack or call applyVoiceTranscription for a plain text message', async () => {
+  it('does not call applyVoiceTranscription for a plain text message', async () => {
     const { routeInbound } = await import('./router.js');
     const { applyVoiceTranscription } = await import('./voice-transcription.js');
 
@@ -1607,19 +1550,201 @@ describe('router — voice-note transcription', () => {
     expect(mockDeliver).not.toHaveBeenCalled();
     expect(applyVoiceTranscription).not.toHaveBeenCalled();
   });
+});
 
-  it('a failed ack does not block message delivery', async () => {
-    mockDeliver.mockRejectedValue(new Error('telegram rate limited'));
+describe('router — voice-note reply-to-bot override (group, drop policy)', () => {
+  beforeEach(async () => {
+    mockDeliver.mockReset().mockResolvedValue(undefined);
+    const { wakeContainer } = await import('./container-runner.js');
+    vi.mocked(wakeContainer).mockClear();
+    const { applyVoiceTranscription } = await import('./voice-transcription.js');
+    vi.mocked(applyVoiceTranscription).mockClear();
+    createAgentGroup({
+      id: 'ag-household',
+      name: 'Household Agent',
+      folder: 'household-agent',
+      agent_provider: null,
+      created_at: now(),
+    });
+    createMessagingGroup({
+      id: 'mg-household',
+      channel_type: 'telegram',
+      platform_id: 'tg-household-1',
+      name: 'Household Chat',
+      is_group: 1,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+    createMessagingGroupAgent({
+      id: 'mga-household',
+      messaging_group_id: 'mg-household',
+      agent_group_id: 'ag-household',
+      engage_mode: 'pattern',
+      engage_pattern: '^\\.',
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'shared',
+      priority: 0,
+      created_at: now(),
+    });
+  });
+
+  function voiceEvent(id: string, replyTo?: { isBot?: boolean }): InboundEvent {
+    return {
+      channelType: 'telegram',
+      platformId: 'tg-household-1',
+      threadId: null,
+      message: {
+        id,
+        kind: 'chat-sdk',
+        content: JSON.stringify({
+          text: '',
+          attachments: [{ type: 'audio', mimeType: 'audio/ogg', size: 999 }],
+          ...(replyTo ? { replyTo } : {}),
+        }),
+        timestamp: now(),
+      },
+    };
+  }
+
+  it('engages and transcribes a voice note that replies to the bot, despite no dot prefix', async () => {
+    const { routeInbound } = await import('./router.js');
+    const { applyVoiceTranscription } = await import('./voice-transcription.js');
+    const { wakeContainer } = await import('./container-runner.js');
+
+    await routeInbound(voiceEvent('msg-reply-bot', { isBot: true }));
+
+    expect(applyVoiceTranscription).toHaveBeenCalledWith(
+      'ag-household',
+      expect.any(String),
+      expect.stringContaining('msg-reply-bot'),
+    );
+    expect(wakeContainer).toHaveBeenCalled();
+  });
+
+  it('drops a voice note with no reply, never invoking transcription', async () => {
+    const { routeInbound } = await import('./router.js');
+    const { applyVoiceTranscription } = await import('./voice-transcription.js');
+    const { wakeContainer } = await import('./container-runner.js');
+
+    await routeInbound(voiceEvent('msg-no-reply'));
+
+    expect(applyVoiceTranscription).not.toHaveBeenCalled();
+    expect(wakeContainer).not.toHaveBeenCalled();
+  });
+
+  it('drops a voice note replying to a human (partner), never invoking transcription', async () => {
+    const { routeInbound } = await import('./router.js');
+    const { applyVoiceTranscription } = await import('./voice-transcription.js');
+    const { wakeContainer } = await import('./container-runner.js');
+
+    await routeInbound(voiceEvent('msg-reply-human', { isBot: false }));
+
+    expect(applyVoiceTranscription).not.toHaveBeenCalled();
+    expect(wakeContainer).not.toHaveBeenCalled();
+  });
+});
+
+describe('router — voice_always_engage override (group, drop policy)', () => {
+  beforeEach(async () => {
+    mockDeliver.mockReset().mockResolvedValue(undefined);
+    const { wakeContainer } = await import('./container-runner.js');
+    vi.mocked(wakeContainer).mockClear();
+    const { applyVoiceTranscription } = await import('./voice-transcription.js');
+    vi.mocked(applyVoiceTranscription).mockClear();
+    createAgentGroup({
+      id: 'ag-household',
+      name: 'Household Agent',
+      folder: 'household-agent',
+      agent_provider: null,
+      created_at: now(),
+    });
+    createMessagingGroup({
+      id: 'mg-household',
+      channel_type: 'telegram',
+      platform_id: 'tg-household-1',
+      name: 'Household Chat',
+      is_group: 1,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+    createMessagingGroupAgent({
+      id: 'mga-household',
+      messaging_group_id: 'mg-household',
+      agent_group_id: 'ag-household',
+      engage_mode: 'pattern',
+      engage_pattern: '^\\.',
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'shared',
+      priority: 0,
+      created_at: now(),
+    });
+    // createMessagingGroupAgent's fixed-column INSERT deliberately doesn't
+    // cover voice_always_engage (same reason it excludes `threads` — see
+    // its other use at 'threads = 0' above): binding `undefined` for an
+    // omitted optional field throws in better-sqlite3. Patch it in directly,
+    // mirroring the wiring the CLI's `wirings-update --voice-always-engage
+    // true` would produce.
+    getDb().prepare("UPDATE messaging_group_agents SET voice_always_engage = 1 WHERE id = 'mga-household'").run();
+  });
+
+  function voiceEvent(id: string): InboundEvent {
+    return {
+      channelType: 'telegram',
+      platformId: 'tg-household-1',
+      threadId: null,
+      message: {
+        id,
+        kind: 'chat-sdk',
+        content: JSON.stringify({
+          text: '',
+          attachments: [{ type: 'audio', mimeType: 'audio/ogg', size: 999 }],
+        }),
+        timestamp: now(),
+      },
+    };
+  }
+
+  function textEvent(id: string, text: string): InboundEvent {
+    return {
+      channelType: 'telegram',
+      platformId: 'tg-household-1',
+      threadId: null,
+      message: { id, kind: 'chat-sdk', content: JSON.stringify({ text }), timestamp: now() },
+    };
+  }
+
+  it('engages and transcribes any voice note, no reply and no dot prefix needed', async () => {
+    const { routeInbound } = await import('./router.js');
+    const { applyVoiceTranscription } = await import('./voice-transcription.js');
+    const { wakeContainer } = await import('./container-runner.js');
+
+    await routeInbound(voiceEvent('msg-voice-always'));
+
+    expect(applyVoiceTranscription).toHaveBeenCalledWith(
+      'ag-household',
+      expect.any(String),
+      expect.stringContaining('msg-voice-always'),
+    );
+    expect(wakeContainer).toHaveBeenCalled();
+  });
+
+  it('still drops a text message with no dot prefix — voice_always_engage never touches text', async () => {
     const { routeInbound } = await import('./router.js');
     const { wakeContainer } = await import('./container-runner.js');
 
-    await expect(routeInbound(voiceEvent('msg-voice-2'))).resolves.toBeUndefined();
-    expect(wakeContainer).toHaveBeenCalled();
+    await routeInbound(textEvent('msg-text-no-dot', 'no prefix here'));
 
-    const dbPath = inboundDbPath('ag-voice', findSession('mg-voice', null)!.id);
-    const db = new Database(dbPath);
-    const row = db.prepare('SELECT * FROM messages_in WHERE id LIKE ?').get('%msg-voice-2%');
-    db.close();
-    expect(row).toBeDefined();
+    expect(wakeContainer).not.toHaveBeenCalled();
+  });
+
+  it('still engages a dot-prefixed text message normally', async () => {
+    const { routeInbound } = await import('./router.js');
+    const { wakeContainer } = await import('./container-runner.js');
+
+    await routeInbound(textEvent('msg-text-dot', '.hello'));
+
+    expect(wakeContainer).toHaveBeenCalled();
   });
 });

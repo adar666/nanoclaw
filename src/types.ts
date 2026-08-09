@@ -135,6 +135,17 @@ export interface MessagingGroupAgent {
    * updating.
    */
   threads?: number | null;
+  /**
+   * Per-wiring override (migration 023): 1 = a transcribable voice
+   * attachment engages this wiring unconditionally, same effect as a
+   * reply-to-bot voice note (see isVoiceReplyToBot in voice-transcription.ts).
+   * NULL/0 = off — voice notes still need a reply-to-bot gesture or the
+   * wiring's own evaluateEngage to engage. Never affects text messages:
+   * router.ts only consults this when the inbound message actually carries a
+   * transcribable voice attachment. Optional on the TS type per the
+   * `threads` convention so pre-migration fixtures don't need updating.
+   */
+  voice_always_engage?: number | null;
   created_at: string;
 }
 
