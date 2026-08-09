@@ -21,4 +21,15 @@ describe('resolveProjectAlias', () => {
   it('trims whitespace before matching', () => {
     expect(resolveProjectAlias('  פאפי  ')).toEqual({ dir: 'pa-ai', warning: null });
   });
+
+  it('rejects prototype-chain keys instead of resolving them to a function, never blocks', () => {
+    expect(resolveProjectAlias('toString')).toEqual({
+      dir: null,
+      warning: expect.stringContaining('Unknown project alias "toString"'),
+    });
+    expect(resolveProjectAlias('constructor')).toEqual({
+      dir: null,
+      warning: expect.stringContaining('Unknown project alias "constructor"'),
+    });
+  });
 });

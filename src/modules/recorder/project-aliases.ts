@@ -46,7 +46,13 @@ export function resolveProjectAlias(raw: string | undefined | null): ProjectAlia
   const alias = typeof raw === 'string' ? raw.trim() : '';
   if (!alias) return { dir: null, warning: null };
 
-  const dir = ALIASES[alias];
+  // Object.hasOwn + typeof guards against prototype-chain keys like
+  // "toString"/"constructor"/"valueOf"/"hasOwnProperty" resolving through
+  // Object.prototype (ALIASES is a plain JSON.parse() result) to a function
+  // instead of a real alias. Left unguarded, that non-string value would
+  // flow into execFile's argv array and throw ERR_INVALID_ARG_TYPE,
+  // blocking a recording — which an unmatched alias must never do.
+  const dir = Object.hasOwn(ALIASES, alias) && typeof ALIASES[alias] === 'string' ? ALIASES[alias] : undefined;
   if (dir) return { dir, warning: null };
 
   return {

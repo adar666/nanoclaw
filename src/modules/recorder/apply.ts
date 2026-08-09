@@ -60,6 +60,17 @@ const SPAWN_ENV = {
 // NEGOTIATOR_CALL_READY_TIMEOUT_SEC=15s to become ready) can legitimately
 // take longer than the old single-process run.sh path's 15s budget.
 const CALL_START_TIMEOUT_MS = 60_000;
+// call.sh end (without --no-debrief) shells out to summarize.sh/summarize.js,
+// an LLM call with its own 120s timeout AND one retry on timeout — up to
+// ~240s worst case, which blows straight through this 60s budget. That
+// mismatch would make execFileAsync SIGTERM a genuinely-fine session and
+// report it as producing no usable transcript (see stopAndIngest's catch
+// below), so stopAndIngest passes --no-debrief: negotiator's honesty check
+// (G56/G58 zero-utterance/FATAL check) runs BEFORE the --no-debrief
+// early-exit in call.sh's end) case, so this doesn't weaken that guarantee
+// at all — it only skips the unrelated, unbounded summarize LLM call.
+// second-brain's ingest (right below) reads transcript-*.jsonl files
+// directly and never depends on call.sh's own debrief output.
 const CALL_END_TIMEOUT_MS = 60_000;
 
 // 3 hours — a real meeting doesn't run longer than this; anything past it
@@ -180,7 +191,7 @@ export async function stopAndIngest(session: Session, reason: 'user' | 'cap'): P
 
   let stopFailed: string | null = null;
   try {
-    await execFileAsync(join(NEGOTIATOR_ROOT, 'call.sh'), ['end'], {
+    await execFileAsync(join(NEGOTIATOR_ROOT, 'call.sh'), ['end', '--no-debrief'], {
       cwd: NEGOTIATOR_ROOT,
       timeout: CALL_END_TIMEOUT_MS,
       env: SPAWN_ENV,

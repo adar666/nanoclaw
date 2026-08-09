@@ -285,7 +285,7 @@ describe('applyRecorderStop / stopAndIngest', () => {
     expect(mockExecFile).toHaveBeenCalledTimes(2); // call.sh end, then the ingest
     const [stopBin, stopArgs, stopOpts] = mockExecFile.mock.calls[0]!;
     expect(stopBin).toMatch(/call\.sh$/);
-    expect(stopArgs).toEqual(['end']);
+    expect(stopArgs).toEqual(['end', '--no-debrief']);
     expect((stopOpts as { env?: Record<string, string> }).env?.PATH).toContain('/opt/homebrew/bin');
     const [ingestBin, ingestArgs] = mockExecFile.mock.calls[1]!;
     expect(ingestArgs).toContain('--dir');
