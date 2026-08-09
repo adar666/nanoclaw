@@ -112,12 +112,70 @@ function errorDetail(err: unknown): string {
   return detail || (err instanceof Error ? err.message : String(err));
 }
 
+/** Parses `call.sh status`'s 3 fixed-format lines. Never throws — any
+ *  unexpected shape reads as "not running" for that line, same as a
+ *  literal "capture: not running" would. */
+function parseCallShStatus(stdout: string): { capture: boolean; ui: boolean; notes: boolean } {
+  return {
+    capture: /^capture: running/m.test(stdout),
+    ui: /^ui: running/m.test(stdout),
+    notes: /^notes: running/m.test(stdout),
+  };
+}
+
+/** `call.sh status` never exits non-zero in normal operation (see call.sh's
+ *  `status)` case) — a failure here is unexpected (negotiator repo moved,
+ *  permissions, etc.), not evidence either way. Answer "still running" in
+ *  that case so a status-check error can never itself cause a real
+ *  session's row to be wrongly reconciled away. */
+async function callShStatus(): Promise<{ capture: boolean; ui: boolean; notes: boolean }> {
+  try {
+    const { stdout } = await execFileAsync(join(NEGOTIATOR_ROOT, 'call.sh'), ['status'], {
+      cwd: NEGOTIATOR_ROOT,
+      timeout: 10_000,
+      env: SPAWN_ENV,
+    });
+    return parseCallShStatus(stdout);
+  } catch (err) {
+    log.error('call.sh status failed during reconciliation — treating as still running, not clearing', { err });
+    return { capture: true, ui: true, notes: true };
+  }
+}
+
+/**
+ * The DB's recorder_sessions "active" row (stopped_at IS NULL) and
+ * negotiator's actual process state are two independent sources of truth
+ * that can drift — a stop that failed partway through, a crashed bridge
+ * process, a DB write that itself failed mid-stop. Trust the filesystem:
+ * if the DB says a session is active but call.sh reports nothing running,
+ * the row is stale — reconcile it here (mark it stopped, reason
+ * 'reconciled') and treat it as "nothing running" from this point on,
+ * rather than refusing every future `start` until someone clears it by
+ * hand. Called from applyRecorderStart/stopAndIngest (so a stale row
+ * self-heals the moment anyone next tries to start or stop) and from
+ * host-sweep's periodic sweepRecorderCap tick (./index.ts) — so it also
+ * self-heals on its own within about a minute, with no user action at all.
+ */
+export async function reconciledRunningSession(): Promise<RecorderSessionRow | undefined> {
+  const running = getRunningRecorderSession();
+  if (!running) return undefined;
+
+  const status = await callShStatus();
+  if (status.capture || status.ui || status.notes) return running; // genuinely still active
+
+  log.warn('recorder_sessions row was active but call.sh reports nothing running — reconciling', {
+    recorderSessionId: running.id,
+  });
+  markRecorderSessionStopped(running.id, new Date().toISOString(), 'reconciled');
+  return undefined;
+}
+
 export async function applyRecorderStart(content: Record<string, unknown>, session: Session): Promise<void> {
   const them = typeof content.them === 'string' && content.them.trim() ? content.them.trim() : 'Other party';
   const context = typeof content.context === 'string' ? content.context.trim() : '';
   const rawProject = typeof content.project === 'string' ? content.project.trim() : '';
 
-  if (getRunningRecorderSession()) {
+  if (await reconciledRunningSession()) {
     notifyAgent(
       session,
       "Recorder is already running. Tell the user it's already recording — no need to start it again.",
@@ -181,7 +239,7 @@ export async function applyRecorderStop(_content: Record<string, unknown>, sessi
 }
 
 export async function stopAndIngest(session: Session, reason: 'user' | 'cap'): Promise<void> {
-  const running = getRunningRecorderSession();
+  const running = await reconciledRunningSession();
   if (!running) {
     if (reason === 'user') {
       notifyAgent(session, "Recorder is not running. Tell the user there's nothing to stop.");
