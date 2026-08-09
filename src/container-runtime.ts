@@ -6,6 +6,11 @@ import { execSync } from 'child_process';
 
 import { CONTAINER_INSTALL_LABEL } from './config.js';
 import { log } from './log.js';
+import { notifyStartupFailure } from './startup-notify.js';
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 /** The container runtime binary name. */
 export const CONTAINER_RUNTIME_BIN = 'docker';
@@ -34,28 +39,70 @@ export function stopContainer(name: string): void {
   execSync(`${CONTAINER_RUNTIME_BIN} stop -t 1 ${name}`, { stdio: 'pipe' });
 }
 
-/** Ensure the container runtime is running, starting it if needed. */
-export function ensureContainerRuntimeRunning(): void {
-  try {
-    execSync(`${CONTAINER_RUNTIME_BIN} info`, {
-      stdio: 'pipe',
-      timeout: 10000,
-    });
-    log.debug('Container runtime already running');
-  } catch (err) {
-    log.error('Failed to reach container runtime', { err });
-    console.error('\n╔════════════════════════════════════════════════════════════════╗');
-    console.error('║  FATAL: Container runtime failed to start                      ║');
-    console.error('║                                                                ║');
-    console.error('║  Agents cannot run without a container runtime. To fix:        ║');
-    console.error('║  1. Ensure Docker is installed and running                     ║');
-    console.error('║  2. Run: docker info                                           ║');
-    console.error('║  3. Restart NanoClaw                                           ║');
-    console.error('╚════════════════════════════════════════════════════════════════╝\n');
-    throw new Error('Container runtime is required but failed to start', {
-      cause: err,
-    });
+/** Default: keep polling for ~2 minutes — Docker Desktop typically needs
+ *  30-60s to come up after login, and launchd's job wins that race on every
+ *  boot. A normal reboot should self-heal instead of tripping the circuit
+ *  breaker. */
+const DEFAULT_RUNTIME_POLL_TIMEOUT_MS = 120_000;
+const DEFAULT_RUNTIME_POLL_INTERVAL_MS = 5_000;
+
+/**
+ * Ensure the container runtime is reachable, polling for up to `timeoutMs`
+ * before giving up. On genuine failure (runtime never came up), sends a
+ * best-effort Telegram notification — this is the only signal outside the
+ * log file, since channel adapters haven't started yet.
+ */
+export async function ensureContainerRuntimeRunning(
+  opts: { timeoutMs?: number; pollIntervalMs?: number } = {},
+): Promise<void> {
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_RUNTIME_POLL_TIMEOUT_MS;
+  const pollIntervalMs = opts.pollIntervalMs ?? DEFAULT_RUNTIME_POLL_INTERVAL_MS;
+  const deadline = Date.now() + timeoutMs;
+
+  let attempt = 0;
+  let lastErr: unknown;
+  while (true) {
+    attempt++;
+    try {
+      execSync(`${CONTAINER_RUNTIME_BIN} info`, {
+        stdio: 'pipe',
+        timeout: 10000,
+      });
+      if (attempt > 1) {
+        log.info('Container runtime became available', { attempt });
+      } else {
+        log.debug('Container runtime already running');
+      }
+      return;
+    } catch (err) {
+      lastErr = err;
+      if (attempt === 1) {
+        log.warn('Container runtime not reachable yet — waiting for it to start (e.g. Docker Desktop after login)', {
+          timeoutMs,
+        });
+      }
+      if (Date.now() + pollIntervalMs > deadline) break; // no time for another attempt
+      await sleep(pollIntervalMs);
+    }
   }
+
+  log.error('Failed to reach container runtime after waiting', { attempts: attempt, timeoutMs, err: lastErr });
+  console.error('\n╔════════════════════════════════════════════════════════════════╗');
+  console.error('║  FATAL: Container runtime failed to start                      ║');
+  console.error('║                                                                ║');
+  console.error('║  Agents cannot run without a container runtime. To fix:        ║');
+  console.error('║  1. Ensure Docker is installed and running                     ║');
+  console.error('║  2. Run: docker info                                           ║');
+  console.error('║  3. Restart NanoClaw                                           ║');
+  console.error('╚════════════════════════════════════════════════════════════════╝\n');
+
+  await notifyStartupFailure(
+    `⚠️ NanoClaw failed to start: container runtime (${CONTAINER_RUNTIME_BIN}) still unreachable after waiting ${Math.round(timeoutMs / 1000)}s. All agents are down until this is fixed. Check Docker Desktop, then restart NanoClaw.`,
+  );
+
+  throw new Error('Container runtime is required but failed to start', {
+    cause: lastErr,
+  });
 }
 
 /**

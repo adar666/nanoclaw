@@ -60,6 +60,27 @@ const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
 const activeContainers = new Map<string, { process: ChildProcess; containerName: string }>();
 
 /**
+ * Docker Desktop's VirtioFS backend sometimes hasn't finished propagating a
+ * just-established bind mount (the session-dir `/workspace` mount) into the
+ * VM's view before runc resolves a *nested* mount destination underneath it
+ * (`/workspace/extra/...` — see validateAdditionalMounts). runc's rootfs-
+ * containment check then spuriously rejects the nested mount as "outside of
+ * rootfs". This is a known, unresolved Docker Desktop/VirtioFS race (see
+ * docker/for-mac#7853, docker/desktop-feedback#279) — not a bad mount config.
+ * It self-resolves once VirtioFS catches up, so a short retry dodges it
+ * without masking a genuinely broken mount (bad path, permissions, missing
+ * file) — those fail with a different code/message and are NOT retried here.
+ */
+const MOUNT_RACE_MAX_ATTEMPTS = 3;
+const MOUNT_RACE_RETRY_DELAYS_MS = [1000, 2000]; // gap before attempt 2, then before attempt 3
+
+export function isRetryableMountRace(code: number | null, stderrLines: string[]): boolean {
+  if (code !== 125) return false;
+  const joined = stderrLines.join('\n');
+  return joined.includes('OCI runtime create failed') && joined.includes('is outside of rootfs');
+}
+
+/**
  * In-flight wake promises, keyed by session id. Deduplicates concurrent
  * `wakeContainer` calls while the first spawn is still mid-setup (async
  * buildContainerArgs, OneCLI gateway apply, etc.) — otherwise a second
@@ -146,10 +167,32 @@ async function spawnContainer(session: Session): Promise<void> {
   const { provider, contribution } = resolveProviderContribution(session, agentGroup, containerConfig);
 
   const mounts = buildMounts(agentGroup, session, containerConfig, provider, contribution);
-  const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
   // OneCLI agent identifier is always the agent group id — stable across
   // sessions and reversible via getAgentGroup() for approval routing.
   const agentIdentifier = agentGroup.id;
+
+  await spawnAttempt(session, agentGroup, mounts, containerConfig, provider, contribution, agentIdentifier, 1);
+}
+
+/**
+ * One spawn attempt. On the narrow VirtioFS mount-race signature (see
+ * isRetryableMountRace), retries with a short backoff up to
+ * MOUNT_RACE_MAX_ATTEMPTS before falling through to today's behavior (leave
+ * it pending — host-sweep's next tick picks it up). Any other failure —
+ * a genuinely bad mount, missing binary, wrong provider — is NOT retried
+ * here; it surfaces exactly as before via the existing warn log.
+ */
+async function spawnAttempt(
+  session: Session,
+  agentGroup: AgentGroup,
+  mounts: VolumeMount[],
+  containerConfig: import('./container-config.js').ContainerConfig,
+  provider: string,
+  contribution: ProviderContainerContribution,
+  agentIdentifier: string,
+  attempt: number,
+): Promise<void> {
+  const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
   const args = await buildContainerArgs(
     mounts,
     containerName,
@@ -160,7 +203,12 @@ async function spawnContainer(session: Session): Promise<void> {
     agentIdentifier,
   );
 
-  log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
+  log.info('Spawning container', {
+    sessionId: session.id,
+    agentGroup: agentGroup.name,
+    containerName,
+    attempt,
+  });
 
   // Clear any orphan heartbeat from a previous container instance — the
   // sweep's ceiling check treats a missing file as "fresh spawn, give grace"
@@ -198,6 +246,45 @@ async function spawnContainer(session: Session): Promise<void> {
     activeContainers.delete(session.id);
     markContainerStopped(session.id);
     stopTypingRefresh(session.id);
+
+    if (isRetryableMountRace(code, stderrTail) && attempt < MOUNT_RACE_MAX_ATTEMPTS) {
+      const delayMs = MOUNT_RACE_RETRY_DELAYS_MS[attempt - 1];
+      log.warn('Container hit the VirtioFS mount race — retrying', {
+        sessionId: session.id,
+        containerName,
+        attempt,
+        nextAttempt: attempt + 1,
+        maxAttempts: MOUNT_RACE_MAX_ATTEMPTS,
+        delayMs,
+      });
+      setTimeout(() => {
+        spawnAttempt(
+          session,
+          agentGroup,
+          mounts,
+          containerConfig,
+          provider,
+          contribution,
+          agentIdentifier,
+          attempt + 1,
+        ).catch((err) =>
+          log.error('Mount-race retry spawn failed', { sessionId: session.id, attempt: attempt + 1, err }),
+        );
+      }, delayMs);
+      return;
+    }
+
+    if (isRetryableMountRace(code, stderrTail)) {
+      log.warn('Container exhausted mount-race retries — falling through to host-sweep', {
+        sessionId: session.id,
+        containerName,
+        attempt,
+        maxAttempts: MOUNT_RACE_MAX_ATTEMPTS,
+        stderrTail,
+      });
+      return;
+    }
+
     // code null = killed by signal (normal shutdown path), not a boot failure.
     if (code !== 0 && code !== null && stderrTail.length > 0) {
       log.warn('Container exited non-zero', { sessionId: session.id, code, containerName, stderrTail });

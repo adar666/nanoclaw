@@ -17,6 +17,12 @@ vi.mock('child_process', () => ({
   execSync: (...args: unknown[]) => mockExecSync(...args),
 }));
 
+// Mock startup-notify — asserted separately, kept out of these tests' scope
+const mockNotifyStartupFailure = vi.fn();
+vi.mock('./startup-notify.js', () => ({
+  notifyStartupFailure: (...args: unknown[]) => mockNotifyStartupFailure(...args),
+}));
+
 import {
   CONTAINER_RUNTIME_BIN,
   readonlyMountArgs,
@@ -59,10 +65,10 @@ describe('stopContainer', () => {
 // --- ensureContainerRuntimeRunning ---
 
 describe('ensureContainerRuntimeRunning', () => {
-  it('does nothing when runtime is already running', () => {
+  it('does nothing when runtime is already running', async () => {
     mockExecSync.mockReturnValueOnce('');
 
-    ensureContainerRuntimeRunning();
+    await ensureContainerRuntimeRunning();
 
     expect(mockExecSync).toHaveBeenCalledTimes(1);
     expect(mockExecSync).toHaveBeenCalledWith(`${CONTAINER_RUNTIME_BIN} info`, {
@@ -70,15 +76,38 @@ describe('ensureContainerRuntimeRunning', () => {
       timeout: 10000,
     });
     expect(log.debug).toHaveBeenCalledWith('Container runtime already running');
+    expect(mockNotifyStartupFailure).not.toHaveBeenCalled();
   });
 
-  it('throws when docker info fails', () => {
-    mockExecSync.mockImplementationOnce(() => {
+  it('self-heals when the runtime comes up mid-poll (Docker Desktop race)', async () => {
+    mockExecSync
+      .mockImplementationOnce(() => {
+        throw new Error('Cannot connect to the Docker daemon');
+      })
+      .mockImplementationOnce(() => {
+        throw new Error('Cannot connect to the Docker daemon');
+      })
+      .mockReturnValueOnce('');
+
+    await ensureContainerRuntimeRunning({ timeoutMs: 1000, pollIntervalMs: 1 });
+
+    expect(mockExecSync).toHaveBeenCalledTimes(3);
+    expect(log.info).toHaveBeenCalledWith('Container runtime became available', { attempt: 3 });
+    expect(mockNotifyStartupFailure).not.toHaveBeenCalled();
+  });
+
+  it('throws and sends a Telegram notification when docker never comes up within the timeout', async () => {
+    mockExecSync.mockImplementation(() => {
       throw new Error('Cannot connect to the Docker daemon');
     });
 
-    expect(() => ensureContainerRuntimeRunning()).toThrow('Container runtime is required but failed to start');
+    await expect(ensureContainerRuntimeRunning({ timeoutMs: 20, pollIntervalMs: 5 })).rejects.toThrow(
+      'Container runtime is required but failed to start',
+    );
+
     expect(log.error).toHaveBeenCalled();
+    expect(mockNotifyStartupFailure).toHaveBeenCalledTimes(1);
+    expect(mockNotifyStartupFailure).toHaveBeenCalledWith(expect.stringContaining('container runtime'));
   });
 });
 

@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { describe, expect, it } from 'vitest';
 
-import { hardeningArgs, resolveProviderName } from './container-runner.js';
+import { hardeningArgs, isRetryableMountRace, resolveProviderName } from './container-runner.js';
 
 describe('resolveProviderName', () => {
   it('prefers session over container config', () => {
@@ -25,6 +25,40 @@ describe('resolveProviderName', () => {
   it('treats empty string as unset (falls through)', () => {
     expect(resolveProviderName('', 'opencode')).toBe('opencode');
     expect(resolveProviderName(null, '')).toBe('claude');
+  });
+});
+
+describe('isRetryableMountRace', () => {
+  const mountRaceStderr = [
+    'docker: Error response from daemon: failed to create task for container: failed to create shim task: OCI runtime create failed: runc create failed: unable to start container process: error during container init: error mounting "/host_mnt/Users/uriel/second-brain-data/household.db" to rootfs at "/workspace/extra/second-brain-data/household.db": create mountpoint for /workspace/extra/second-brain-data/household.db mount: mountpoint "/run/host_virtiofs/..." is outside of rootfs "/var/lib/docker/rootfs/overlayfs/abc123"',
+    "Run 'docker run --help' for more information",
+  ];
+
+  it('matches the exact OCI-125 VirtioFS mount-race signature', () => {
+    expect(isRetryableMountRace(125, mountRaceStderr)).toBe(true);
+  });
+
+  it('does not match on a different exit code, even with matching text', () => {
+    expect(isRetryableMountRace(1, mountRaceStderr)).toBe(false);
+    expect(isRetryableMountRace(null, mountRaceStderr)).toBe(false);
+  });
+
+  it('does not match code 125 without the specific mount-race text', () => {
+    // A genuinely bad mount, wrong provider binary, etc. — should fail loud,
+    // not get silently retried and turned into a slower failure.
+    expect(isRetryableMountRace(125, ['docker: Error response from daemon: no such file or directory'])).toBe(false);
+    // Only one of the two required substrings present — not narrow enough on its own.
+    expect(isRetryableMountRace(125, ['OCI runtime create failed: some unrelated error'])).toBe(false);
+    expect(isRetryableMountRace(125, ['permission denied: is outside of rootfs but not the real signature'])).toBe(
+      false,
+    );
+    // Both substrings present (even split across lines) is the actual signature.
+    expect(isRetryableMountRace(125, ['OCI runtime create failed: ...', '... is outside of rootfs ...'])).toBe(true);
+  });
+
+  it('does not match a clean exit or empty stderr', () => {
+    expect(isRetryableMountRace(0, [])).toBe(false);
+    expect(isRetryableMountRace(125, [])).toBe(false);
   });
 });
 

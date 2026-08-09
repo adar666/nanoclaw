@@ -79,8 +79,10 @@ async function main(): Promise<void> {
   // Idempotent — skips groups that already have a config row.
   backfillContainerConfigs();
 
-  // 2. Container runtime
-  ensureContainerRuntimeRunning();
+  // 2. Container runtime — polls for up to ~2min so a normal boot (Docker
+  // Desktop starting after login) self-heals instead of crash-looping into
+  // the circuit breaker's 15min backoff.
+  await ensureContainerRuntimeRunning();
   cleanupOrphans();
 
   // 3. Channel adapters
