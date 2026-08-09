@@ -15,10 +15,13 @@
  *   tries++. Existing retry machinery does the rest.
  *
  *   If the container IS running:
- *     1. Absolute ceiling: heartbeat age > max(30 min, current_bash_timeout)
- *        → kill. Covers the "alive but silent for 30 min" case. Extended
- *        only while Bash is declared as running longer, honouring the
- *        user's own timeout directive. Kill then resets processing rows.
+ *     1. Absolute ceiling: heartbeat age > max(ceiling, current_bash_timeout)
+ *        → kill, where ceiling is the group's container_configs.idle_timeout_minutes
+ *        override if set, else ABSOLUTE_CEILING_MS (30 min). Covers the "alive
+ *        but silent past the ceiling" case. Extended only while Bash is
+ *        declared as running longer, honouring the user's own timeout
+ *        directive — a shorter group override never kills a genuinely
+ *        in-flight tool call early. Kill then resets processing rows.
  *
  *     2. Message-scoped stuck: for each 'processing' row, tolerance =
  *        max(60s, current_bash_timeout_ms_if_Bash_running). If
@@ -32,6 +35,7 @@ import fs from 'fs';
 import { ensureEgressNetwork } from './egress-lockdown.js';
 import { getActiveSessions, isTaskThread, updateSession } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
+import { getContainerConfig } from './db/container-configs.js';
 import {
   countDueMessages,
   deleteOrphanProcessingClaims,
@@ -67,6 +71,9 @@ export const ABSOLUTE_CEILING_MS = 30 * 60 * 1000;
 // Stuck tolerance window applied per 'processing' claim — "did we see any
 // signs of life since this message was claimed?"
 export const CLAIM_STUCK_MS = 60 * 1000;
+// Gap between consecutive spawns within one sweep tick, applied only after a
+// session that actually just woke — see the loop in sweep() for why.
+export const SPAWN_STAGGER_MS = 500;
 const MAX_TRIES = 5;
 const BACKOFF_BASE_MS = 5000;
 
@@ -85,8 +92,10 @@ export function decideStuckAction(args: {
   heartbeatMtimeMs: number; // 0 when heartbeat file absent
   containerState: ContainerState | null;
   claims: Array<{ message_id: string; status_changed: string }>;
+  /** Per-group override for the absolute ceiling (container_configs.idle_timeout_minutes, in ms). Defaults to ABSOLUTE_CEILING_MS. */
+  ceilingMs?: number;
 }): StuckDecision {
-  const { now, heartbeatMtimeMs, containerState, claims } = args;
+  const { now, heartbeatMtimeMs, containerState, claims, ceilingMs = ABSOLUTE_CEILING_MS } = args;
   const declaredBashMs = bashTimeoutMs(containerState);
 
   // Ceiling check only applies when we have an actual heartbeat timestamp.
@@ -99,7 +108,11 @@ export function decideStuckAction(args: {
   // claim-stuck check below handles it.
   if (heartbeatMtimeMs !== 0) {
     const heartbeatAge = now - heartbeatMtimeMs;
-    const ceiling = Math.max(ABSOLUTE_CEILING_MS, declaredBashMs ?? 0);
+    // A group's idle-timeout override can shorten the ceiling below the
+    // instance default, but an in-flight Bash tool's declared timeout still
+    // wins — a running tool call is never killed early regardless of the
+    // group's idle preference.
+    const ceiling = Math.max(ceilingMs, declaredBashMs ?? 0);
     if (heartbeatAge > ceiling) {
       return { action: 'kill-ceiling', heartbeatAgeMs: heartbeatAge, ceilingMs: ceiling };
     }
@@ -146,7 +159,16 @@ async function sweep(): Promise<void> {
   try {
     const sessions = getActiveSessions();
     for (const session of sessions) {
-      await sweepSession(session);
+      const justWoke = await sweepSession(session);
+      // Stagger back-to-back spawns within one tick. Multiple due sessions
+      // discovered in the same sweep otherwise fire docker run within
+      // milliseconds of each other — confirmed in logs as a concurrency
+      // aggravator for the VirtioFS nested-mount race (container-runner.ts's
+      // isRetryableMountRace comment has the full writeup). Only sessions
+      // that actually spawned this tick pay the delay.
+      if (justWoke) {
+        await new Promise((resolve) => setTimeout(resolve, SPAWN_STAGGER_MS));
+      }
     }
   } catch (err) {
     log.error('Host sweep error', { err });
@@ -164,6 +186,17 @@ async function sweep(): Promise<void> {
   }
   // MODULE-HOOK:approvals-reason-sweep:end
 
+  // Recorder max-duration cap — independent of whether the agent ever calls
+  // recorder.stop. Central-DB scan, once per tick.
+  // MODULE-HOOK:recorder-cap-sweep:start
+  try {
+    const { sweepRecorderCap } = await import('./modules/recorder/index.js');
+    await sweepRecorderCap();
+  } catch (err) {
+    log.error('Recorder cap sweep failed', { err });
+  }
+  // MODULE-HOOK:recorder-cap-sweep:end
+
   setTimeout(sweep, SWEEP_INTERVAL_MS);
 }
 
@@ -176,19 +209,20 @@ export function shouldCloseTaskSession(
   return isTaskThread(threadId) && !containerRunning && liveTaskCount === 0;
 }
 
-async function sweepSession(session: Session): Promise<void> {
+/** Returns true iff this call woke a container (used to stagger the sweep loop). */
+async function sweepSession(session: Session): Promise<boolean> {
   const agentGroup = getAgentGroup(session.agent_group_id);
-  if (!agentGroup) return;
+  if (!agentGroup) return false;
 
   const inPath = inboundDbPath(agentGroup.id, session.id);
-  if (!fs.existsSync(inPath)) return;
+  if (!fs.existsSync(inPath)) return false;
 
   let inDb: Database.Database;
   let outDb: Database.Database | null = null;
   try {
     inDb = openInboundDb(agentGroup.id, session.id);
   } catch {
-    return;
+    return false;
   }
 
   try {
@@ -197,6 +231,7 @@ async function sweepSession(session: Session): Promise<void> {
     // outbound.db might not exist yet (container hasn't started)
   }
 
+  let justWoke = false;
   try {
     // 1. Sync processing_ack → messages_in status
     if (outDb) {
@@ -210,7 +245,6 @@ async function sweepSession(session: Session): Promise<void> {
     // would keep bumping process_after into the future, dueCount would stay 0,
     // and the wake would never fire.
     const dueCount = countDueMessages(inDb);
-    let justWoke = false;
     if (dueCount > 0 && !isContainerRunning(session.id)) {
       log.info('Waking container for due messages', { sessionId: session.id, count: dueCount });
       // wakeContainer never throws — transient spawn failures (OneCLI down,
@@ -265,6 +299,7 @@ async function sweepSession(session: Session): Promise<void> {
     inDb.close();
     outDb?.close();
   }
+  return justWoke;
 }
 
 function heartbeatMtimeMs(agentGroupId: string, sessionId: string): number {
@@ -281,6 +316,12 @@ function bashTimeoutMs(state: ContainerState | null): number | null {
   return typeof state.tool_declared_timeout_ms === 'number' ? state.tool_declared_timeout_ms : null;
 }
 
+/** Per-group absolute-ceiling override (container_configs.idle_timeout_minutes). NULL/unset → ABSOLUTE_CEILING_MS. */
+function idleCeilingMsFor(agentGroupId: string): number {
+  const minutes = getContainerConfig(agentGroupId)?.idle_timeout_minutes;
+  return minutes ? minutes * 60_000 : ABSOLUTE_CEILING_MS;
+}
+
 function enforceRunningContainerSla(
   inDb: Database.Database,
   outDb: Database.Database,
@@ -292,6 +333,7 @@ function enforceRunningContainerSla(
     heartbeatMtimeMs: heartbeatMtimeMs(agentGroupId, session.id),
     containerState: getContainerState(outDb),
     claims: getProcessingClaims(outDb),
+    ceilingMs: idleCeilingMsFor(agentGroupId),
   });
 
   if (decision.action === 'ok') return;
