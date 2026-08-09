@@ -1,14 +1,17 @@
 /**
  * Guarded handler bodies for recorder start/stop.
  *
- * Both bodies run negotiator's own run.sh — a fixed binary path, invoked
- * with an argv array (never a shell string), so the two free-text values
- * the agent supplies (them/context) can only ever land as flag VALUES.
- * Runs are short-lived: `run.sh start` backgrounds negotiator via `nohup`
- * and returns in under a second; `run.sh stop` waits for a clean SIGTERM
- * exit (up to ~5s) and then runs negotiator's own summarize.sh
- * synchronously before returning. See ./guard.ts for why this never holds
- * for approval.
+ * Both bodies run negotiator's own call.sh — a fixed binary path, invoked
+ * with an argv array (never a shell string), so the free-text values the
+ * agent supplies (them/context/project) can only ever land as flag VALUES.
+ * call.sh (not run.sh) is the entry point: it starts capture, the notes UI,
+ * and notes.js as one orchestrated session, rolls all three back if any
+ * fails to become ready (G33), runs a mandatory audio preflight before
+ * starting (G45/G46 — BLOCKS on failure; see applyRecorderStart's error
+ * path, never pass --skip-preflight automatically), and on `end` refuses
+ * to report success for a session that produced no usable transcript
+ * (G56 — see stopAndIngest's error path). See ./guard.ts for why this
+ * never holds for approval.
  *
  * `stopAndIngest` is shared by the agent-triggered stop (recorder.stop) and
  * host-sweep's cap enforcement (./index.ts's sweepRecorderCap) — same
@@ -29,6 +32,7 @@ import {
   markRecorderSessionStopped,
   type RecorderSessionRow,
 } from './db.js';
+import { resolveProjectAlias } from './project-aliases.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -40,18 +44,23 @@ const NEGOTIATOR_LOGS_DIR = join(NEGOTIATOR_ROOT, 'logs');
 
 // Homebrew on Apple Silicon lives at /opt/homebrew, which is NOT on
 // NanoClaw's launchd job's PATH (/usr/local/bin:/usr/bin:/bin:/Users/uriel/.local/bin
-// — confirmed via ~/Library/LaunchAgents/com.nanoclaw-v2-*.plist). run.sh
+// — confirmed via ~/Library/LaunchAgents/com.nanoclaw-v2-*.plist). call.sh
 // backgrounds `node run.js` bare (resolves fine, /usr/local/bin/node is on
-// that PATH) which in turn bare-spawns `ffmpeg` three levels down
-// (negotiator's capture.js/wav-split.js/devices.js) — NOT on that PATH.
-// Every execFileAsync call below passes this widened PATH so the whole
-// downstream chain inherits it, without touching the sibling negotiator
-// repo. Same class of bug, same fix, as voice-transcription.ts's absolute
-// binary paths — see docs/superpowers/specs/2026-08-05-hebrew-voice-transcription-design.md.
+// that PATH) which in turn bare-spawns `ffmpeg` three levels down — NOT on
+// that PATH. Every execFileAsync call below passes this widened PATH so
+// the whole downstream chain inherits it, without touching the sibling
+// negotiator repo.
 const SPAWN_ENV = {
   ...process.env,
   PATH: `${process.env.PATH ?? ''}:/opt/homebrew/bin`,
 };
+
+// call.sh orchestrates three processes plus a mandatory preflight — a
+// cold start (preflight + capture + ui + notes, each with up to
+// NEGOTIATOR_CALL_READY_TIMEOUT_SEC=15s to become ready) can legitimately
+// take longer than the old single-process run.sh path's 15s budget.
+const CALL_START_TIMEOUT_MS = 60_000;
+const CALL_END_TIMEOUT_MS = 60_000;
 
 // 3 hours — a real meeting doesn't run longer than this; anything past it
 // is almost certainly a forgotten "סיימתי". Enforced by host-sweep's
@@ -68,9 +77,34 @@ function describe(row: Pick<RecorderSessionRow, 'them' | 'context'>): string {
   return row.context ? `${row.them}, re: ${row.context}` : row.them;
 }
 
+/** call.sh start echoes `[call] keyterms: <comma-list-or-<none>>` to
+ *  stdout — this is the only way the bridge learns what keyterms a
+ *  --project resolution actually produced, since that computation happens
+ *  entirely inside call.sh/session-context.js. */
+function extractKeyterms(stdout: string): string {
+  const m = stdout.match(/^\[call\] keyterms: (.*)$/m);
+  if (!m) return '';
+  const val = m[1].trim();
+  return val === '<none>' ? '' : val;
+}
+
+/** session-context.js warns to stderr (never stdout) when a --project dir
+ *  doesn't exist on disk — surfaced here so an alias that resolves to a
+ *  stale/renamed directory is still visible in the Telegram confirmation. */
+function extractProjectWarnings(stderr: string): string[] {
+  return (stderr.match(/^\[call\] warning:.*$/gm) ?? []).map((l) => l.replace(/^\[call\] warning:\s*/, ''));
+}
+
+function errorDetail(err: unknown): string {
+  const e = err as NodeJS.ErrnoException & { stdout?: string; stderr?: string };
+  const detail = (e.stderr && e.stderr.trim()) || (e.stdout && e.stdout.trim());
+  return detail || (err instanceof Error ? err.message : String(err));
+}
+
 export async function applyRecorderStart(content: Record<string, unknown>, session: Session): Promise<void> {
   const them = typeof content.them === 'string' && content.them.trim() ? content.them.trim() : 'Other party';
   const context = typeof content.context === 'string' ? content.context.trim() : '';
+  const rawProject = typeof content.project === 'string' ? content.project.trim() : '';
 
   if (getRunningRecorderSession()) {
     notifyAgent(
@@ -80,17 +114,29 @@ export async function applyRecorderStart(content: Record<string, unknown>, sessi
     return;
   }
 
+  // call.sh's --topic is required; the tool's existing "one-line
+  // topic/subject" field (context) already carries that in the vast
+  // majority of cases — but never fail a start over a missing one.
+  const topic = context || `Call with ${them}`;
+
+  const { dir: projectDir, warning: projectWarning } = resolveProjectAlias(rawProject);
+
+  const args = ['start', '--topic', topic, '--lang', 'he', '--them', them];
+  if (projectDir) args.push('--project', projectDir);
+
+  let result: { stdout: string; stderr: string };
   try {
-    await execFileAsync(
-      join(NEGOTIATOR_ROOT, 'run.sh'),
-      ['start', '--', '--lang', 'he', '--them', them, '--context', context],
-      { cwd: NEGOTIATOR_ROOT, timeout: 15_000, env: SPAWN_ENV },
-    );
+    result = await execFileAsync(join(NEGOTIATOR_ROOT, 'call.sh'), args, {
+      cwd: NEGOTIATOR_ROOT,
+      timeout: CALL_START_TIMEOUT_MS,
+      env: SPAWN_ENV,
+    });
   } catch (err) {
     log.error('recorder.start failed', { err });
     notifyAgent(
       session,
-      `Recorder failed to start: ${err instanceof Error ? err.message : String(err)}. Tell the user it did NOT start.`,
+      `Recorder failed to start: ${errorDetail(err)}. Tell the user it did NOT start — this includes a failed audio ` +
+        `preflight (the other party would not have been recorded) or a component that never became ready; nothing is running.`,
     );
     return;
   }
@@ -104,8 +150,19 @@ export async function applyRecorderStart(content: Record<string, unknown>, sessi
     started_at: new Date().toISOString(),
   });
 
-  log.info('Recorder started', { agentGroupId: session.agent_group_id, them, context });
-  notifyAgent(session, `Recording started (${describe({ them, context })}). Tell the user it's live.`);
+  const keyterms = extractKeyterms(result.stdout);
+  const stderrWarnings = extractProjectWarnings(result.stderr);
+
+  const lines: string[] = [];
+  if (rawProject) {
+    lines.push(projectDir ? `Project: "${rawProject}" → ${projectDir}` : `Project: ${projectWarning}`);
+    lines.push(`Keyterms: ${keyterms || 'none'}`);
+  }
+  if (stderrWarnings.length) lines.push(...stderrWarnings);
+  lines.push(`Recording started (${describe({ them, context })}). UI: http://localhost:8140.`);
+
+  log.info('Recorder started', { agentGroupId: session.agent_group_id, them, context, project: projectDir });
+  notifyAgent(session, `${lines.join(' ')} Tell the user it's live and give them the UI link.`);
 }
 
 export async function applyRecorderStop(_content: Record<string, unknown>, session: Session): Promise<void> {
@@ -121,29 +178,35 @@ export async function stopAndIngest(session: Session, reason: 'user' | 'cap'): P
     return;
   }
 
+  let stopFailed: string | null = null;
   try {
-    await execFileAsync(join(NEGOTIATOR_ROOT, 'run.sh'), ['stop'], {
+    await execFileAsync(join(NEGOTIATOR_ROOT, 'call.sh'), ['end'], {
       cwd: NEGOTIATOR_ROOT,
-      timeout: 30_000,
+      timeout: CALL_END_TIMEOUT_MS,
       env: SPAWN_ENV,
     });
   } catch (err) {
-    log.error('recorder.stop failed', { err });
-    notifyAgent(
-      session,
-      `Recorder stop command failed: ${err instanceof Error ? err.message : String(err)}. It may still be running — check manually.`,
-    );
-    return;
+    // call.sh end exits non-zero when the session produced no usable
+    // transcript (FATAL abort, or genuinely zero utterances — call.sh's
+    // G56 check) as well as on an unexpected shell failure. The processes
+    // are stopped either way (call.sh stops them before this check runs),
+    // so the DB row below is still marked stopped — but ingest never
+    // runs and the confirmation must say so plainly, never "ask about it".
+    stopFailed = errorDetail(err);
   }
 
   markRecorderSessionStopped(running.id, new Date().toISOString(), reason);
 
-  // node dist/bin/... (not `pnpm run ...`) deliberately — no PATH
-  // dependency on pnpm being resolvable from wherever the host process's
-  // env came from (e.g. launchd), and no dev-toolchain dependency (tsx) at
-  // runtime. Requires second-brain to have been built (`pnpm run build`)
-  // — see its README's "plain node" invocation note. Re-run that build
-  // after any change to second-brain's src/.
+  if (stopFailed) {
+    log.error('recorder.stop: call.sh end reported a failed session', { err: stopFailed });
+    notifyAgent(
+      session,
+      `Recording stopped, but it did NOT produce a usable transcript — nothing was ingested. ` +
+        `Tell the user this plainly, do not say it's ready to ask about:\n\n${stopFailed}`,
+    );
+    return;
+  }
+
   let ingestSummary: string;
   try {
     const { stdout } = await execFileAsync(

@@ -14,19 +14,51 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'fs';
 
-const { mockExecFile, mockNotifyAgent } = vi.hoisted(() => ({
-  mockExecFile: vi.fn(
+const { mockExecFile, mockNotifyAgent } = vi.hoisted(() => {
+  const mockExecFile = vi.fn(
     (
       _file: string,
       _args: string[],
       _opts: unknown,
       cb: (err: unknown, res: { stdout: string; stderr: string }) => void,
     ) => {
-      cb(null, { stdout: 'ok\n', stderr: '' });
+      cb(null, { stdout: '[call] keyterms: <none>\nUI: http://localhost:8140\n', stderr: '' });
     },
-  ),
-  mockNotifyAgent: vi.fn(),
-}));
+  );
+  // Real Node's child_process.execFile carries a [util.promisify.custom]
+  // implementation that attaches a rejected call's stdout/stderr onto the
+  // Error object — that's what apply.ts's errorDetail() relies on. Mocking
+  // the whole module replaces execFile with a plain vi.fn() that has no such
+  // symbol, so promisify(execFile) would otherwise fall back to generic
+  // behavior and silently drop stdout/stderr on rejection. This reproduces
+  // the real one so promisify(execFile) behaves identically under test.
+  // Must be attached here, inside vi.hoisted() — apply.ts's own
+  // `promisify(execFile)` call happens at module-import time, which (per
+  // Vitest's hoisting) runs before any plain top-level statement in this
+  // file, so attaching the symbol any later would be too late for
+  // promisify() to ever see it. Uses Symbol.for(...) directly (matching
+  // `util.promisify.custom`, verified equal to
+  // Symbol.for('nodejs.util.promisify.custom')) rather than the imported
+  // `promisify` binding, since regular imports haven't been evaluated yet
+  // this early in Vitest's hoisting order and referencing one here throws
+  // "Cannot access '...' before initialization".
+  (mockExecFile as unknown as Record<symbol, unknown>)[Symbol.for('nodejs.util.promisify.custom')] = (
+    file: string,
+    args: string[],
+    opts: unknown,
+  ) =>
+    new Promise((resolve, reject) => {
+      mockExecFile(file, args, opts, (err: unknown, res: { stdout: string; stderr: string }) => {
+        if (err) {
+          Object.assign(err as object, res);
+          reject(err);
+        } else {
+          resolve(res);
+        }
+      });
+    });
+  return { mockExecFile, mockNotifyAgent: vi.fn() };
+});
 
 vi.mock('node:child_process', () => ({ execFile: mockExecFile }));
 vi.mock('../approvals/index.js', () => ({ notifyAgent: mockNotifyAgent }));
@@ -56,7 +88,9 @@ function fakeSession(agentGroupId: string): Session {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  mockExecFile.mockImplementation((_file, _args, _opts, cb) => cb(null, { stdout: 'ok\n', stderr: '' }));
+  mockExecFile.mockImplementation((_file, _args, _opts, cb) =>
+    cb(null, { stdout: '[call] keyterms: <none>\nUI: http://localhost:8140\n', stderr: '' }),
+  );
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true, force: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
   const db = initTestDb();
@@ -139,18 +173,58 @@ describe('recorder_sessions db', () => {
 });
 
 describe('applyRecorderStart', () => {
-  it('invokes run.sh with a fixed binary and them/context as argv values, never a shell string', async () => {
+  it('invokes call.sh start with a fixed binary and them/context/topic as argv values, never a shell string', async () => {
     const session = fakeSession('ag-uriel');
     await applyRecorderStart({ them: 'דניס', context: 'HoursReportWebApp' }, session);
 
     expect(mockExecFile).toHaveBeenCalledTimes(1);
     const [bin, args, opts] = mockExecFile.mock.calls[0]!;
-    expect(bin).toMatch(/run\.sh$/);
-    expect(args).toEqual(['start', '--', '--lang', 'he', '--them', 'דניס', '--context', 'HoursReportWebApp']);
+    expect(bin).toMatch(/call\.sh$/);
+    expect(args).toEqual(['start', '--topic', 'HoursReportWebApp', '--lang', 'he', '--them', 'דניס']);
     // /opt/homebrew/bin isn't on NanoClaw's launchd job's PATH — negotiator's
-    // run.sh backgrounds a bare `ffmpeg` spawn three levels down, which
-    // would silently fail to resolve without this. See apply.ts's SPAWN_ENV.
+    // call.sh backgrounds a bare `node run.js`, which in turn bare-spawns
+    // ffmpeg — see apply.ts's SPAWN_ENV.
     expect((opts as { env?: Record<string, string> }).env?.PATH).toContain('/opt/homebrew/bin');
+  });
+
+  it('falls back to a derived topic when context is empty, rather than failing', async () => {
+    const session = fakeSession('ag-uriel');
+    await applyRecorderStart({ them: 'דניס', context: '' }, session);
+
+    const [, args] = mockExecFile.mock.calls[0]!;
+    expect(args[args.indexOf('--topic') + 1]).toBe('Call with דניס');
+  });
+
+  it('resolves a known project alias to its real directory and passes --project', async () => {
+    const session = fakeSession('ag-uriel');
+    await applyRecorderStart({ them: 'דניס', context: 'x', project: 'פאפי' }, session);
+
+    const [, args] = mockExecFile.mock.calls[0]!;
+    expect(args).toContain('--project');
+    expect(args[args.indexOf('--project') + 1]).toBe('pa-ai');
+  });
+
+  it('an unrecognized project alias warns and still starts, without --project', async () => {
+    const session = fakeSession('ag-uriel');
+    await applyRecorderStart({ them: 'דניס', context: 'x', project: 'שטויות' }, session);
+
+    const [, args] = mockExecFile.mock.calls[0]!;
+    expect(args).not.toContain('--project');
+    expect(getRunningRecorderSession()).toBeDefined();
+    expect(mockNotifyAgent).toHaveBeenCalledWith(session, expect.stringContaining('Unknown project alias "שטויות"'));
+  });
+
+  it('relays the resolved project and keyterms to Telegram before confirming live', async () => {
+    mockExecFile.mockImplementation((_file, _args, _opts, cb) =>
+      cb(null, { stdout: '[call] keyterms: negotiator,BlackHole\nUI: http://localhost:8140\n', stderr: '' }),
+    );
+    const session = fakeSession('ag-uriel');
+    await applyRecorderStart({ them: 'דניס', context: 'x', project: 'פאפי' }, session);
+
+    expect(mockNotifyAgent).toHaveBeenCalledWith(
+      session,
+      expect.stringMatching(/Project: "פאפי" → pa-ai.*Keyterms: negotiator,BlackHole.*Recording started/s),
+    );
   });
 
   it('records a running recorder_sessions row and notifies success', async () => {
@@ -174,15 +248,21 @@ describe('applyRecorderStart', () => {
     expect(mockNotifyAgent).toHaveBeenCalledWith(session, expect.stringContaining('already running'));
   });
 
-  it('notifies failure and does not create a row when run.sh start fails', async () => {
+  it("surfaces call.sh's own stderr verbatim on failure — not a generic message — and creates no row", async () => {
     mockExecFile.mockImplementation((_file, _args, _opts, cb) =>
-      cb(new Error('device busy'), { stdout: '', stderr: '' }),
+      cb(new Error('Command failed with exit code 1'), {
+        stdout: '',
+        stderr: '[check] FAILED: system audio is not reaching BlackHole.\nThe other party will NOT be recorded.',
+      }),
     );
     const session = fakeSession('ag-uriel');
     await applyRecorderStart({ them: 'דניס', context: 'x' }, session);
 
     expect(getRunningRecorderSession()).toBeUndefined();
-    expect(mockNotifyAgent).toHaveBeenCalledWith(session, expect.stringContaining('did NOT start'));
+    expect(mockNotifyAgent).toHaveBeenCalledWith(
+      session,
+      expect.stringContaining('system audio is not reaching BlackHole'),
+    );
   });
 });
 
@@ -202,10 +282,10 @@ describe('applyRecorderStop / stopAndIngest', () => {
 
     await applyRecorderStop({}, session);
 
-    expect(mockExecFile).toHaveBeenCalledTimes(2); // run.sh stop, then the ingest
+    expect(mockExecFile).toHaveBeenCalledTimes(2); // call.sh end, then the ingest
     const [stopBin, stopArgs, stopOpts] = mockExecFile.mock.calls[0]!;
-    expect(stopBin).toMatch(/run\.sh$/);
-    expect(stopArgs).toEqual(['stop']);
+    expect(stopBin).toMatch(/call\.sh$/);
+    expect(stopArgs).toEqual(['end']);
     expect((stopOpts as { env?: Record<string, string> }).env?.PATH).toContain('/opt/homebrew/bin');
     const [ingestBin, ingestArgs] = mockExecFile.mock.calls[1]!;
     expect(ingestArgs).toContain('--dir');
@@ -215,6 +295,33 @@ describe('applyRecorderStop / stopAndIngest', () => {
     const running = getRunningRecorderSession();
     expect(running).toBeUndefined();
     expect(mockNotifyAgent).toHaveBeenCalledWith(session, expect.stringContaining('stopped'));
+  });
+
+  it('a call.sh end failure (no usable transcript) marks the row stopped, never runs ingest, and never says "ask about it"', async () => {
+    const session = fakeSession('ag-uriel');
+    await applyRecorderStart({ them: 'דניס', context: 'x' }, session);
+    mockExecFile.mockClear();
+    mockNotifyAgent.mockClear();
+    mockExecFile.mockImplementation((_file, _args, _opts, cb) =>
+      cb(new Error('exit 1'), {
+        stdout: '',
+        stderr:
+          '[call] RECORDING FAILED — session produced no usable transcript.\nFATAL: audio was captured but zero utterances were transcribed.',
+      }),
+    );
+
+    await applyRecorderStop({}, session);
+
+    expect(mockExecFile).toHaveBeenCalledTimes(1); // call.sh end only — ingest never runs
+    expect(getRunningRecorderSession()).toBeUndefined(); // still marked stopped — processes ARE dead
+    expect(mockNotifyAgent).toHaveBeenCalledWith(
+      session,
+      expect.stringContaining('FATAL: audio was captured but zero utterances were transcribed'),
+    );
+    expect(mockNotifyAgent).not.toHaveBeenCalledWith(
+      session,
+      expect.stringContaining("it's done and ready to ask about"),
+    );
   });
 
   it('a cap-triggered stop notifies with the auto-stop wording, distinct from a user stop', async () => {
@@ -235,7 +342,7 @@ describe('applyRecorderStop / stopAndIngest', () => {
     let call = 0;
     mockExecFile.mockImplementation((_file, _args, _opts, cb) => {
       call++;
-      if (call === 1) return cb(null, { stdout: 'stopped\n', stderr: '' }); // run.sh stop
+      if (call === 1) return cb(null, { stdout: 'stopped\n', stderr: '' }); // call.sh end
       return cb(new Error('ingest crashed'), { stdout: '', stderr: '' }); // ingest
     });
 
