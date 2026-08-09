@@ -32,6 +32,7 @@ import { startTypingRefresh, stopTypingRefresh } from './modules/typing/index.js
 import { log } from './log.js';
 import { resolveSession, writeSessionMessage, writeOutboundDirect } from './session-manager.js';
 import { hasTranscribableVoiceAttachment, applyVoiceTranscription, isVoiceReplyToBot } from './voice-transcription.js';
+import { ingestTelegramMedia } from './media-ingestion.js';
 import { wakeContainer } from './container-runner.js';
 import { getSession } from './db/sessions.js';
 import type { AgentGroup, MessagingGroup, MessagingGroupAgent } from './types.js';
@@ -313,6 +314,34 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
   // the wiring, not just the event. Never true for a text-only message, so
   // it can never affect the text-trigger path.
   const hasVoiceAttachment = hasTranscribableVoiceAttachment(event.message.content);
+
+  // Second-brain media ingestion: Telegram photos/PDF-or-image documents
+  // only (later phases add audio/Office docs/video — see
+  // src/media-ingestion.ts). Runs ONCE per event, before any per-agent
+  // delivery below, using whichever wired agent group has a configured
+  // media tenant — in practice exactly one agent is ever wired to any of
+  // the three groups this feature covers, so this loop is a short,
+  // defensive scan, not a real fan-out. event.message.content is
+  // reassigned in place so every wired agent's own writeSessionMessage call
+  // (per agent, in the loop below) stores the same rewritten text — a tag
+  // plus the caption, or nothing at all if there's no eligible attachment
+  // or no configured tenant for any wired agent (event.message.content is
+  // left completely untouched in that case, the common one).
+  for (const candidate of agents) {
+    const candidateGroup = getAgentGroup(candidate.agent_group_id);
+    if (!candidateGroup) continue;
+    const rewritten = await ingestTelegramMedia(
+      event.message.content,
+      candidateGroup,
+      userId,
+      event.message.id,
+      event.message.timestamp,
+    );
+    if (rewritten !== null) {
+      event.message.content = rewritten;
+      break;
+    }
+  }
 
   // Per-wiring thread policy inputs, resolved once per event. Each wiring's
   // threads override (NULL = inherit) resolves against the channel's declared

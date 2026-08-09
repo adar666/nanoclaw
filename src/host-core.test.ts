@@ -1748,3 +1748,100 @@ describe('router — voice_always_engage override (group, drop policy)', () => {
     expect(wakeContainer).toHaveBeenCalled();
   });
 });
+
+describe('router — media ingestion wiring', () => {
+  beforeEach(async () => {
+    mockDeliver.mockReset().mockResolvedValue(undefined);
+    const { ingestTelegramMedia } = await import('./media-ingestion.js');
+    vi.mocked(ingestTelegramMedia).mockReset();
+    createAgentGroup({
+      id: 'ag-media',
+      name: 'Yulanda',
+      folder: 'dm-with-uriel',
+      agent_provider: null,
+      created_at: now(),
+    });
+    createMessagingGroup({
+      id: 'mg-media',
+      channel_type: 'telegram',
+      platform_id: 'tg-media-1',
+      name: null,
+      is_group: 0,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+    createMessagingGroupAgent({
+      id: 'mga-media',
+      messaging_group_id: 'mg-media',
+      agent_group_id: 'ag-media',
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'shared',
+      priority: 0,
+      created_at: now(),
+    });
+  });
+
+  function photoEvent(id: string): InboundEvent {
+    return {
+      channelType: 'telegram',
+      platformId: 'tg-media-1',
+      threadId: null,
+      message: {
+        id,
+        kind: 'chat-sdk',
+        content: JSON.stringify({
+          text: 'what is this',
+          attachments: [{ type: 'image', size: 100, data: 'ZmFrZQ==' }],
+        }),
+        timestamp: now(),
+      },
+    };
+  }
+
+  it('calls ingestTelegramMedia with the event fields, and stores its rewritten content instead of the original', async () => {
+    const { routeInbound } = await import('./router.js');
+    const { ingestTelegramMedia } = await import('./media-ingestion.js');
+    vi.mocked(ingestTelegramMedia).mockResolvedValue(
+      JSON.stringify({ text: '[MEDIA] /fake/path (telegram-photo, image/jpeg)\nwhat is this' }),
+    );
+
+    await routeInbound(photoEvent('msg-media-1'));
+
+    expect(ingestTelegramMedia).toHaveBeenCalledWith(
+      expect.stringContaining('attachments'),
+      expect.objectContaining({ folder: 'dm-with-uriel' }),
+      null, // no senderResolver registered in this test file — matches every other test here
+      'msg-media-1',
+      expect.any(String),
+    );
+
+    const session = findSession('mg-media', null);
+    const db = new Database(inboundDbPath('ag-media', session!.id));
+    const row = db.prepare('SELECT content FROM messages_in').get() as { content: string };
+    db.close();
+    expect(JSON.parse(row.content).text).toContain('[MEDIA]');
+    expect(JSON.parse(row.content).text).toContain('/fake/path');
+  });
+
+  it('leaves content untouched when ingestTelegramMedia returns null (the common no-media case)', async () => {
+    const { routeInbound } = await import('./router.js');
+    const { ingestTelegramMedia } = await import('./media-ingestion.js');
+    vi.mocked(ingestTelegramMedia).mockResolvedValue(null);
+
+    await routeInbound({
+      channelType: 'telegram',
+      platformId: 'tg-media-1',
+      threadId: null,
+      message: { id: 'msg-media-2', kind: 'chat-sdk', content: JSON.stringify({ text: 'hi' }), timestamp: now() },
+    });
+
+    const session = findSession('mg-media', null);
+    const db = new Database(inboundDbPath('ag-media', session!.id));
+    const row = db.prepare('SELECT content FROM messages_in').get() as { content: string };
+    db.close();
+    expect(JSON.parse(row.content).text).toBe('hi');
+  });
+});
