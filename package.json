@@ -9,7 +9,7 @@
     "ncl": "bin/ncl"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && cp src/modules/recorder/project-aliases.json dist/modules/recorder/project-aliases.json",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
     "typecheck": "tsc --noEmit",
