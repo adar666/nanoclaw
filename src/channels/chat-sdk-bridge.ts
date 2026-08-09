@@ -39,6 +39,13 @@ interface GatewayAdapter extends Adapter {
 export interface ReplyContext {
   text: string;
   sender: string;
+  /**
+   * True when the replied-to message was authored by a bot account (the
+   * platform's own signal — Telegram's `User.is_bot`, for instance — not a
+   * name/username comparison). Extractors that can't determine this leave it
+   * undefined; router.ts treats undefined as "not a reply to the bot."
+   */
+  isBot?: boolean;
 }
 
 /** Extract reply context from a platform-specific raw message. Return null if no reply. */
