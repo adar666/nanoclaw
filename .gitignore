@@ -49,3 +49,12 @@ forks.md
 
 # Subagent-driven-development scratch workspace (ledgers, briefs, review packages)
 .superpowers/
+
+# NanoClawBridge build output — ad-hoc signed .app bundle. Rebuilding/re-signing
+# invalidates the macOS TCC microphone grant tied to it; never committed, never
+# reproduced by CI. See launchd/wrapper-src/main.c for the (unshipped) source.
+launchd/NanoClawBridge.app/
+*.app/
+
+# Per-host scheduler lock, not shared state.
+.claude/scheduled_tasks.lock
