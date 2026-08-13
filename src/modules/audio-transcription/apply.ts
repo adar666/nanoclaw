@@ -142,6 +142,33 @@ export async function handleTranscribeAudioImpl(
     return;
   }
 
+  // The string check above only rules out `../`-style traversal in the
+  // agent-declared path itself — it does not follow symlinks. The session
+  // dir is agent-writable, so a compromised/prompt-injected agent could
+  // pre-place a symlink inside its own inbox pointing at an arbitrary host
+  // path and then declare that path; isPathInside would pass (it's
+  // textually inside sessDir) and fs.existsSync would follow the link.
+  // Resolve both sides and re-check containment on the realpaths — same
+  // idea as ensureContainedInboxDir's realpath guard for the write path
+  // (src/inbox-safety.ts), adapted for this read path.
+  let realSessDir: string;
+  let realHostPath: string;
+  try {
+    realSessDir = fs.realpathSync(sessDir);
+    realHostPath = fs.realpathSync(hostPath);
+  } catch (err) {
+    log.warn('transcribe_audio: failed to resolve real path, refusing', { sessionId: session.id, hostPath, err });
+    return;
+  }
+  if (!isPathInside(realSessDir, realHostPath)) {
+    log.warn('transcribe_audio: resolved path escapes session dir, refusing', {
+      sessionId: session.id,
+      hostPath,
+      realHostPath,
+    });
+    return;
+  }
+
   const note = typeof content.note === 'string' ? content.note : undefined;
   void runJob(session.agent_group_id, session.id, hostPath, note);
 }
@@ -152,6 +179,17 @@ export async function handleTranscribeAudioImpl(
  * called awaited from the delivery-action handler (see above) — this is
  * where the actual multi-minute wait lives, fully decoupled from the
  * outbound-delivery poll loop.
+ *
+ * This feature is fire-and-forget by design: there's no job-status row or
+ * polling tool, so the [AUDIO-TRANSCRIPT-COMPLETE]/[AUDIO-TRANSCRIPT-FAILED]
+ * message this function writes is the ONLY terminal signal the user ever
+ * gets. transcribeAudioFile itself never throws, but the persistence step
+ * (saveTranscript's fs.writeFileSync, writeSessionMessage's DB write) can —
+ * disk full, DB lock, etc. Without a catch here, that exception would only
+ * reach the process-wide unhandledRejection handler (log-and-continue) and
+ * the request would silently vanish with zero user-visible indication
+ * anything happened. The catch below still attempts to write a failure
+ * message so the session always gets a terminal reply.
  */
 export async function runTranscriptionJob(
   agentGroupId: string,
@@ -159,27 +197,45 @@ export async function runTranscriptionJob(
   hostAudioPath: string,
   _note?: string,
 ): Promise<void> {
-  const result = await transcribeAudioFile(hostAudioPath);
+  try {
+    const result = await transcribeAudioFile(hostAudioPath);
 
-  let text: string;
-  if (result.ok) {
-    const transcriptPath = saveTranscript(agentGroupId, path.basename(hostAudioPath), result.text);
-    text = `${AUDIO_TRANSCRIPT_COMPLETE_TAG}\n${result.text}\n\n(נשמר גם ב-transcripts/${path.basename(transcriptPath)})`;
-  } else {
-    text = audioTranscriptFailedTag(result.reason);
-  }
+    let text: string;
+    if (result.ok) {
+      const transcriptPath = saveTranscript(agentGroupId, path.basename(hostAudioPath), result.text);
+      text = `${AUDIO_TRANSCRIPT_COMPLETE_TAG}\n${result.text}\n\n(נשמר גם ב-transcripts/${path.basename(transcriptPath)})`;
+    } else {
+      text = audioTranscriptFailedTag(result.reason);
+    }
 
-  writeSessionMessage(agentGroupId, sessionId, {
-    id: `audio-transcript-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    kind: 'chat-sdk',
-    timestamp: new Date().toISOString(),
-    content: JSON.stringify({ text }),
-  });
+    writeSessionMessage(agentGroupId, sessionId, {
+      id: `audio-transcript-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      kind: 'chat-sdk',
+      timestamp: new Date().toISOString(),
+      content: JSON.stringify({ text }),
+    });
 
-  if (!isContainerRunning(sessionId)) {
-    const fresh = getSession(sessionId);
-    if (fresh) {
-      await wakeContainer(fresh);
+    if (!isContainerRunning(sessionId)) {
+      const fresh = getSession(sessionId);
+      if (fresh) {
+        await wakeContainer(fresh);
+      }
+    }
+  } catch (err) {
+    log.error('transcribe_audio: job failed unexpectedly', { agentGroupId, sessionId, hostAudioPath, err });
+    try {
+      writeSessionMessage(agentGroupId, sessionId, {
+        id: `audio-transcript-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        kind: 'chat-sdk',
+        timestamp: new Date().toISOString(),
+        content: JSON.stringify({ text: audioTranscriptFailedTag('error') }),
+      });
+    } catch (writeErr) {
+      log.error('transcribe_audio: failed to deliver the failure message too', {
+        agentGroupId,
+        sessionId,
+        writeErr,
+      });
     }
   }
 }

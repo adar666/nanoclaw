@@ -175,6 +175,27 @@ describe('handleTranscribeAudioImpl', () => {
     expect(neverResolvingJob).not.toHaveBeenCalled();
   });
 
+  it('refuses a symlink inside the session dir that resolves outside it (symlink escape)', async () => {
+    const ag = makeGroup('ag-symlink', 'symlink-escape');
+    const session = makeSession(ag.id, 'sess-symlink');
+    const inboxDir = path.join(sessionDir(ag.id, session.id), 'inbox', 'msg1');
+    fs.mkdirSync(inboxDir, { recursive: true });
+
+    // A compromised/prompt-injected agent pre-places a symlink inside its
+    // own inbox pointing at an arbitrary host path, then declares that path.
+    // The declared path is textually inside the session dir (isPathInside
+    // on the raw string passes) but resolves outside it.
+    const outsideTarget = path.join(TEST_ROOT, 'outside-secret.m4a');
+    fs.writeFileSync(outsideTarget, 'attacker-controlled bytes');
+    fs.symlinkSync(outsideTarget, path.join(inboxDir, 'evil.m4a'));
+
+    const neverResolvingJob = vi.fn(() => new Promise<void>(() => {}));
+
+    await handleTranscribeAudioImpl({ path: 'inbox/msg1/evil.m4a' }, session, neverResolvingJob);
+
+    expect(neverResolvingJob).not.toHaveBeenCalled();
+  });
+
   it('no-ops when the referenced file does not exist', async () => {
     const ag = makeGroup('ag-missing', 'missing-file');
     const session = makeSession(ag.id, 'sess-missing');
@@ -293,5 +314,35 @@ describe('runTranscriptionJob', () => {
     await runTranscriptionJob(ag.id, session.id, '/tmp/x.m4a');
 
     expect(wakeContainer).not.toHaveBeenCalled();
+  });
+
+  it('on unexpected error in the persistence step: still delivers a failure message', async () => {
+    // No makeGroup() call — saveTranscript throws for an agent group id that
+    // doesn't exist in the DB, a real (not mocked) stand-in for "the
+    // persistence step throws" (disk full, DB lock, etc. in production).
+    const session: Session = {
+      id: 'sess-job-throws',
+      agent_group_id: 'ag-does-not-exist',
+      messaging_group_id: null,
+      thread_id: null,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'running',
+      last_active: null,
+      created_at: new Date().toISOString(),
+    };
+    fs.mkdirSync(sessionDir(session.agent_group_id, session.id), { recursive: true });
+
+    const { transcribeAudioFile } = await import('../../voice-transcription.js');
+    vi.mocked(transcribeAudioFile).mockResolvedValue({ ok: true, text: 'ok text' });
+
+    await runTranscriptionJob(session.agent_group_id, session.id, '/tmp/does-not-matter.m4a');
+
+    const rows = new Database(path.join(sessionDir(session.agent_group_id, session.id), 'inbound.db'))
+      .prepare('SELECT content FROM messages_in ORDER BY seq DESC LIMIT 1')
+      .all() as Array<{ content: string }>;
+    expect(rows).toHaveLength(1);
+    const content = JSON.parse(rows[0].content);
+    expect(content.text).toBe('[AUDIO-TRANSCRIPT-FAILED: error]');
   });
 });
