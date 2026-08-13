@@ -23,7 +23,7 @@ import {
   runTranscriptionJob,
   saveTranscript,
 } from './apply.js';
-import { sessionDir, writeSessionMessage } from '../../session-manager.js';
+import { sessionDir } from '../../session-manager.js';
 import type { AgentGroup, Session } from '../../types.js';
 
 vi.mock('../../voice-transcription.js', () => ({
@@ -111,6 +111,17 @@ describe('AUDIO_TRANSCRIPT_COMPLETE_TAG', () => {
   });
 });
 
+/** Reads the text of the most recently written inbound row for a session —
+ *  used to assert that a silent-drop path still delivers a terminal
+ *  [AUDIO-TRANSCRIPT-FAILED: ...] message rather than vanishing. */
+function lastInboundText(agentGroupId: string, sessionId: string): string {
+  const rows = new Database(path.join(sessionDir(agentGroupId, sessionId), 'inbound.db'))
+    .prepare('SELECT content FROM messages_in ORDER BY seq DESC LIMIT 1')
+    .all() as Array<{ content: string }>;
+  expect(rows).toHaveLength(1);
+  return JSON.parse(rows[0].content).text;
+}
+
 describe('handleTranscribeAudioImpl', () => {
   function makeSession(agentGroupId: string, id: string): Session {
     return {
@@ -139,7 +150,15 @@ describe('handleTranscribeAudioImpl', () => {
     // hang and the test would fail on timeout — that's the proof, not a race.
     await handleTranscribeAudioImpl({ path: 'inbox/msg1/call.m4a' }, session, neverResolvingJob);
 
-    expect(neverResolvingJob).toHaveBeenCalledWith(ag.id, session.id, path.join(inboxDir, 'call.m4a'), undefined);
+    // runJob must receive the realpath'd path (fs.realpathSync), not the
+    // unresolved one — on macOS /tmp resolves to /private/tmp, so the raw
+    // path.join(...) would not match what the fixed handler actually passes.
+    expect(neverResolvingJob).toHaveBeenCalledWith(
+      ag.id,
+      session.id,
+      fs.realpathSync(path.join(inboxDir, 'call.m4a')),
+      undefined,
+    );
   });
 
   it('passes note through when provided', async () => {
@@ -160,12 +179,12 @@ describe('handleTranscribeAudioImpl', () => {
     expect(neverResolvingJob).toHaveBeenCalledWith(
       ag.id,
       session.id,
-      path.join(inboxDir, 'call.m4a'),
+      fs.realpathSync(path.join(inboxDir, 'call.m4a')),
       'client call, urgent',
     );
   });
 
-  it('refuses a path that escapes the session directory (traversal)', async () => {
+  it('refuses a path that escapes the session directory (traversal), and delivers a terminal failure message', async () => {
     const ag = makeGroup('ag-escape', 'escape');
     const session = makeSession(ag.id, 'sess-escape');
     const neverResolvingJob = vi.fn(() => new Promise<void>(() => {}));
@@ -173,9 +192,13 @@ describe('handleTranscribeAudioImpl', () => {
     await handleTranscribeAudioImpl({ path: '../../../etc/passwd' }, session, neverResolvingJob);
 
     expect(neverResolvingJob).not.toHaveBeenCalled();
+    // The agent was told "you will get a message tagged
+    // [AUDIO-TRANSCRIPT-COMPLETE]" and is instructed not to poll or remind
+    // the user — a silent drop here means the request vanishes forever.
+    expect(lastInboundText(ag.id, session.id)).toBe('[AUDIO-TRANSCRIPT-FAILED: error]');
   });
 
-  it('refuses a symlink inside the session dir that resolves outside it (symlink escape)', async () => {
+  it('refuses a symlink inside the session dir that resolves outside it (symlink escape), and delivers a terminal failure message', async () => {
     const ag = makeGroup('ag-symlink', 'symlink-escape');
     const session = makeSession(ag.id, 'sess-symlink');
     const inboxDir = path.join(sessionDir(ag.id, session.id), 'inbox', 'msg1');
@@ -194,9 +217,10 @@ describe('handleTranscribeAudioImpl', () => {
     await handleTranscribeAudioImpl({ path: 'inbox/msg1/evil.m4a' }, session, neverResolvingJob);
 
     expect(neverResolvingJob).not.toHaveBeenCalled();
+    expect(lastInboundText(ag.id, session.id)).toBe('[AUDIO-TRANSCRIPT-FAILED: error]');
   });
 
-  it('no-ops when the referenced file does not exist', async () => {
+  it('no-ops when the referenced file does not exist, and delivers a terminal failure message', async () => {
     const ag = makeGroup('ag-missing', 'missing-file');
     const session = makeSession(ag.id, 'sess-missing');
     const neverResolvingJob = vi.fn(() => new Promise<void>(() => {}));
@@ -204,9 +228,10 @@ describe('handleTranscribeAudioImpl', () => {
     await handleTranscribeAudioImpl({ path: 'inbox/msg1/nope.m4a' }, session, neverResolvingJob);
 
     expect(neverResolvingJob).not.toHaveBeenCalled();
+    expect(lastInboundText(ag.id, session.id)).toBe('[AUDIO-TRANSCRIPT-FAILED: error]');
   });
 
-  it('no-ops when content.path is missing', async () => {
+  it('no-ops when content.path is missing, and delivers a terminal failure message', async () => {
     const ag = makeGroup('ag-nopath', 'no-path');
     const session = makeSession(ag.id, 'sess-nopath');
     const neverResolvingJob = vi.fn(() => new Promise<void>(() => {}));
@@ -214,6 +239,45 @@ describe('handleTranscribeAudioImpl', () => {
     await handleTranscribeAudioImpl({}, session, neverResolvingJob);
 
     expect(neverResolvingJob).not.toHaveBeenCalled();
+    expect(lastInboundText(ag.id, session.id)).toBe('[AUDIO-TRANSCRIPT-FAILED: error]');
+  });
+
+  it('refuses a path that resolves to a directory rather than a file, and delivers a terminal failure message', async () => {
+    const ag = makeGroup('ag-isdir', 'is-dir');
+    const session = makeSession(ag.id, 'sess-isdir');
+    const inboxDir = path.join(sessionDir(ag.id, session.id), 'inbox', 'msg1');
+    fs.mkdirSync(inboxDir, { recursive: true });
+    const neverResolvingJob = vi.fn(() => new Promise<void>(() => {}));
+
+    // relPath: '.' resolves to the session dir itself — every prior check
+    // (raw containment, existsSync, realpath containment) passes for it.
+    await handleTranscribeAudioImpl({ path: '.' }, session, neverResolvingJob);
+
+    expect(neverResolvingJob).not.toHaveBeenCalled();
+    expect(lastInboundText(ag.id, session.id)).toBe('[AUDIO-TRANSCRIPT-FAILED: error]');
+  });
+
+  it('strips a leading /workspace/ prefix from the declared path before resolving', async () => {
+    const ag = makeGroup('ag-wsprefix', 'ws-prefix');
+    const session = makeSession(ag.id, 'sess-wsprefix');
+    const inboxDir = path.join(sessionDir(ag.id, session.id), 'inbox', 'msg1');
+    fs.mkdirSync(inboxDir, { recursive: true });
+    fs.writeFileSync(path.join(inboxDir, 'call.m4a'), 'fake audio bytes');
+
+    const neverResolvingJob = vi.fn(() => new Promise<void>(() => {}));
+
+    // Mirrors what the agent's context actually shows it
+    // ([audio: name — saved to /workspace/inbox/<msgId>/name]) — if the
+    // agent passes that full displayed path instead of stripping the
+    // mount prefix itself, this should still resolve to the right file.
+    await handleTranscribeAudioImpl({ path: '/workspace/inbox/msg1/call.m4a' }, session, neverResolvingJob);
+
+    expect(neverResolvingJob).toHaveBeenCalledWith(
+      ag.id,
+      session.id,
+      fs.realpathSync(path.join(inboxDir, 'call.m4a')),
+      undefined,
+    );
   });
 });
 
@@ -278,6 +342,10 @@ describe('runTranscriptionJob', () => {
 
     const { transcribeAudioFile } = await import('../../voice-transcription.js');
     vi.mocked(transcribeAudioFile).mockResolvedValue({ ok: false, reason: 'timeout' });
+    // Explicit rather than relying on the mock's default/inherited value —
+    // makes this test order-independent.
+    const { isContainerRunning } = await import('../../container-runner.js');
+    vi.mocked(isContainerRunning).mockReturnValue(false);
 
     await runTranscriptionJob(ag.id, session.id, '/tmp/does-not-matter.m4a');
 

@@ -34,13 +34,12 @@ export function audioTranscriptFailedTag(reason: 'not-installed' | 'timeout' | '
   return `[AUDIO-TRANSCRIPT-FAILED: ${reason}]`;
 }
 
-/** Same charset policy as media-ingestion.ts's sanitizeFilenameFragment
- *  (control chars stripped, path separators stripped) but keeps Hebrew —
- *  source filenames are routinely Hebrew (e.g. a forwarded call recording's
- *  auto-generated Telegram name). Duplicated rather than imported: that
+/** Not imported from media-ingestion.ts's sanitizeFilenameFragment (which
+ *  handles Hebrew fine too, via \p{L}) — duplicated instead because that
  *  helper lives in a module this one deliberately doesn't depend on (see
  *  spec § "Explicitly out of scope" — no second-brain/media-ingestion
- *  coupling). */
+ *  coupling), and because this slug uses a narrower, explicit charset
+ *  (ASCII alnum + the Hebrew block) rather than the general \p{L} class. */
 function slugify(sourceFilename: string): string {
   const base = sourceFilename.replace(/\.[^./]+$/, '');
   const slug = base
@@ -120,25 +119,55 @@ export const handleTranscribeAudio: DeliveryActionHandler = (
   _inDb: Database.Database,
 ) => handleTranscribeAudioImpl(content, session, runTranscriptionJob);
 
+/**
+ * Writes the ONLY terminal signal the session ever gets for a given
+ * transcribe_audio request. The MCP tool that triggers this flow already
+ * told the agent "Transcription started — you will get a message tagged
+ * [AUDIO-TRANSCRIPT-COMPLETE]", and the paired instructions.md tells the
+ * agent not to poll or remind the user it's waiting — so every early-exit
+ * path (bad input, refused path, missing file) and every job-level failure
+ * MUST route through here, or the request silently vanishes forever.
+ */
+function deliverFailure(agentGroupId: string, sessionId: string, reason: 'not-installed' | 'timeout' | 'error'): void {
+  writeSessionMessage(agentGroupId, sessionId, {
+    id: `audio-transcript-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    kind: 'chat-sdk',
+    timestamp: new Date().toISOString(),
+    content: JSON.stringify({ text: audioTranscriptFailedTag(reason), sender: 'system' }),
+  });
+}
+
+const WORKSPACE_PREFIX = '/workspace/';
+
 export async function handleTranscribeAudioImpl(
   content: Record<string, unknown>,
   session: Session,
   runJob: RunTranscriptionJob,
 ): Promise<void> {
-  const relPath = typeof content.path === 'string' ? content.path : undefined;
-  if (!relPath) {
+  const rawPath = typeof content.path === 'string' ? content.path : undefined;
+  if (!rawPath) {
     log.warn('transcribe_audio: missing path', { sessionId: session.id });
+    deliverFailure(session.agent_group_id, session.id, 'error');
     return;
   }
+
+  // The agent's context shows the file at the full mounted path
+  // (/workspace/inbox/<msgId>/name) even though instructions.md asks it to
+  // pass the path relative to the session dir. Strip the mount prefix
+  // defensively so a copy-pasted full path still resolves correctly instead
+  // of failing the containment check below for no visible reason.
+  const relPath = rawPath.startsWith(WORKSPACE_PREFIX) ? rawPath.slice(WORKSPACE_PREFIX.length) : rawPath;
 
   const sessDir = sessionDir(session.agent_group_id, session.id);
   const hostPath = path.resolve(sessDir, relPath);
   if (!isPathInside(sessDir, hostPath)) {
     log.warn('transcribe_audio: path escapes session dir, refusing', { sessionId: session.id, relPath });
+    deliverFailure(session.agent_group_id, session.id, 'error');
     return;
   }
   if (!fs.existsSync(hostPath)) {
     log.warn('transcribe_audio: file not found', { sessionId: session.id, hostPath });
+    deliverFailure(session.agent_group_id, session.id, 'error');
     return;
   }
 
@@ -158,6 +187,7 @@ export async function handleTranscribeAudioImpl(
     realHostPath = fs.realpathSync(hostPath);
   } catch (err) {
     log.warn('transcribe_audio: failed to resolve real path, refusing', { sessionId: session.id, hostPath, err });
+    deliverFailure(session.agent_group_id, session.id, 'error');
     return;
   }
   if (!isPathInside(realSessDir, realHostPath)) {
@@ -166,11 +196,27 @@ export async function handleTranscribeAudioImpl(
       hostPath,
       realHostPath,
     });
+    deliverFailure(session.agent_group_id, session.id, 'error');
+    return;
+  }
+  if (!fs.statSync(realHostPath).isFile()) {
+    log.warn('transcribe_audio: resolved path is not a regular file, refusing', {
+      sessionId: session.id,
+      realHostPath,
+    });
+    deliverFailure(session.agent_group_id, session.id, 'error');
     return;
   }
 
+  // Pass the already-resolved, already-validated realHostPath — not the
+  // original hostPath — to the background job. runJob runs later, un-awaited;
+  // between this check and whenever ffmpeg actually opens the file, a
+  // compromised/prompt-injected agent has a window to swap hostPath for a
+  // symlink pointing outside the session dir. Handing the job the raw
+  // hostPath would let that swap defeat the containment check we just did —
+  // the validated path and the path actually read must be the same path.
   const note = typeof content.note === 'string' ? content.note : undefined;
-  void runJob(session.agent_group_id, session.id, hostPath, note);
+  void runJob(session.agent_group_id, session.id, realHostPath, note);
 }
 
 /**
@@ -184,12 +230,24 @@ export async function handleTranscribeAudioImpl(
  * polling tool, so the [AUDIO-TRANSCRIPT-COMPLETE]/[AUDIO-TRANSCRIPT-FAILED]
  * message this function writes is the ONLY terminal signal the user ever
  * gets. transcribeAudioFile itself never throws, but the persistence step
- * (saveTranscript's fs.writeFileSync, writeSessionMessage's DB write) can —
- * disk full, DB lock, etc. Without a catch here, that exception would only
- * reach the process-wide unhandledRejection handler (log-and-continue) and
- * the request would silently vanish with zero user-visible indication
- * anything happened. The catch below still attempts to write a failure
- * message so the session always gets a terminal reply.
+ * (saveTranscript's fs.writeFileSync) can — disk full, DB lock, etc. Without
+ * a catch here, that exception would only reach the process-wide
+ * unhandledRejection handler (log-and-continue) and the request would
+ * silently vanish with zero user-visible indication anything happened. The
+ * catch below still attempts to write a failure message so the session
+ * always gets a terminal reply.
+ *
+ * The first try only wraps transcription + saveTranscript, deliberately —
+ * and, on the failure-result branch, delivers the failure tag inline rather
+ * than after the try, so a throw from transcribeAudioFile/saveTranscript
+ * can't be confused with a clean not-ok result. Once saveTranscript has
+ * succeeded (or a failure tag has already been delivered), the outcome is
+ * decided: a failure in the steps after that point (writing the completion
+ * message, waking the container) must NOT be reported as
+ * [AUDIO-TRANSCRIPT-FAILED] — on the success path the transcript already
+ * exists durably on disk and re-reporting it as failed would be actively
+ * misleading; on the failure path a failure message was already delivered.
+ * At most, log it.
  */
 export async function runTranscriptionJob(
   agentGroupId: string,
@@ -197,23 +255,38 @@ export async function runTranscriptionJob(
   hostAudioPath: string,
   _note?: string,
 ): Promise<void> {
+  let text: string | undefined;
   try {
     const result = await transcribeAudioFile(hostAudioPath);
-
-    let text: string;
     if (result.ok) {
       const transcriptPath = saveTranscript(agentGroupId, path.basename(hostAudioPath), result.text);
       text = `${AUDIO_TRANSCRIPT_COMPLETE_TAG}\n${result.text}\n\n(נשמר גם ב-transcripts/${path.basename(transcriptPath)})`;
     } else {
-      text = audioTranscriptFailedTag(result.reason);
+      deliverFailure(agentGroupId, sessionId, result.reason);
     }
+  } catch (err) {
+    log.error('transcribe_audio: job failed unexpectedly', { agentGroupId, sessionId, hostAudioPath, err });
+    try {
+      deliverFailure(agentGroupId, sessionId, 'error');
+    } catch (writeErr) {
+      log.error('transcribe_audio: failed to deliver the failure message too', {
+        agentGroupId,
+        sessionId,
+        writeErr,
+      });
+    }
+    return;
+  }
 
-    writeSessionMessage(agentGroupId, sessionId, {
-      id: `audio-transcript-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      kind: 'chat-sdk',
-      timestamp: new Date().toISOString(),
-      content: JSON.stringify({ text }),
-    });
+  try {
+    if (text !== undefined) {
+      writeSessionMessage(agentGroupId, sessionId, {
+        id: `audio-transcript-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        kind: 'chat-sdk',
+        timestamp: new Date().toISOString(),
+        content: JSON.stringify({ text, sender: 'system' }),
+      });
+    }
 
     if (!isContainerRunning(sessionId)) {
       const fresh = getSession(sessionId);
@@ -222,20 +295,11 @@ export async function runTranscriptionJob(
       }
     }
   } catch (err) {
-    log.error('transcribe_audio: job failed unexpectedly', { agentGroupId, sessionId, hostAudioPath, err });
-    try {
-      writeSessionMessage(agentGroupId, sessionId, {
-        id: `audio-transcript-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        kind: 'chat-sdk',
-        timestamp: new Date().toISOString(),
-        content: JSON.stringify({ text: audioTranscriptFailedTag('error') }),
-      });
-    } catch (writeErr) {
-      log.error('transcribe_audio: failed to deliver the failure message too', {
-        agentGroupId,
-        sessionId,
-        writeErr,
-      });
-    }
+    log.error('transcribe_audio: post-result delivery step failed (message/wake did not complete)', {
+      agentGroupId,
+      sessionId,
+      hostAudioPath,
+      err,
+    });
   }
 }
