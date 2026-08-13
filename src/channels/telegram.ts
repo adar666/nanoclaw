@@ -3,6 +3,7 @@
  * interceptor wrapped around onInbound to verify chat ownership before
  * registration. See telegram-pairing.ts for the why.
  */
+import fs from 'fs/promises';
 import { createTelegramAdapter } from '@chat-adapter/telegram';
 
 import { readEnvFile } from '../env.js';
@@ -26,6 +27,18 @@ const TELEGRAM_DEFAULTS: ChannelDefaults = {
   group: { engageMode: 'mention', threads: false, unknownSenderPolicy: 'request_approval' },
   mentions: 'platform',
 };
+
+const CLOUD_API_BASE = 'https://api.telegram.org';
+
+/**
+ * Fixed work dir inside the `telegram-bot-api` local-server container
+ * (matches the image's TELEGRAM_WORK_DIR default — see docker run command
+ * in the operator's setup notes). When --local mode is on, getFile returns
+ * an absolute path under this prefix instead of a fetchable URL; we swap it
+ * for the host-side bind mount path (TELEGRAM_LOCAL_FILE_DIR) to read the
+ * file directly instead of trying to HTTP-fetch a container-local path.
+ */
+const LOCAL_SERVER_CONTAINER_DIR = '/var/lib/telegram-bot-api';
 
 /**
  * Retry a one-shot operation that can fail on transient network errors at
@@ -67,9 +80,9 @@ function extractReplyContext(raw: Record<string, any>): ReplyContext | null {
 }
 
 /** Look up the bot username via Telegram getMe. Cached after first call. */
-async function fetchBotUsername(token: string): Promise<string | null> {
+async function fetchBotUsername(token: string, apiBase: string): Promise<string | null> {
   try {
-    const res = await fetch(`https://api.telegram.org/bot${token}/getMe`);
+    const res = await fetch(`${apiBase}/bot${token}/getMe`);
     const json = (await res.json()) as { ok: boolean; result?: { username?: string } };
     return json.ok ? (json.result?.username ?? null) : null;
   } catch (err) {
@@ -108,11 +121,11 @@ function readInboundFields(message: InboundMessage): InboundFields {
  * are logged but never propagated, so a Telegram outage can't undo a successful
  * pairing or trigger the interceptor's fail-open path.
  */
-async function sendPairingConfirmation(token: string, platformId: string): Promise<void> {
+async function sendPairingConfirmation(token: string, apiBase: string, platformId: string): Promise<void> {
   const chatId = platformId.split(':').slice(1).join(':');
   if (!chatId) return;
   try {
-    const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    const res = await fetch(`${apiBase}/bot${token}/sendMessage`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
@@ -132,6 +145,7 @@ function createPairingInterceptor(
   botUsernamePromise: Promise<string | null>,
   hostOnInbound: ChannelSetup['onInbound'],
   token: string,
+  apiBase: string,
 ): ChannelSetup['onInbound'] {
   return async (platformId, threadId, message) => {
     try {
@@ -207,7 +221,7 @@ function createPairingInterceptor(
         intent: consumed.intent,
       });
 
-      await sendPairingConfirmation(token, platformId);
+      await sendPairingConfirmation(token, apiBase, platformId);
     } catch (err) {
       log.error('Telegram pairing interceptor error', { err });
       // Fail open: pass through so a pairing bug doesn't break normal traffic.
@@ -218,13 +232,42 @@ function createPairingInterceptor(
 
 registerChannelAdapter('telegram', {
   factory: () => {
-    const env = readEnvFile(['TELEGRAM_BOT_TOKEN']);
+    const env = readEnvFile(['TELEGRAM_BOT_TOKEN', 'TELEGRAM_API_BASE_URL', 'TELEGRAM_LOCAL_FILE_DIR']);
     if (!env.TELEGRAM_BOT_TOKEN) return null;
     const token = env.TELEGRAM_BOT_TOKEN;
+    // Points at a self-hosted `telegram-bot-api` server (--local mode) instead
+    // of the cloud API when set — raises the getFile download cap from 20MB
+    // to 2000MB. See docs/telegram-local-bot-api.md for setup.
+    const apiBase = env.TELEGRAM_API_BASE_URL || CLOUD_API_BASE;
+    const localFileDir = env.TELEGRAM_LOCAL_FILE_DIR || null;
     const telegramAdapter = createTelegramAdapter({
       botToken: token,
       mode: 'polling',
+      apiBaseUrl: apiBase,
     });
+
+    if (localFileDir) {
+      // --local mode returns an absolute container-side path in `file_path`
+      // instead of something fetchable over HTTP. Read it straight off the
+      // bind-mounted host directory rather than hitting the network at all.
+      // downloadFile/telegramFetch are `protected` in the package's types —
+      // this is a deliberate instance-level override (JS has no real
+      // privacy), not something worth forking the package for.
+      const internals = telegramAdapter as unknown as {
+        downloadFile: (fileId: string) => Promise<Buffer>;
+        telegramFetch: (method: string, payload?: Record<string, unknown>) => Promise<{ file_path?: string }>;
+      };
+      const original = internals.downloadFile.bind(telegramAdapter);
+      internals.downloadFile = async (fileId: string) => {
+        const file = await internals.telegramFetch('getFile', { file_id: fileId });
+        if (file.file_path?.startsWith(LOCAL_SERVER_CONTAINER_DIR)) {
+          const hostPath = localFileDir + file.file_path.slice(LOCAL_SERVER_CONTAINER_DIR.length);
+          return fs.readFile(hostPath);
+        }
+        return original(fileId);
+      };
+    }
+
     const bridge = createChatSdkBridge({
       adapter: telegramAdapter,
       concurrency: 'concurrent',
@@ -235,7 +278,7 @@ registerChannelAdapter('telegram', {
       maxTextLength: 4000,
     });
 
-    const botUsernamePromise = fetchBotUsername(token);
+    const botUsernamePromise = fetchBotUsername(token, apiBase);
 
     const wrapped: ChannelAdapter = {
       ...bridge,
@@ -243,7 +286,7 @@ registerChannelAdapter('telegram', {
         const chatId = platformId.split(':').slice(1).join(':');
         if (!chatId) return null;
         try {
-          const res = await fetch(`https://api.telegram.org/bot${token}/getChat`, {
+          const res = await fetch(`${apiBase}/bot${token}/getChat`, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ chat_id: chatId }),
@@ -257,7 +300,7 @@ registerChannelAdapter('telegram', {
       async setup(hostConfig: ChannelSetup) {
         const intercepted: ChannelSetup = {
           ...hostConfig,
-          onInbound: createPairingInterceptor(botUsernamePromise, hostConfig.onInbound, token),
+          onInbound: createPairingInterceptor(botUsernamePromise, hostConfig.onInbound, token, apiBase),
         };
         return withRetry(() => bridge.setup(intercepted), 'bridge.setup');
       },
