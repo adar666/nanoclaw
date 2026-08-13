@@ -10,6 +10,7 @@ import './interactive.js';
 import './agents.js';
 import './self-mod.js';
 import './recorder.js';
+import './transcribe-audio.js';
 import { startMcpServer } from './server.js';
 
 function log(msg: string): void {
