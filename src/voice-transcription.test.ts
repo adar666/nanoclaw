@@ -21,6 +21,7 @@ import {
   hasTranscribableVoiceAttachment,
   isVoiceReplyToBot,
   transcribeVoiceNote,
+  transcribeAudioFile,
   applyVoiceTranscription,
   VOICE_TRANSCRIPT_TAG,
   voiceTranscriptFailedTag,
@@ -258,6 +259,87 @@ describe('transcribeVoiceNote', () => {
       modelPath: FAKE_MODEL,
     });
     expect(result).toEqual({ ok: false, reason: 'error' });
+  });
+});
+
+describe('transcribeAudioFile', () => {
+  const FAKE_DIR = '/tmp/nanoclaw-test-voice-bins-audiofile';
+  const FAKE_WHISPER = path.join(FAKE_DIR, 'whisper-cli');
+  const FAKE_FFMPEG = path.join(FAKE_DIR, 'ffmpeg');
+  const FAKE_MODEL = path.join(FAKE_DIR, 'model.bin');
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    fs.mkdirSync(FAKE_DIR, { recursive: true });
+    fs.writeFileSync(FAKE_WHISPER, '');
+    fs.writeFileSync(FAKE_FFMPEG, '');
+    fs.writeFileSync(FAKE_MODEL, '');
+  });
+
+  afterEach(() => {
+    fs.rmSync(FAKE_DIR, { recursive: true, force: true });
+  });
+
+  function mockedExecFile() {
+    return execFile as unknown as ReturnType<typeof vi.fn>;
+  }
+
+  it('transcribes a non-.ogg file (e.g. .m4a) using the same engine', async () => {
+    let call = 0;
+    mockedExecFile().mockImplementation(
+      (_cmd: string, _args: string[], _opts: unknown, cb: (...a: unknown[]) => void) => {
+        call++;
+        if (call === 1) return cb(null, { stdout: '', stderr: '' });
+        cb(null, { stdout: '  שיחה עם לקוח  \n', stderr: '' });
+      },
+    );
+
+    const result = await transcribeAudioFile('/tmp/call-recording.m4a', {
+      whisperCli: FAKE_WHISPER,
+      ffmpeg: FAKE_FFMPEG,
+      modelPath: FAKE_MODEL,
+    });
+
+    expect(result).toEqual({ ok: true, text: 'שיחה עם לקוח' });
+    const [ffmpegCall] = mockedExecFile().mock.calls.filter((c) => c[0] === FAKE_FFMPEG);
+    expect(ffmpegCall[1]).toEqual(expect.arrayContaining(['-i', '/tmp/call-recording.m4a']));
+  });
+
+  it('defaults to a timeout far larger than the voice-note default (30s)', async () => {
+    mockedExecFile().mockImplementation(
+      (_cmd: string, _args: string[], opts: { timeout: number }, cb: (...a: unknown[]) => void) => {
+        // Capture the timeout ffmpeg is called with and fail fast — we only
+        // care about the budget passed in, not a real transcription.
+        expect(opts.timeout).toBeGreaterThan(30_000);
+        cb(new Error('stop here, budget already asserted'), { stdout: '', stderr: '' });
+      },
+    );
+
+    await transcribeAudioFile('/tmp/call-recording.m4a', {
+      whisperCli: FAKE_WHISPER,
+      ffmpeg: FAKE_FFMPEG,
+      modelPath: FAKE_MODEL,
+    });
+
+    expect.assertions(1); // the assertion inside mockImplementation must have run
+  });
+
+  it('an explicit timeoutMs still overrides the default', async () => {
+    mockedExecFile().mockImplementation(
+      (_cmd: string, _args: string[], opts: { timeout: number }, cb: (...a: unknown[]) => void) => {
+        expect(opts.timeout).toBeLessThanOrEqual(5_000);
+        cb(new Error('stop here'), { stdout: '', stderr: '' });
+      },
+    );
+
+    await transcribeAudioFile('/tmp/x.m4a', {
+      whisperCli: FAKE_WHISPER,
+      ffmpeg: FAKE_FFMPEG,
+      modelPath: FAKE_MODEL,
+      timeoutMs: 5_000,
+    });
+
+    expect.assertions(1);
   });
 });
 

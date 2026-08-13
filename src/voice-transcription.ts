@@ -191,6 +191,28 @@ export async function transcribeVoiceNote(oggPath: string, opts: TranscribeOpts 
 }
 
 /**
+ * Default timeout for on-demand full-audio-file transcription. Much larger
+ * than transcribeVoiceNote's 30s default — a full call recording can
+ * legitimately take several minutes to transcribe even with Metal
+ * acceleration. 20 minutes covers the vast majority of realistic recording
+ * lengths at whisper.cpp turbo's typical multiple-of-realtime throughput.
+ */
+export const AUDIO_FILE_TIMEOUT_MS = 20 * 60 * 1000;
+
+/**
+ * Same engine as transcribeVoiceNote (ffmpeg -> 16kHz mono WAV -> whisper-cli
+ * forced to Hebrew) — the conversion step is already format-agnostic, so
+ * this works for any audio ffmpeg can decode, not just OGG voice notes. A
+ * distinct exported name (rather than callers reaching for
+ * transcribeVoiceNote directly) so call sites don't read "VoiceNote" for a
+ * 40-minute uploaded call recording. Default timeout is AUDIO_FILE_TIMEOUT_MS,
+ * not transcribeVoiceNote's 30s — still overridable via opts.timeoutMs.
+ */
+export function transcribeAudioFile(audioPath: string, opts: TranscribeOpts = {}): Promise<TranscribeResult> {
+  return transcribeVoiceNote(audioPath, { timeoutMs: AUDIO_FILE_TIMEOUT_MS, ...opts });
+}
+
+/**
  * Re-reads a just-inserted inbound row, transcribes any transcribable voice
  * attachment it carries, and rewrites the row's `content.text` in place
  * with a [VOICE-TRANSCRIPT]/[VOICE-TRANSCRIPT-FAILED: reason] tag prepended.
