@@ -15,8 +15,18 @@
 import fs from 'fs';
 import path from 'path';
 
+import type Database from 'better-sqlite3';
+
 import { GROUPS_DIR } from '../../config.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
+import { isContainerRunning, wakeContainer } from '../../container-runner.js';
+import { getSession } from '../../db/sessions.js';
+import type { DeliveryActionHandler } from '../../delivery.js';
+import { isPathInside } from '../../inbox-safety.js';
+import { log } from '../../log.js';
+import { sessionDir, writeSessionMessage } from '../../session-manager.js';
+import type { Session } from '../../types.js';
+import { transcribeAudioFile } from '../../voice-transcription.js';
 
 export const AUDIO_TRANSCRIPT_COMPLETE_TAG = '[AUDIO-TRANSCRIPT-COMPLETE]';
 
@@ -84,4 +94,92 @@ export function saveTranscript(agentGroupId: string, sourceFilename: string, tra
 
   fs.writeFileSync(filePath, body, 'utf-8');
   return filePath;
+}
+
+type RunTranscriptionJob = (
+  agentGroupId: string,
+  sessionId: string,
+  hostAudioPath: string,
+  note?: string,
+) => Promise<void>;
+
+/**
+ * Delivery-action handler for the `transcribe_audio` system action (written
+ * by the container's `transcribe_audio` MCP tool). Resolves the
+ * agent-declared relative path against the session dir, refuses anything
+ * that escapes it, and — if the file exists — fires the background job
+ * WITHOUT awaiting it (`void runJob(...)`). This is a hard requirement: the
+ * outbound-delivery poll loop that calls this handler must never be blocked
+ * by a multi-minute whisper-cli run. `runJob` is injectable for tests
+ * (default: the real `runTranscriptionJob`), same pattern as
+ * voice-transcription.ts's `applyVoiceTranscription`.
+ */
+export const handleTranscribeAudio: DeliveryActionHandler = (
+  content: Record<string, unknown>,
+  session: Session,
+  _inDb: Database.Database,
+) => handleTranscribeAudioImpl(content, session, runTranscriptionJob);
+
+export async function handleTranscribeAudioImpl(
+  content: Record<string, unknown>,
+  session: Session,
+  runJob: RunTranscriptionJob,
+): Promise<void> {
+  const relPath = typeof content.path === 'string' ? content.path : undefined;
+  if (!relPath) {
+    log.warn('transcribe_audio: missing path', { sessionId: session.id });
+    return;
+  }
+
+  const sessDir = sessionDir(session.agent_group_id, session.id);
+  const hostPath = path.resolve(sessDir, relPath);
+  if (!isPathInside(sessDir, hostPath)) {
+    log.warn('transcribe_audio: path escapes session dir, refusing', { sessionId: session.id, relPath });
+    return;
+  }
+  if (!fs.existsSync(hostPath)) {
+    log.warn('transcribe_audio: file not found', { sessionId: session.id, hostPath });
+    return;
+  }
+
+  const note = typeof content.note === 'string' ? content.note : undefined;
+  void runJob(session.agent_group_id, session.id, hostPath, note);
+}
+
+/**
+ * The background job: transcribe, persist, deliver a tagged completion
+ * message into the same session, wake the container if it's idle. Never
+ * called awaited from the delivery-action handler (see above) — this is
+ * where the actual multi-minute wait lives, fully decoupled from the
+ * outbound-delivery poll loop.
+ */
+export async function runTranscriptionJob(
+  agentGroupId: string,
+  sessionId: string,
+  hostAudioPath: string,
+  _note?: string,
+): Promise<void> {
+  const result = await transcribeAudioFile(hostAudioPath);
+
+  let text: string;
+  if (result.ok) {
+    const transcriptPath = saveTranscript(agentGroupId, path.basename(hostAudioPath), result.text);
+    text = `${AUDIO_TRANSCRIPT_COMPLETE_TAG}\n${result.text}\n\n(נשמר גם ב-transcripts/${path.basename(transcriptPath)})`;
+  } else {
+    text = audioTranscriptFailedTag(result.reason);
+  }
+
+  writeSessionMessage(agentGroupId, sessionId, {
+    id: `audio-transcript-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    kind: 'chat-sdk',
+    timestamp: new Date().toISOString(),
+    content: JSON.stringify({ text }),
+  });
+
+  if (!isContainerRunning(sessionId)) {
+    const fresh = getSession(sessionId);
+    if (fresh) {
+      await wakeContainer(fresh);
+    }
+  }
 }
