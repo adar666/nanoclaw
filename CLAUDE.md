@@ -23,6 +23,29 @@ The host is a single Node process that orchestrates per-session agent containers
 
 **Everything is a message.** There is no IPC, no file watcher, no stdin piping between host and container. The two session DBs are the sole IO surface.
 
+<!-- AGENTS-BMAD:start -->
+## Pitfalls observed in practice
+
+Hard-won, not hypothetical — each line below is something that actually went wrong once and was traced to a root cause. Verified against the code as of 2026-08-15.
+
+- **`groups/*` is gitignored — installation-specific, per-operator content.** Editing a group's `instructions.prepend.md` or `CLAUDE.md` is a normal, expected operation (persona tuning, bug fixes) but it will never show up in `git status` and never gets committed. Don't go looking for a diff to commit after editing group files — there isn't one, by design. (`.gitignore:15`.)
+
+- **Never call `getUpdates` directly against the Telegram Bot API (cloud or the local `telegram-bot-api` server) while the host service is running.** Telegram allows exactly one `getUpdates` consumer per bot token — a second caller triggers `Conflict: terminated by other getUpdates request` and knocks the real bot offline for the exponential-backoff duration (up to ~30s, compounding on repeated interference). Diagnose inbound-message issues via `logs/nanoclaw.log`/`nanoclaw.error.log` and, if a local `telegram-bot-api` container is running, its own `docker logs` — never by polling the API yourself.
+
+- **A host-side TS change (`src/**`) needs `pnpm run build` + a service restart (`launchctl kickstart -k gui/$(id -u)/<service-label>` on macOS) to take effect — a container rebuild does nothing for it.** A container-side change (`container/agent-runner/src/**`, `container/skills/**`) needs `./container/build.sh` + the same service restart — a host-only rebuild does nothing for it. Two separate rebuild+restart paths; changing one side and only restarting for the other is a real, easy-to-make mistake.
+
+- **An unawaited call to a `void | Promise<void>`-typed callback is invisible until the callee is slow.** `createPairingInterceptor` in `src/channels/telegram.ts` called `hostOnInbound(...)` without `await` on every early-return path — legal TypeScript, silent at runtime, harmless for a fast text message. It became a real bug — a message silently never reaching `inbound.db`, nothing logged anywhere — the moment the real work behind that callback got slow enough (a large attachment's base64 decode + disk write) for the premature resolution to matter. Fixed in `c09f1c5`, regression-tested with a controllable deferred promise. When a function is typed to *possibly* return a promise, treat it as always doing so and await it.
+
+- **A per-group `instructions.prepend.md` can silently override or shadow a newly-shipped capability.** A group's existing persona text (e.g. "files route to a private log, checked only in a nightly sync") can generalize past what it originally meant to cover once a new tool is wired in for a case it didn't anticipate (e.g. audio files) — the agent trusts its older, more specific-sounding persona text over a capability it was just told about in the same context. When adding a new per-group capability, check the group's own `instructions.prepend.md` for language that might already (wrongly) claim to cover it.
+
+- **Diagnostic `log.info()` calls added for live debugging must be reverted before considering a fix "done."** And: an "intermittent" bug report is worth checking against non-code causes (stale agent persona/instructions, a service that needs a restart, a race with your own manual API calls) before assuming the newest code change is at fault — several of the pitfalls above were each mistaken for a different one before the real cause surfaced.
+
+### Running and verifying
+
+- `pnpm test` (host, vitest) and `cd container/agent-runner && bun test` (container, bun:test) are two separate suites on two separate runtimes — a green run of one says nothing about the other. Run both when a change touches both trees.
+- `pnpm exec tsc --noEmit -p .` (host) and `pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit` (container) are two separate tsconfigs — same split as above.
+<!-- AGENTS-BMAD:end -->
+
 ## Entity Model
 
 ```
