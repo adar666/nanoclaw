@@ -121,6 +121,33 @@ export function markCompleted(ids: string[]): void {
 }
 
 /**
+ * Release a claim without completing it — deletes the processing_ack rows
+ * for these ids outright, so the very next getPendingMessages() call (this
+ * container's own next poll tick, no need to wait for the host's sweep)
+ * sees them as fresh pending work again.
+ *
+ * Used for a follow-up pushed into an active query whose stream then ends
+ * without ever producing a result for it (e.g. a slash command aborted the
+ * query mid-turn) — markProcessing already claimed it, but there's no
+ * result event to prove the model addressed it, so it must not be marked
+ * completed. Leaving the claim in place would also work in principle (a
+ * true container crash gets cleaned up by host-sweep's crash recovery),
+ * but here the container is alive and about to loop back into its own next
+ * getPendingMessages() call immediately — releasing now means the message
+ * is reprocessed on the very next tick instead of sitting unclaimed until
+ * the host's 60s sweep + heartbeat heuristic (which may never fire while
+ * the container stays busy with other work) gets around to it.
+ */
+export function releaseProcessing(ids: string[]): void {
+  if (ids.length === 0) return;
+  const db = getOutboundDb();
+  const stmt = db.prepare('DELETE FROM processing_ack WHERE message_id = ?');
+  db.transaction(() => {
+    for (const id of ids) stmt.run(id);
+  })();
+}
+
+/**
  * Ack task messages whose pre-task script gated the run. The reason decides
  * the ack: `gated` (wakeAgent=false) is the monitor working as designed → a
  * plain `completed`; `error` (broken script) → `script-skip:error`, which the

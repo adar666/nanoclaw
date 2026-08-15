@@ -4,6 +4,7 @@ import {
   markProcessing,
   markCompleted,
   markScriptSkipped,
+  releaseProcessing,
   type MessageInRow,
 } from './db/messages-in.js';
 import { writeMessageOut } from './db/messages-out.js';
@@ -373,6 +374,17 @@ export async function processQuery(
   let pollInFlight = false;
   let endedForCommand = false;
   let corruptionStreak = 0;
+  // Follow-up messages pushed into the active stream (below) are claimed via
+  // markProcessing but must NOT be marked completed until a 'result' event
+  // proves the model actually made forward progress since the push. They
+  // accumulate here and flush alongside initialBatchIds on every 'result'
+  // event. If the container dies between push() and the next result, these
+  // ids stay 'processing' in processing_ack — exactly the state host-sweep's
+  // crash recovery (resetStuckProcessingRows) already knows how to retry.
+  // Found live: marking completed immediately after push (the old
+  // behavior) let a crash silently swallow a follow-up with no trace,
+  // because host-sweep only resets rows still stuck in 'processing'.
+  let pendingFollowUpIds: string[] = [];
   const pollHandle = setInterval(() => {
     if (done || pollInFlight || endedForCommand) return;
     pollInFlight = true;
@@ -410,6 +422,16 @@ export async function processQuery(
 
         const newIds = newMessages.map((m) => m.id);
         markProcessing(newIds);
+        // Claim protection starts here, not at push() below — an await sits
+        // between this claim and the push (applyPreTaskScripts), and if the
+        // stream ends while that await is in flight, the early `if (done)
+        // return` a few lines down would otherwise exit without these ids
+        // ever entering pendingFollowUpIds, leaving them claimed forever
+        // with no path to release (the same failure class the finally-block
+        // release exists to close, just one step earlier). Ids resolved via
+        // markScriptSkipped below get pulled back out immediately after —
+        // they're already finalized by their own ack, not pending.
+        pendingFollowUpIds.push(...newIds);
 
         // Run pre-task scripts on follow-ups too — without this, a task that
         // arrives during an active query (e.g. a */10 monitoring cron) bypasses
@@ -425,23 +447,39 @@ export async function processQuery(
         if (skipped.length > 0) {
           markScriptSkipped(skipped);
           log(`Pre-task script skipped ${skipped.length} follow-up task(s): ${skipped.map((s) => s.id).join(', ')}`);
+          const skippedIds = new Set(skipped.map((s) => s.id));
+          pendingFollowUpIds = pendingFollowUpIds.filter((id) => !skippedIds.has(id));
         }
         // MODULE-HOOK:scheduling-pre-task-followup:end
 
         if (keep.length === 0) return;
         // Re-check done — the outer query may have finished while the script
-        // was awaited. Pushing into a closed stream is wasted work; the
-        // claimed messages get released by the host's processing-claim sweep.
+        // was awaited. Pushing into a closed stream is wasted work, but the
+        // claimed ids are already in pendingFollowUpIds (above) and get
+        // released in the finally block below — not silently abandoned.
         if (done) return;
 
-        const keptIds = keep.map((m) => m.id);
         const prompt = formatMessages(keep);
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
         unwrappedNudged = false;
         taskBlockNudged = false;
         query.push(prompt);
         archivePrompts.push(prompt);
-        markCompleted(keptIds);
+        // pendingFollowUpIds already has these ids (claimed above, before
+        // the await) — do NOT markCompleted here. Flushed on the next
+        // 'result' event instead of immediately after push.
+        // Bless this claim immediately (host-sweep's claim-stuck check only
+        // trips when heartbeatMtime <= claimedAt — see decideStuckAction in
+        // src/host-sweep.ts). Without this, a follow-up pushed while the
+        // model is mid-way through a long non-Bash tool call (no SDK events
+        // firing, so no heartbeat touch) could sit past the flat 60s
+        // tolerance and get the whole container killed as "stuck" even
+        // though it's genuinely still working — Bash tool calls already get
+        // a longer grace window from their declared timeout, but nothing
+        // else did until this touch. Matches how the initial batch's own
+        // claim gets blessed almost instantly by the query's first 'init'
+        // event; a follow-up's claim deserves the same treatment.
+        touchHeartbeat();
       } catch (err) {
         // Without this catch the rejection escapes the void IIFE and Node
         // terminates the container on unhandled-rejection. The initial-batch
@@ -496,12 +534,14 @@ export async function processQuery(
         setContinuation(providerName, event.continuation);
       } else if (event.type === 'result') {
         // A result — with or without text — means the turn is done. Mark
-        // the initial batch completed now so the host sweep doesn't see
-        // stale 'processing' claims while the query stays open for
-        // follow-up pushes. The agent may have responded via MCP
-        // (send_message) mid-turn, or the message may not need a response
-        // at all — either way the turn is finished.
-        markCompleted(initialBatchIds);
+        // the initial batch (and any follow-ups pushed since the last
+        // result — see pendingFollowUpIds above) completed now so the host
+        // sweep doesn't see stale 'processing' claims while the query stays
+        // open for further follow-up pushes. The agent may have responded
+        // via MCP (send_message) mid-turn, or the message may not need a
+        // response at all — either way the turn is finished.
+        markCompleted([...initialBatchIds, ...pendingFollowUpIds]);
+        pendingFollowUpIds = [];
         if (event.text) {
           // Read-and-clear BEFORE dispatchResultText: send_message/send_file
           // (mcp-tools/core.ts, a separate subprocess) stamp this the moment
@@ -585,6 +625,17 @@ export async function processQuery(
   } finally {
     done = true;
     clearInterval(pollHandle);
+    // The stream ended (abort — e.g. a slash command interrupted this turn
+    // — or the SDK just closed it) without a 'result' event to flush any
+    // follow-up pushed since the last one. Release rather than complete:
+    // the message was never actually addressed, and this container is
+    // still alive and about to loop back into its own next
+    // getPendingMessages() poll — releasing now (not waiting on host-sweep,
+    // which may never notice while the container stays busy with whatever
+    // comes next — see the adversarial review finding this closes) makes it
+    // reprocessed on literally the next tick.
+    releaseProcessing(pendingFollowUpIds);
+    pendingFollowUpIds = [];
   }
 
   return { continuation: queryContinuation };

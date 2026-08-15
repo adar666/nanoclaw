@@ -572,3 +572,159 @@ describe('task-run turn wiring (real processQuery)', () => {
     expect(logs).not.toContain('second delivery decision handled');
   });
 });
+
+// --- Follow-up completion timing: crash-recovery correctness ---
+//
+// Found live (2026-08-15/16): a follow-up message pushed into an active
+// query used to be markCompleted() immediately after push() — before the
+// model had produced any result addressing it. A container killed between
+// that push and the next 'result' event left the message permanently
+// 'completed' in processing_ack, so host-sweep's crash recovery
+// (which only resets rows still stuck in 'processing') never saw anything
+// to retry — the work vanished with no trace. Fix: a pushed follow-up
+// stays 'processing' (not completed) until a genuine 'result' event proves
+// the model made forward progress since the push.
+//
+// Adversarial review (same night) found the first version of this fix
+// incomplete: if the stream ends WITHOUT a crash — e.g. query.abort() from
+// a slash-command interruption, or the SDK just closing the stream — the
+// container stays alive and busy, so host-sweep's heartbeat-based
+// claim-stuck check never fires (heartbeat keeps advancing on whatever the
+// container does next) and the row would sit 'processing' forever with no
+// recovery path at all. A TRUE crash (the whole process dying) can't be
+// unit-tested — the surrounding finally block simply never runs — so what
+// these tests actually exercise is the non-crash "stream ended with no
+// further result" case, and assert the real fix for it: the pending
+// follow-up gets its claim released (processing_ack row deleted) in
+// processQuery's finally block, so it's picked up fresh on the very next
+// getPendingMessages() poll instead of waiting on a recovery path that
+// wouldn't have fired anyway.
+function ackStatus(messageId: string): string | undefined {
+  return (
+    getOutboundDb().prepare('SELECT status FROM processing_ack WHERE message_id = ?').get(messageId) as
+      | { status: string }
+      | undefined
+  )?.status;
+}
+
+describe('follow-up completion timing (crash-recovery correctness)', () => {
+  it('releases (not completes) a pushed follow-up whose query ends with no further result', async () => {
+    insertMessage('m1', 'chat', { sender: 'User', text: 'first' });
+    const pushes: string[] = [];
+
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      yield { type: 'result', text: 'turn 1 done' };
+
+      // A follow-up arrives while the query stays open — e.g. the
+      // background transcription-complete job writing a new inbound row.
+      insertMessage('m2', 'chat', { sender: 'System', text: 'follow-up content' });
+      const deadline = Date.now() + 5000;
+      while (!pushes.some((p) => p.includes('follow-up content')) && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      // The stream just ends here with no second result — no crash, the
+      // generator simply stops producing events (matches, from
+      // processQuery's point of view, what an abort() looks like too).
+    }
+
+    const query: AgentQuery = {
+      push: (m: string) => {
+        pushes.push(m);
+      },
+      end: () => {},
+      events: events(),
+      abort: () => {},
+    };
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
+
+    expect(pushes.some((p) => p.includes('follow-up content'))).toBe(true);
+    // Released, not left dangling 'processing' and not wrongly 'completed' —
+    // no row at all means the next getPendingMessages() call sees it fresh.
+    expect(ackStatus('m2')).toBeUndefined();
+  });
+
+  it('releases a follow-up whose result gets discarded by an abort() mid-flight (slash-command interruption)', async () => {
+    insertMessage('m1', 'chat', { sender: 'User', text: 'first' });
+    const pushes: string[] = [];
+    let aborted = false;
+
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      yield { type: 'result', text: 'turn 1 done' };
+
+      insertMessage('m2', 'chat', { sender: 'System', text: 'follow-up content' });
+      const pushDeadline = Date.now() + 5000;
+      while (!pushes.some((p) => p.includes('follow-up content')) && Date.now() < pushDeadline) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+
+      // abort() fires (e.g. a slash command landed) before the model's
+      // result for the follow-up is ever yielded — a real provider would
+      // drop it here too (see providers/claude.ts's `if (aborted) return`).
+      const abortDeadline = Date.now() + 5000;
+      while (!aborted && Date.now() < abortDeadline) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      // The generator ends without ever yielding the dropped result.
+    }
+
+    const query: AgentQuery = {
+      push: (m: string) => {
+        pushes.push(m);
+      },
+      end: () => {},
+      events: events(),
+      abort: () => {
+        aborted = true;
+      },
+    };
+
+    const processing = processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
+
+    // Simulate the follow-up poller detecting a slash command and aborting
+    // the stream mid-turn, once the follow-up has actually been pushed.
+    const deadline = Date.now() + 5000;
+    while (!pushes.some((p) => p.includes('follow-up content')) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    query.abort();
+
+    await processing;
+
+    expect(ackStatus('m2')).toBeUndefined();
+  });
+
+  it('flushes a pushed follow-up as completed once a subsequent result event proves forward progress', async () => {
+    insertMessage('m1', 'chat', { sender: 'User', text: 'first' });
+    const pushes: string[] = [];
+
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      yield { type: 'result', text: 'turn 1 done' };
+
+      insertMessage('m2', 'chat', { sender: 'System', text: 'follow-up content' });
+      const deadline = Date.now() + 5000;
+      while (!pushes.some((p) => p.includes('follow-up content')) && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+
+      // The model actually addresses the follow-up this time.
+      yield { type: 'result', text: 'turn 2 done' };
+    }
+
+    const query: AgentQuery = {
+      push: (m: string) => {
+        pushes.push(m);
+      },
+      end: () => {},
+      events: events(),
+      abort: () => {},
+    };
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
+
+    expect(ackStatus('m2')).toBe('completed');
+  });
+});
