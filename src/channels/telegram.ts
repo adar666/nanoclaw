@@ -141,7 +141,7 @@ async function sendPairingConfirmation(token: string, apiBase: string, platformI
   }
 }
 
-function createPairingInterceptor(
+export function createPairingInterceptor(
   botUsernamePromise: Promise<string | null>,
   hostOnInbound: ChannelSetup['onInbound'],
   token: string,
@@ -151,12 +151,12 @@ function createPairingInterceptor(
     try {
       const botUsername = await botUsernamePromise;
       if (!botUsername) {
-        hostOnInbound(platformId, threadId, message);
+        await hostOnInbound(platformId, threadId, message);
         return;
       }
       const { text, authorUserId } = readInboundFields(message);
       if (!text) {
-        hostOnInbound(platformId, threadId, message);
+        await hostOnInbound(platformId, threadId, message);
         return;
       }
       const consumed = await tryConsume({
@@ -167,7 +167,7 @@ function createPairingInterceptor(
         adminUserId: authorUserId,
       });
       if (!consumed) {
-        hostOnInbound(platformId, threadId, message);
+        await hostOnInbound(platformId, threadId, message);
         return;
       }
       // Pairing matched — record the chat and short-circuit so the
@@ -225,7 +225,7 @@ function createPairingInterceptor(
     } catch (err) {
       log.error('Telegram pairing interceptor error', { err });
       // Fail open: pass through so a pairing bug doesn't break normal traffic.
-      hostOnInbound(platformId, threadId, message);
+      await hostOnInbound(platformId, threadId, message);
     }
   };
 }
