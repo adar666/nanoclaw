@@ -53,6 +53,7 @@ import { fileURLToPath } from 'url';
 import zlib from 'zlib';
 
 import type { PDFDocument as PDFDocumentType, PDFFont, PDFPage, PDFTextField as PDFTextFieldType } from 'pdf-lib';
+import type JSZipType from 'jszip';
 
 import type { McpToolDefinition } from './types.js';
 import { registerTools } from './server.js';
@@ -926,6 +927,225 @@ interface FillOpts {
   baseDir: string;
 }
 
+// ---------------------------------------------------------------------------
+// .docx text-line fill (Story 1.4) — targets a plain paragraph's underscore
+// blank or trailing-colon label, for documents (or document regions) that
+// aren't a table. Only ever considers top-level body paragraphs (roots whose
+// tag is 'p') — a paragraph nested inside a <w:tbl> is never a candidate
+// here; that's the table-row path's job (see fillDocx's dispatch below).
+// ---------------------------------------------------------------------------
+
+interface DocxLineCandidate {
+  /** 1-indexed position within the *candidate* list itself — the same list both the discovery call and a fill call's "lineNumber" address. */
+  lineNumber: number;
+  pNode: XmlNode;
+  /** Own text of this paragraph (concatenated t-descendants, plus a rendered space for a <w:tab/>/<w:br/>), trimmed — shown in the discovery list and echoed back on fill. */
+  text: string;
+  /**
+   * The <w:t> node(s) that together make up *this candidate's* underscore
+   * run, when one was found — undefined means this candidate qualified via
+   * the trailing-colon rule instead. Almost always length 1; length > 1
+   * only when that one underscore run itself is fragmented across multiple
+   * <w:t> nodes (see findAllUnderscoreRunGroups). A paragraph with two
+   * separate underscore runs (two blanks) produces two candidates, each
+   * with its own node group here — never a merged/ambiguous one.
+   */
+  underscoreNodes?: XmlNode[];
+}
+
+/**
+ * Concatenates a paragraph's own <w:t> descendant text, in document order,
+ * decoding XML entities. A <w:tab/> or <w:br/> found in the raw XML between
+ * (or around) two <w:t> nodes renders as a single space, so a label and a
+ * blank separated by a real tab/line-break don't visually run together in
+ * the discovery listing (e.g. "שם:" <tab> "___________" reads as
+ * "שם: ___________", not "שם:___________").
+ */
+function collectParagraphText(xml: string, pNode: XmlNode): string {
+  const tNodes = collectDescendants(pNode, 't');
+  const tabOrBreakRe = /<w:(?:tab|br)\b[^>]*\/>/;
+  let result = '';
+  let cursor = pNode.start;
+  const appendGap = (gapStart: number, gapEnd: number) => {
+    if (gapEnd > gapStart && tabOrBreakRe.test(xml.slice(gapStart, gapEnd))) result += ' ';
+  };
+  for (const t of tNodes) {
+    appendGap(cursor, t.start);
+    result += decodeXmlEntities(xml.slice(t.openEnd, t.close));
+    cursor = t.end;
+  }
+  appendGap(cursor, pNode.end);
+  return result;
+}
+
+/**
+ * Finds every underscore run (a `/_{3,}/` match) in a paragraph's
+ * concatenated <w:t>-descendant text, returning one node-group per match —
+ * a paragraph with two blanks ("Name: ___ Date: ___") yields two groups,
+ * each independently addressable as its own line candidate. For a single
+ * match, the group is normally one <w:t> node; if Word fragmented that one
+ * blank across multiple runs, every node overlapping that specific match is
+ * included (fillDocxTextLine then applies replaceCellText's existing
+ * first-run-wins/blank-the-rest splice to just that group's nodes — same
+ * behavior already documented for a table cell, no new precedent needed
+ * here). A label run adjacent to (but not overlapping) a match is never
+ * included in that match's group, so it's left untouched by the fill.
+ */
+function findAllUnderscoreRunGroups(xml: string, pNode: XmlNode): XmlNode[][] {
+  const tNodes = collectDescendants(pNode, 't');
+  if (tNodes.length === 0) return [];
+
+  let concatenated = '';
+  const ranges: Array<{ node: XmlNode; start: number; end: number }> = [];
+  for (const node of tNodes) {
+    const text = decodeXmlEntities(xml.slice(node.openEnd, node.close));
+    const start = concatenated.length;
+    concatenated += text;
+    ranges.push({ node, start, end: start + text.length });
+  }
+
+  const groups: XmlNode[][] = [];
+  const re = /_{3,}/g;
+  let m: RegExpExecArray | null;
+  // eslint-disable-next-line no-cond-assign
+  while ((m = re.exec(concatenated))) {
+    const matchStart = m.index;
+    const matchEnd = m.index + m[0].length;
+    const overlapping = ranges.filter((r) => r.start < matchEnd && r.end > matchStart).map((r) => r.node);
+    if (overlapping.length > 0) groups.push(overlapping);
+  }
+  return groups;
+}
+
+// A trailing-colon paragraph only counts as a fill-in-the-blank label when it's short
+// (e.g. "תאריך:") — a longer prose sentence or section heading that happens to end in
+// ':' ("Please review the following:") is not a blank to fill.
+const COLON_LABEL_MAX_LENGTH = 40;
+
+/**
+ * Scans top-level body paragraphs (document order) for fill-in-the-blank
+ * markers: one candidate per underscore run (3+ literal `_`), or — only
+ * when no underscore run was found at all — one candidate if the paragraph
+ * is a short line ending in ':' with nothing meaningful after it. Table-
+ * internal paragraphs (anything not a direct `roots` entry) are never
+ * candidates. A paragraph that's purely a decorative underscore divider
+ * (no other label text once every underscore run is stripped out) is never
+ * a candidate either — it has no label to attach a value to. The returned
+ * list's own position (1-indexed) IS the "lineNumber" addressing scheme —
+ * both the discovery response and a fill call's lineNumber argument index
+ * into this same filtered list, mirroring how the PDF side's lineNumber
+ * indexes its own detected-lines list.
+ */
+function findDocxLineCandidates(xml: string, roots: XmlNode[]): DocxLineCandidate[] {
+  const candidates: DocxLineCandidate[] = [];
+  for (const pNode of roots) {
+    if (pNode.tag !== 'p') continue;
+    const text = collectParagraphText(xml, pNode).trim();
+    if (text === '') continue;
+
+    const underscoreGroups = findAllUnderscoreRunGroups(xml, pNode);
+    if (underscoreGroups.length > 0) {
+      const hasLabelText = text.replace(/_+/g, '').trim().length > 0;
+      if (hasLabelText) {
+        for (const group of underscoreGroups) {
+          candidates.push({ lineNumber: candidates.length + 1, pNode, text, underscoreNodes: group });
+        }
+      }
+      continue;
+    }
+
+    if (text.endsWith(':') && text.length <= COLON_LABEL_MAX_LENGTH) {
+      candidates.push({ lineNumber: candidates.length + 1, pNode, text, underscoreNodes: undefined });
+    }
+  }
+  return candidates;
+}
+
+function formatDocxLineCandidates(candidates: DocxLineCandidate[]): string {
+  return candidates.map((c) => `${c.lineNumber}. ${c.text}`).join('\n');
+}
+
+/** Discovery response for a table-less docx (or one where the caller explicitly asked for line targeting). */
+function docxListLines(candidates: DocxLineCandidate[]): ReturnType<typeof ok> | ReturnType<typeof err> {
+  if (candidates.length === 0) {
+    return err(
+      'This document has no tables to fill, and no fill-in-the-blank line (an underscore blank or a ' +
+        'trailing-colon label) was detected either.',
+    );
+  }
+  return ok(
+    `Detected fill-in-the-blank line(s):\n${formatDocxLineCandidates(candidates)}\n\nCall fill_document_field ` +
+      'again with the same "document", this "lineNumber", and a "value" to fill one.',
+  );
+}
+
+const TABLE_ROW_REQUIRED_MESSAGE = 'row is required for a .docx fill (1-indexed row within the target table).';
+
+/**
+ * Bare-discovery response (neither row/table nor lineNumber given). Always
+ * scans for fill-in-the-blank paragraphs regardless of whether the document
+ * also has tables (2026-08-16 spec amendment) — a mixed document names both
+ * possibilities so the agent can pick either targeting mode, rather than
+ * only ever surfacing the table prompt with the blank lines undiscoverable.
+ */
+function docxDiscoveryResponse(
+  tables: XmlNode[],
+  candidates: DocxLineCandidate[],
+): ReturnType<typeof ok> | ReturnType<typeof err> {
+  if (tables.length === 0) return docxListLines(candidates);
+  if (candidates.length === 0) return err(TABLE_ROW_REQUIRED_MESSAGE);
+  return ok(
+    `${TABLE_ROW_REQUIRED_MESSAGE} Or use "lineNumber" instead to fill one of the detected fill-in-the-blank ` +
+      `line(s) below:\n${formatDocxLineCandidates(candidates)}\n\nCall fill_document_field again with the same ` +
+      '"document" and either "row" (table path) or "lineNumber" (text-line path) plus "value".',
+  );
+}
+
+/** Paragraph has no underscore run (colon-ending case) — insert a new run right after its last existing run. A leading space keeps the value from running into the colon (e.g. "תאריך: 16/08/2026", not "תאריך:16/08/2026"). */
+function insertRunAfterParagraph(xml: string, pNode: XmlNode, value: string): string {
+  const runXml = `<w:r><w:t xml:space="preserve"> ${xmlEscapeText(value)}</w:t></w:r>`;
+  const runs = pNode.children.filter((c) => c.tag === 'r');
+  if (runs.length > 0) {
+    const lastRun = runs[runs.length - 1];
+    if (lastRun.end === -1) throw new Error('Malformed paragraph XML (unclosed run) — cannot fill.');
+    const insertAt = lastRun.end;
+    return xml.slice(0, insertAt) + runXml + xml.slice(insertAt);
+  }
+  if (pNode.close === -1) throw new Error('Malformed paragraph XML (unclosed paragraph) — cannot fill.');
+  const insertAt = pNode.close;
+  return xml.slice(0, insertAt) + runXml + xml.slice(insertAt);
+}
+
+async function fillDocxTextLine(
+  zip: JSZipType,
+  xml: string,
+  roots: XmlNode[],
+  meta: DocumentMeta,
+  lineNumber: number,
+  value: string,
+  opts: FillOpts,
+): Promise<ReturnType<typeof ok> | ReturnType<typeof err>> {
+  const candidates = findDocxLineCandidates(xml, roots);
+  const target = candidates[lineNumber - 1];
+  if (!target) {
+    return err(
+      `No line ${lineNumber} found — this document has ${candidates.length} detected fill-in-the-blank line(s).`,
+    );
+  }
+
+  const newXml = target.underscoreNodes
+    ? replaceCellText(xml, target.underscoreNodes, value)
+    : insertRunAfterParagraph(xml, target.pNode, value);
+
+  zip.file('word/document.xml', newXml);
+  const outBytes = await zip.generateAsync({ type: 'nodebuffer' });
+  const outPath = writeFillOutput(opts.baseDir, meta.slug, 'docx', outBytes);
+  return ok(
+    `Filled line ${lineNumber} ("${target.text}") of "${meta.slug}" with "${value}". New file at ${outPath} — ` +
+      'call send_file to deliver it.',
+  );
+}
+
 async function fillDocx(
   rawPath: string,
   meta: DocumentMeta,
@@ -933,11 +1153,29 @@ async function fillDocx(
   opts: FillOpts,
 ): Promise<ReturnType<typeof ok> | ReturnType<typeof err>> {
   const row = typeof args.row === 'number' ? args.row : undefined;
-  if (row === undefined) return err('row is required for a .docx fill (1-indexed row within the target table).');
   const value = typeof args.value === 'string' ? args.value : undefined;
-  if (value === undefined) return err('value is required.');
   const tableArg = typeof args.table === 'number' ? args.table : undefined;
   const columnArg = typeof args.column === 'number' ? args.column : undefined;
+  const lineNumberArg = typeof args.lineNumber === 'number' ? args.lineNumber : undefined;
+
+  // Table-row targeting (Story 1.2) always wins when the caller gives row
+  // and/or table — text-line mode only activates when the caller instead
+  // gives lineNumber, or gives neither and the document has no tables at all.
+  const usesTablePath = row !== undefined || tableArg !== undefined;
+
+  // row/table and lineNumber together used to silently resolve to table
+  // priority, dropping lineNumber with no acknowledgment — an explicit
+  // error is safer than a silent resolution.
+  if (usesTablePath && lineNumberArg !== undefined) {
+    return err(
+      'Pass either "row"/"table" for the table-fill path or "lineNumber" for the text-line path, not both.',
+    );
+  }
+  // column only means something for table-row targeting — without row/table
+  // it used to be silently ignored.
+  if (columnArg !== undefined && !usesTablePath) {
+    return err('"column" requires "row" (or "table") — it only applies to table-row targeting.');
+  }
 
   const JSZipModule = await import('jszip');
   const JSZip = JSZipModule.default;
@@ -951,6 +1189,20 @@ async function fillDocx(
     return err("This document's table XML looks malformed (an unbalanced tag) — declining to edit it.");
   }
   const tables = roots.filter((n) => n.tag === 'tbl');
+
+  if (!usesTablePath) {
+    if (lineNumberArg !== undefined) {
+      if (value === undefined) return err('value is required together with lineNumber.');
+      return fillDocxTextLine(zip, xml, roots, meta, lineNumberArg, value, opts);
+    }
+    // Discovery (no row/table/lineNumber given) — always scans for
+    // fill-in-the-blank paragraphs regardless of whether the document also
+    // has tables; a mixed document's response names both possibilities.
+    return docxDiscoveryResponse(tables, findDocxLineCandidates(xml, roots));
+  }
+
+  if (row === undefined) return err('row is required for a .docx fill (1-indexed row within the target table).');
+  if (value === undefined) return err('value is required.');
   if (tables.length === 0) return err('This document has no tables to fill.');
 
   let tableIndex: number;
@@ -1360,8 +1612,11 @@ async function fillPdf(
   return pdfFillPixel(rawPath, meta, pixelX, pixelY, value, opts);
 }
 
+// `lineNumber` is a shared arg (Story 1.4 adds it to .docx text-line targeting, alongside
+// its pre-existing Story 1.2 use for a .pdf text-layer line) — it belongs in neither
+// file-type-exclusive list below.
 const DOCX_ONLY_ARGS = ['table', 'row', 'column'] as const;
-const PDF_ONLY_ARGS = ['fieldName', 'lineNumber', 'pixelX', 'pixelY'] as const;
+const PDF_ONLY_ARGS = ['fieldName', 'pixelX', 'pixelY'] as const;
 
 function presentArgNames(args: Record<string, unknown>, keys: readonly string[]): string[] {
   return keys.filter((k) => args[k] !== undefined);
@@ -1429,11 +1684,16 @@ export const fillDocumentField: McpToolDefinition = {
     name: 'fill_document_field',
     description:
       'Fill a value into a named target in a document already saved via save_document, and produce a new file ' +
-      "(the stored copy is never modified) — call send_file with the returned path to deliver it. For a .docx: " +
-      'targets a table row (table/row, column optional — defaults to the row\'s last cell). For a .pdf: targets ' +
-      'an AcroForm field (fieldName) if the PDF has one matching, otherwise a text-layer line (a first call with ' +
-      'no lineNumber returns the detected lines to choose from) or, for a scanned PDF, a pixel position on a ' +
-      'rendered page (a first call with no pixelX/pixelY renders page 1 and returns its pixel dimensions).',
+      "(the stored copy is never modified) — call send_file with the returned path to deliver it. For a .docx " +
+      "with a table: targets a table row (table/row, column optional — defaults to the row's last cell) — this " +
+      'always wins over line targeting when row/table is given. For a .docx with no table (or when you give ' +
+      'lineNumber instead of row): targets a plain paragraph\'s fill-in-the-blank line — an underscore blank or ' +
+      'a trailing-colon label — a first call with neither row nor lineNumber returns a discovery response ' +
+      '(the detected blank lines, the table-row prompt, or both if the document has both a table and non-table ' +
+      'blanks). Never pass row/table together with lineNumber. For a .pdf: targets an AcroForm field (fieldName) ' +
+      'if the PDF has one matching, otherwise a text-layer line (a first call with no lineNumber returns the ' +
+      'detected lines to choose from) or, for a scanned PDF, a pixel position on a rendered page (a first call ' +
+      'with no pixelX/pixelY renders page 1 and returns its pixel dimensions).',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -1451,11 +1711,18 @@ export const fillDocumentField: McpToolDefinition = {
         },
         row: {
           type: 'integer',
-          description: '.docx only: 1-indexed row number within the target table. Required for a .docx fill.',
+          description:
+            '.docx only: 1-indexed row number within the target table. Give this (or table) to fill a table ' +
+            'row. Mutually exclusive with lineNumber for a .docx — passing both is an error. Omit both row and ' +
+            'lineNumber to get a discovery response: the "row is required" prompt if the document has a table, ' +
+            'the detected fill-in-the-blank line list if it has no table, or both (naming either option) if it ' +
+            'has a table AND non-table blank paragraphs.',
         },
         column: {
           type: 'integer',
-          description: '.docx only: 1-indexed column (cell) within the target row. Defaults to the last cell.',
+          description:
+            '.docx only: 1-indexed column (cell) within the target row. Defaults to the last cell. Requires row ' +
+            '(or table) — an error if given without either, since it only applies to table-row targeting.',
         },
         fieldName: {
           type: 'string',
@@ -1464,8 +1731,10 @@ export const fillDocumentField: McpToolDefinition = {
         lineNumber: {
           type: 'integer',
           description:
-            '.pdf, text-layer only: 1-indexed line (from a prior no-argument call\'s numbered list) to draw the ' +
-            'value after, on the same baseline.',
+            '1-indexed line (from a prior discovery call\'s numbered list) — for a .pdf text-layer, draws the ' +
+            'value after that line on the same baseline; for a .docx, fills that fill-in-the-blank paragraph\'s ' +
+            'underscore run (each blank in a paragraph is its own numbered line) or trailing-colon label. ' +
+            'Mutually exclusive with row/table for a .docx — passing both is an error.',
         },
         pixelX: {
           type: 'number',

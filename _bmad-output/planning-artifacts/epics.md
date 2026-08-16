@@ -19,7 +19,7 @@ This document provides the complete epic and story breakdown for **Document Memo
 
 FR1: When a user sends a Word or PDF attachment and asks to save/remember it, the agent stores the file and its extracted text content in the agent group's memory, with a summary entry in `memory/index.md`. For a PDF with no text layer, extraction falls back to the agent reading the rendered page image directly.
 FR2: A user can ask about a previously saved document's content at any later point, and the agent answers from the stored memory/index entry and extracted text rather than requiring the file again. If the reference is ambiguous, the agent presents a numbered list of candidates and the user picks by number.
-FR3: A user can name a target inside a specific saved document — a Word table row (table number + row number), a PDF form field, or a PDF text line/position — plus a value, and the agent produces an updated copy of the document with that value applied, delivered back in chat. If the target document is ambiguous, the same numbered disambiguation as FR2 applies first.
+FR3: A user can name a target inside a specific saved document — a Word table row (table number + row number), a Word fill-in-the-blank text line (line number, when no table matches — added post-launch after live use showed most real forms aren't tables), a PDF form field, or a PDF text line/position — plus a value, and the agent produces an updated copy of the document with that value applied, delivered back in chat. If the target document is ambiguous, the same numbered disambiguation as FR2 applies first.
 
 ### NonFunctional Requirements
 
@@ -44,6 +44,7 @@ NFR7: When the target saved document is ambiguous, the agent presents a numbered
 - **AD-9** `src/attachment-naming.ts`'s `MIME_TO_EXT` map gains `.docx`/`.doc` entries — a landed prerequisite so a Word file never arrives extension-less.
 - **AD-10** One shared slug-generation function (filename → lowercase kebab-case, strip extension, `-2`/`-3`… on collision) used by every tool in `documents.ts` — no per-tool reinvention.
 - **AD-11** Every write to a shared per-group memory index file (`memory/index.md`, `memory/documents/index.md`) goes through locked read-modify-write — concurrent sessions of the same group can save at the same time.
+- **AD-12** Docx fill-in-the-blank text lines (a paragraph with an underscore run or trailing colon/blank, no matching table) get their own targeting mode, distinct from AD-5's table-cell editing — same two-call discovery pattern as AD-4's PDF text-layer branch. Added post-launch: live production use showed real-world forms are built this way far more often than as Word tables.
 - New `container/skills/document-memory/SKILL.md` (agent-facing prose, same shape as `audio-report/SKILL.md`) teaches the agent when/how to call the three tools and how to run the numbered-pick-list disambiguation.
 - Deferred (spine-acknowledged, not built now): whether an edit refreshes the stored raw copy and/or stored extracted text (default: neither — a re-save is a separate, unspecified action); OCR fallback if agent-vision reading proves insufficient in practice; multi-file/batch fill operations; version history/undo for edited documents.
 
@@ -57,7 +58,7 @@ N/A — no UX design contract exists and none is needed. This feature has no UI 
 | --- | --- | --- |
 | FR1 | CAP-1 | AD-1, AD-2, AD-3, AD-4, AD-6, AD-9, AD-10, AD-11 |
 | FR2 | CAP-2 | AD-6, AD-7, AD-10 |
-| FR3 | CAP-3 | AD-1, AD-2, AD-3, AD-4, AD-5, AD-7, AD-8, AD-10 |
+| FR3 | CAP-3 | AD-1, AD-2, AD-3, AD-4, AD-5, AD-7, AD-8, AD-10, AD-12 |
 | NFR1, NFR2, NFR3 | CAP-1, CAP-3 | AD-4, AD-5 |
 | NFR4 | CAP-1, CAP-2 | AD-6 |
 | NFR5 | CAP-3 | (existing `send_file`, unchanged) |
@@ -176,3 +177,27 @@ So that I get an accurate answer without resending the file.
 **Given** the user's reference matches no saved document
 **When** `list_documents` runs
 **Then** the agent says so plainly rather than guessing at content
+
+### Story 1.4: Fill a Docx Fill-In-The-Blank Text Line (No Table)
+
+As a NanoClaw user,
+I want to fill a blank on a plain Word form (a line with underscores or a label, not a table),
+So that forms built the way real forms actually are can be filled without me doing it by hand.
+
+**Acceptance Criteria:**
+
+**Given** a saved `.docx` with no table matching the request, but a paragraph carrying an underscore run (3+ characters) or a trailing colon/blank
+**When** the user asks to fill a value with no `lineNumber` given
+**Then** `fill_document_field` returns a numbered list of detected fill-in-the-blank lines (AD-12)
+
+**Given** the same document and a `lineNumber` + `value` from a follow-up call
+**When** `fill_document_field` runs
+**Then** the matched underscore run is replaced with the value (or the value is inserted right after the label if there's no underscore run), that one paragraph changes, every other paragraph is byte-identical, and a new `.docx` is returned (AD-12)
+
+**Given** a `.docx` where a table already matches the request
+**When** `fill_document_field` runs
+**Then** the existing table-row path (AD-5) takes priority — text-line fill only applies when no table matches (row-targeting-matrix.md's selection rule)
+
+**Given** no paragraph in the document matches (no table, no fill-in-the-blank marker found either)
+**When** `fill_document_field` runs
+**Then** it declines clearly (AD-8) — never guesses at inserting the value somewhere

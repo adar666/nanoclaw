@@ -96,7 +96,21 @@ description (same matching either way).
   conversation. If nothing matches, that *is* an error — say so plainly
   rather than guessing.
 
-## Filling a `.docx` table row
+## Filling a `.docx`
+
+Two targeting modes, auto-selected by the document's shape and which
+argument you give — you never pick a mode explicitly:
+
+1. **Table row** — the document has a table and you give `row` (or `table`).
+   This always wins over line targeting when `row`/`table` is given, even if
+   the same document also has non-table paragraphs elsewhere.
+2. **Text-line (fill-in-the-blank paragraph)** — the document has no table
+   at all, or you give `lineNumber` instead of `row`. Targets a plain
+   paragraph carrying an underscore blank (`שם: ___________`) or a trailing
+   colon label (`תאריך:`) with nothing after it — the common shape for a
+   real-world form that isn't built from a Word table.
+
+### Table row
 
 One call. Give `document`, `row` (1-indexed row within the table), and
 `value`. `table` (1-indexed) is only needed if the document has more than
@@ -113,6 +127,42 @@ mcp__nanoclaw__fill_document_field({ document: "intake-form", row: 2, value: "Ad
 If the target row's cell holds a nested table, or the table/row number
 doesn't exist, the tool declines with a clear error and writes no file —
 don't retry with a guessed different number, ask the user instead.
+
+### Text-line (no table, or you're targeting a non-table blank)
+
+Two calls, mirroring the PDF text-layer flow below:
+
+- First call: `fill_document_field({ document })` — with no `row` and no
+  `lineNumber`. If the document has no table, this returns a numbered list
+  of detected fill-in-the-blank paragraphs (mirrors the PDF line list's
+  shape). **If it also has a table, the response names both possibilities**
+  — the table-row prompt *and* the numbered blank-line list — so pick
+  whichever mode actually matches what the user wants (`row` for the table,
+  `lineNumber` for a blank-line paragraph).
+- Second call: `fill_document_field({ document, lineNumber, value })` —
+  fills that line. Each detected blank is its own numbered candidate — a
+  paragraph with two blanks ("Name: ___ Date: ___") lists as two separate
+  lines, each independently fillable. An underscore blank has its
+  underscore run replaced with `value`; a trailing-colon label gets `value`
+  appended right after it, on the same paragraph. Only that one paragraph
+  changes — table content, if any, is untouched.
+
+Don't pass `row`/`table` and `lineNumber` together, and don't pass `column`
+without `row`/`table` — both are rejected with a clear error rather than
+silently picking one or dropping the other.
+
+If no table exists and no fill-in-the-blank paragraph is detected either,
+the tool declines clearly — don't guess a target; ask the user instead (the
+same "decline rather than guess" rule as everywhere else in this tool).
+
+**Known limitation:** if a paragraph's label and its blank happen to sit in
+the *same* underlying Word run (no formatting break between them — rare,
+but possible for a short line typed all at once with no script/formatting
+change), filling it replaces the whole run, and the label is lost along
+with the blank. This mirrors the existing table-cell multi-run limitation
+— if it happens, the delivered file will show just the value with no label
+in front of it; mention that to the user rather than assuming something
+went wrong.
 
 ## Filling a `.pdf`
 
