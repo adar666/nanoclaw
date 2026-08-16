@@ -15,7 +15,7 @@ A pain to solve: right now a user who sends a Word or PDF file to their agent ge
 ## Capabilities
 
 - **CAP-1**
-  - **intent:** When a user sends a Word or PDF attachment and asks to save/remember it, the agent stores the file and its extracted text content in the agent group's memory, with a summary entry in `memory/index.md`. For a PDF with no text layer (scanned/image-only), extraction falls back to the agent reading the rendered page image directly (see `row-targeting-matrix.md`).
+  - **intent:** When a user sends a Word or PDF attachment and asks to save/remember it, the agent stores the file and its extracted text content in the agent group's memory, with a pointer entry in `memory/index.md` (a mechanical filename restatement, not a generated content summary — see `implementation-artifacts/epic-1-retro-2026-08-16.md` action item AI-3). For a PDF with no text layer (scanned/image-only), extraction falls back to the agent reading the rendered page image directly (see `row-targeting-matrix.md`).
   - **success:** After sending a docx/pdf with "remember this," a later, unrelated conversation can ask about the document's content and the agent answers correctly from memory, with no need to resend the file — including for a scanned PDF.
 
 - **CAP-2**
@@ -35,6 +35,7 @@ A pain to solve: right now a user who sends a Word or PDF file to their agent ge
 - Saved documents and their extracted content live under the requesting agent group's `memory/` tree (raw file + a `memory/index.md` summary entry, per the existing OKF convention) — not the separate second-brain media-ingestion pipeline, which is a different tenant-scoped system serving only specific DM groups.
 - Editing must return the updated file through the existing `send_file` MCP tool / outbox delivery path. No new outbound delivery mechanism.
 - No docx/pdf read or write library exists in the container today. Shipping this feature requires adding a new dependency to the agent-runner (Bun) package tree and a container image rebuild — accepted as in-scope for this spec, not deferred to a later epic.
+- PDF fill values must render correctly for non-Latin-1 scripts (Hebrew, confirmed working) via an embedded Unicode-coverage font, not just the Latin-1-only PDF standard fonts — added during implementation review, not originally planned here; see `architecture-nanoclaw-v2-2026-08-16/ARCHITECTURE-SPINE.md`'s Stack table.
 
 ## Non-goals
 

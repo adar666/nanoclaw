@@ -117,6 +117,8 @@ flowchart LR
 | pdfjs-dist | ~6.2.108 | Extract PDF text with per-item positional data when a text layer exists. Actively maintained (Mozilla), verified current. |
 | @hyzyla/pdfium | 2.1.13 | Render a PDF page to an image (scanned-content read fallback, overlay position-estimate fallback, AD-4). `[ADOPTED]` Verified: ships a bundled WASM fallback, so its optional `sharp` dependency is not a native-binary blocker for this Bun/Docker base image. |
 | jszip | 3.10.1 | Unzip/rezip `.docx` for direct OOXML cell-text edits (AD-5). Stable since 2022, not deprecated — not "actively released" but still the ecosystem-standard choice; no better-adopted alternative found. |
+| @pdf-lib/fontkit | 1.1.1 | Registers a custom-font embedder for `pdf-lib` — required for any non-Standard-14 (non-Latin-1) glyph, added mid-Story-1.2 during code review after Helvetica-only drawing was found to crash on Hebrew `value` input. `[UNDOCUMENTED IN PLANNING]` landed via implementation-time review judgment, not a pre-planned decision — see `implementation-artifacts/epic-1-retro-2026-08-16.md` action item AI-4. |
+| @fontsource/noto-sans-hebrew | 5.3.0 | The Unicode/Hebrew-coverage font asset `@pdf-lib/fontkit` embeds, drawn alongside Helvetica per run via script detection (`documents.ts`'s `splitByScript`/`drawUnicodeText`) so mixed-script `value`s render correctly. Same undocumented-in-planning note as above. |
 
 ## Structural Seed
 
@@ -145,9 +147,24 @@ groups/<folder>/memory/
 
 ## Deferred
 
-- Whether a fill-in edit also updates the canonical stored copy (`memory/documents/files/<slug>.<ext>`) **and/or** the concept file's stored extracted text/summary, or only produces a delivered copy leaving both untouched. SPEC.md's CAP-3 success criteria describe only the delivered file. Default-safe assumption until decided: both the stored raw file and the stored extracted text remain at their as-saved content — a re-save is a distinct, not-yet-specified action. Revisit before `fill_document_field` is built, since leaving it undecided risks CAP-2 answering from permanently stale text after any edit.
+- ~~Whether a fill-in edit also updates the canonical stored copy...~~ **Resolved by implementation**: `fill_document_field` only ever writes to `.document-fills/`; the stored raw file and stored extracted text are never touched by a fill (confirmed, epic-1 retro spec-reconciliation pass).
 - `pdf-lib`'s archived-repo risk (Stack table): revisit and consider migrating to the actively-maintained `@cantoo/pdf-lib` fork if a real incompatibility with a future PDF feature surfaces — not a reason to block this build.
 - Deployment/operational envelope: no new topology. Shipping this feature still requires the standard base-image rebuild + service restart (already a SPEC.md constraint); nothing feature-specific beyond that.
 - OCR quality fallback if the agent's own vision-based reading of a scanned page proves insufficient in practice (a dedicated OCR engine, if ever needed, is out of scope per SPEC.md's no-new-OCR-engine decision — revisit only if the vision-fallback approach demonstrably fails).
 - Multi-file / batch document operations (e.g. "fill this value in all three saved contracts") — SPEC.md scopes CAP-3 to one named document at a time.
 - Version history / undo for edited documents — not in SPEC.md; revisit if requested.
+
+**Merged from `implementation-artifacts/deferred-work.md` (epic-1 retro action item AI-5 — single source of truth going forward):**
+
+- No size limits / decompression-bomb protection on docx unzip or PDF read (whole-file reads, only a 64MB unzip output cap) — robustness hardening, not blocking for a trusted single-operator use case.
+- No timeout around async PDF text-extraction/render calls — a pathological file could hang a tool call indefinitely.
+- Full multi-page scanned-PDF support (rendering/reading pages beyond page 1) and mixed text/image-page handling — current page-1-only behavior is disclosed to the user via the tool's message and SKILL.md, not silent; genuine multi-page support is a larger feature.
+- Lock staleness detection is mtime-heuristic only, no real PID-liveness cross-check — reasonable, not a perfect crash-detection mechanism.
+- No handling or specific user-facing messaging for password-protected/encrypted PDFs — surfaces a generic "Could not read PDF" error; revisit if it comes up in practice.
+- Full cleanup/GC of abandoned `.document-renders/` and `.document-fills/` files when the agent never follows up on a two-call flow — only the successful-completion path cleans up after itself.
+- Full merged-cell-aware (`w:gridSpan`) visual-column targeting for `.docx` fills — the shipped code only detects and declines a gridSpan row rather than silently miscounting.
+- Non-`w:`-prefixed OOXML namespace bindings are not recognized by the table parser (reports "no tables" rather than a specific unsupported-namespace message) — rare in practice since Word's own default binds `w:`.
+
+**Also accepted, self-documented only in-code (epic-1 retro action item AI-6):**
+
+- AD-7's literal Rule ("`list_documents` returns structured data only; rendering the pick-list is the agent's own turn") isn't what shipped — the tool pre-renders the numbered candidate text itself. The **Prevents** goal (two call sites formatting differently) is honored, since both `list_documents` and `fill_document_field`'s ambiguous-match branch call the identical `formatDocumentCandidates` helper — only the letter of the Rule differs from the implementation. Accepted as a reasonable simplification; not worth un-doing.

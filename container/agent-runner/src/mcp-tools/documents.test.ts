@@ -235,6 +235,7 @@ describe('save_document — happy path, docx', () => {
     const concept = fs.readFileSync(conceptFile, 'utf-8');
     expect(concept).toContain('type: saved-document');
     expect(concept).toContain('source-filename: "report.docx"');
+    expect(concept).toContain('raw-file: "files/report.docx"');
     expect(concept).toContain('saved-date:');
     expect(concept).toContain('Hello World');
     expect(concept).toContain('Second paragraph');
@@ -855,6 +856,28 @@ describe('fill_document_field — docx happy path', () => {
     expect(docxXmlToText(newXml)).toContain('a2');
     expect(docxXmlToText(newXml)).not.toContain('b2');
     expect(docxXmlToText(newXml)).toContain('X');
+  });
+});
+
+describe('fill_document_field — docx, control characters in value are stripped', () => {
+  it('strips a raw control byte from value before splicing into word/document.xml', async () => {
+    const original = buildDocxWithTables([[['a1', 'b1']]]);
+    const filePath = writeInboxFile('report.docx', original);
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    // eslint-disable-next-line no-control-regex
+    const dirtyValue = 'be\x01fore\nafter';
+    const result = await fillDocumentFieldImpl({ document: 'report', table: 1, row: 1, value: dirtyValue }, opts());
+    expect(result.isError).toBeFalsy();
+
+    const outPath = extractOutPath(result.content[0].text);
+    const newXml = await readDocxXml(fs.readFileSync(outPath));
+
+    // The inserted run itself carries no control bytes -- only the value's alphanumeric
+    // content survives, joined with nothing (the control byte and the newline are both gone).
+    const insertedRun = /<w:t[^>]*>beforeafter<\/w:t>/.exec(newXml);
+    expect(insertedRun).not.toBeNull();
+    expect(docxXmlToText(newXml)).toContain('beforeafter');
   });
 });
 
