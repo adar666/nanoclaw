@@ -1,5 +1,5 @@
 /**
- * save_document — persist a Word (.docx) or PDF attachment to the agent
+ * save_document — persist a Word (.docx/.doc) or PDF attachment to the agent
  * group's durable per-group memory (see docs/memory.md's OKF convention),
  * so a later, unrelated conversation can be answered from it without the
  * file being resent.
@@ -20,9 +20,15 @@
  *     purposes) and stripping the OOXML markup with a small regex-based
  *     reader — no new zip dependency for this story (`jszip`/`pdf-lib` are
  *     Story 1.2's, needed only for *writing* back into a document).
+ *   - `.doc` (legacy binary Word 97-2003): text is pulled out via the
+ *     `word-extractor` package (pure JS, no system dependency) — no
+ *     LibreOffice conversion in this read path at all. Filling a saved
+ *     `.doc` (Story 1.5) is the one operation that needs LibreOffice: a
+ *     one-time `.doc` -> `.docx` conversion feeding the existing, unmodified
+ *     `.docx` fill pipeline; save/recall never touch it.
  *
- * Only `.docx` and `.pdf` are in scope; anything else is declined cleanly
- * with no memory footprint at all.
+ * `.docx`, `.doc`, and `.pdf` are in scope; anything else is declined
+ * cleanly with no memory footprint at all.
  *
  * Storage shape (AD-6):
  *   memory/documents/files/<slug>.<ext>   — canonical raw copy
@@ -47,7 +53,9 @@
  * class of risk (a path that resolves outside the sandbox).
  */
 import { execFileSync } from 'child_process';
+import crypto from 'crypto';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import zlib from 'zlib';
@@ -74,7 +82,7 @@ function errnoCode(e: unknown): string | undefined {
   return e && typeof e === 'object' && 'code' in e ? (e as NodeJS.ErrnoException).code : undefined;
 }
 
-const SUPPORTED_EXTENSIONS = new Set(['docx', 'pdf']);
+const SUPPORTED_EXTENSIONS = new Set(['docx', 'doc', 'pdf']);
 
 // ---------------------------------------------------------------------------
 // Path containment — `path` is a model-supplied argument. Resolve it (either
@@ -282,6 +290,61 @@ function extractDocxText(filePath: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// .doc (legacy binary Word 97-2003) text extraction via `word-extractor` —
+// a pure-JS OLE2/Compound-File-Binary reader, no system dependency and no
+// LibreOffice call. This is a genuinely different binary format from
+// `.docx` (OOXML-in-a-zip), so it gets its own extraction path rather than
+// any modification of extractDocxText above. `.extract()` takes a file path
+// directly (matching every other read path in this file) and resolves to a
+// document object; `getBody()` is the main document text — headers,
+// footers, footnotes, etc. are available via other accessors but are not
+// read here, mirroring the .docx path's "body paragraphs only" scope.
+// ---------------------------------------------------------------------------
+
+// Shared across every .doc-related operation that can, in principle, hang on
+// a pathological input: word-extractor's in-process parse below, and the
+// soffice subprocess conversion further down. Same 30s budget for both —
+// there's no discipline-based reason for the read path to be more patient
+// than the write path.
+const DOC_TIMEOUT_MS = 30_000;
+
+/**
+ * word-extractor has no built-in timeout/cancellation — a pathological .doc
+ * (deeply nested OLE2 structure, adversarial input) could otherwise hang
+ * save_document indefinitely. This races the extraction against a timer;
+ * on timeout the *promise* settles (so the caller isn't blocked forever),
+ * even though the underlying parse work may still be running in the
+ * background — best achievable without an abortable extractor API.
+ */
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (e) => {
+        clearTimeout(timer);
+        reject(e);
+      },
+    );
+  });
+}
+
+async function extractDocText(filePath: string): Promise<string> {
+  try {
+    const WordExtractor = (await import('word-extractor')).default;
+    const extractor = new WordExtractor();
+    const doc = await withTimeout(extractor.extract(filePath), DOC_TIMEOUT_MS, '.doc text extraction');
+    return doc.getBody().trim();
+  } catch (e) {
+    log(`.doc text extraction failed for ${filePath}: ${e instanceof Error ? e.message : String(e)}`);
+    return '';
+  }
+}
+
+// ---------------------------------------------------------------------------
 // .pdf text-layer extraction via pdfjs-dist. Returns '' (not an error) when
 // the PDF has no meaningful text layer — the caller treats that as "scanned,
 // fall back to rendering." A genuinely malformed/corrupt PDF throws instead,
@@ -459,7 +522,7 @@ export async function saveDocumentImpl(
     const ext = path.extname(originalFilename).slice(1).toLowerCase();
     if (!SUPPORTED_EXTENSIONS.has(ext)) {
       return err(
-        `Unsupported file type "${ext ? `.${ext}` : '(none)'}" — save_document only handles Word (.docx) ` +
+        `Unsupported file type "${ext ? `.${ext}` : '(none)'}" — save_document only handles Word (.docx/.doc) ` +
           'and PDF (.pdf) files.',
       );
     }
@@ -504,6 +567,13 @@ export async function saveDocumentImpl(
 
         bodyText = extractedText;
         renderPathToCleanup = renderPath;
+      }
+    } else if (ext === 'doc') {
+      bodyText = await extractDocText(resolvedPath);
+      if (!bodyText) {
+        extractionNote =
+          '\n\n_(Could not extract text automatically from this Word document — the raw file is preserved ' +
+          'for reference.)_';
       }
     } else {
       bodyText = extractDocxText(resolvedPath);
@@ -612,7 +682,7 @@ export async function saveDocumentImpl(
 
 interface DocumentMeta {
   slug: string;
-  ext: 'docx' | 'pdf';
+  ext: 'docx' | 'doc' | 'pdf';
   sourceFilename: string;
   description: string;
   /**
@@ -623,7 +693,7 @@ interface DocumentMeta {
    * are about to actually target this document must check this field and
    * surface a specific error instead of proceeding.
    */
-  ambiguousExtensions?: Array<'docx' | 'pdf'>;
+  ambiguousExtensions?: Array<'docx' | 'doc' | 'pdf'>;
 }
 
 /** Reverses yamlEscape(): strips the surrounding quotes and unescapes `\x` -> `x`. */
@@ -653,10 +723,10 @@ function readConceptMeta(documentsDir: string, filesDir: string, slug: string): 
     }
   }
 
-  const matchingExts: Array<'docx' | 'pdf'> = [];
+  const matchingExts: Array<'docx' | 'doc' | 'pdf'> = [];
   for (const candidate of SUPPORTED_EXTENSIONS) {
     if (fs.existsSync(path.join(filesDir, `${slug}.${candidate}`))) {
-      matchingExts.push(candidate as 'docx' | 'pdf');
+      matchingExts.push(candidate as 'docx' | 'doc' | 'pdf');
     }
   }
   if (matchingExts.length === 0) return undefined; // concept file with no matching raw copy — orphaned, skip it
@@ -1612,6 +1682,169 @@ async function fillPdf(
   return pdfFillPixel(rawPath, meta, pixelX, pixelY, value, opts);
 }
 
+// ---------------------------------------------------------------------------
+// fill_document_field — .doc path. There's no practical way to edit the
+// legacy binary format directly, so a saved `.doc` is converted to `.docx`
+// once via headless LibreOffice, into a throwaway scratch directory, and
+// the resulting file is handed to the *existing*, completely unmodified
+// fillDocx() — the entire table-row/text-line fill pipeline is reused as-is
+// (Story 1.2/1.4). Output is always `.docx`; the original `.doc` is never
+// touched or reconstructed.
+// ---------------------------------------------------------------------------
+
+const DOC_CONVERSION_NOTE =
+  ' (This was a legacy .doc file — converted to .docx to make it editable. The returned file is .docx, not a ' +
+  'reconstructed .doc.)';
+
+/**
+ * Every successful fill path (table row, text line, PDF field/line/pixel —
+ * see fillDocxTextLine/fillDocx/pdfFillLine/pdfFillPixel/pdfFillAcroForm)
+ * writes this exact marker into its ok() text. Reused here, rather than a
+ * new convention, to tell a *completed* fill apart from a discovery/
+ * candidate-list/ambiguous-table prompt — the only kind of response the
+ * .doc-origin disclosure below is ever allowed to attach to.
+ */
+const FILL_SUCCESS_MARKER = 'New file at ';
+
+const SUBPROCESS_OUTPUT_TAIL_CHARS = 500;
+
+/** Truncates captured subprocess output to a readable tail for an error message — the full buffer could be arbitrarily large or noisy. */
+function tailOf(buf: unknown): string {
+  if (!buf) return '';
+  const text = Buffer.isBuffer(buf) ? buf.toString('utf-8') : String(buf);
+  const trimmed = text.trim();
+  return trimmed.length > SUBPROCESS_OUTPUT_TAIL_CHARS ? `…${trimmed.slice(-SUBPROCESS_OUTPUT_TAIL_CHARS)}` : trimmed;
+}
+
+/**
+ * Builds the argv for a headless LibreOffice conversion. Exported and
+ * reused (with a different target format) by this file's own test fixture
+ * builder (`buildDocViaSoffice` in documents.test.ts) — a single source of
+ * truth for the flag set, so a future flag change can't silently drift the
+ * production invocation and the test fixture's invocation apart.
+ */
+export function sofficeConvertArgs(inputPath: string, targetFormat: string, outDir: string, profileDir: string): string[] {
+  return [
+    '--headless',
+    '--norestore',
+    `-env:UserInstallation=file://${profileDir}`,
+    '--convert-to',
+    targetFormat,
+    '--outdir',
+    outDir,
+    inputPath,
+  ];
+}
+
+/**
+ * Converts `rawPath` (a .doc) to .docx via `soffice --headless --convert-to
+ * docx`, into a fresh, isolated scratch directory. Each call gets its own
+ * `-env:UserInstallation` profile directory — headless LibreOffice takes an
+ * exclusive lock on its user profile, so two concurrent conversions sharing
+ * one profile would collide; a unique per-call profile avoids that
+ * lock-file conflict entirely rather than needing any retry/queueing logic.
+ */
+function convertDocToDocx(rawPath: string, scratchDir: string): { path: string } | { error: string } {
+  const profileDir = path.join(scratchDir, 'profile');
+
+  // Scratch-space setup gets its own try/catch — a disk-full/permissions
+  // failure here must produce a clear, .doc-conversion-specific error
+  // (and get logged, per every other extraction failure in this file),
+  // not fall through to fillDoc's/fillDocumentFieldImpl's generic
+  // catch-all with no trace of what actually happened.
+  try {
+    fs.mkdirSync(profileDir, { recursive: true });
+  } catch (e) {
+    const error = `Could not prepare scratch space for .doc conversion: ${e instanceof Error ? e.message : String(e)}`;
+    log(`.doc conversion failed for ${rawPath}: ${error}`);
+    return { error };
+  }
+
+  try {
+    execFileSync('soffice', sofficeConvertArgs(rawPath, 'docx', scratchDir, profileDir), {
+      timeout: DOC_TIMEOUT_MS,
+      stdio: 'pipe',
+    });
+  } catch (e) {
+    if (errnoCode(e) === 'ENOENT') {
+      const error =
+        'LibreOffice (soffice) is not installed in this container — cannot convert a legacy .doc file for ' +
+        'filling.';
+      log(`.doc conversion failed for ${rawPath}: ${error}`);
+      return { error };
+    }
+
+    // execFileSync populates .stdout/.stderr on the thrown error when stdio
+    // is 'pipe' (as here) — the real LibreOffice diagnostic (e.g. "source
+    // file could not be loaded") lives there, not in e.message, which is
+    // just Node's generic "Command failed" wrapper.
+    const errObj = e as { killed?: boolean; signal?: string | null; stdout?: unknown; stderr?: unknown };
+    const isTimeout = Boolean(errObj?.killed || errObj?.signal);
+    const output = [tailOf(errObj?.stderr), tailOf(errObj?.stdout)].filter(Boolean).join(' | ');
+    const outputSuffix = output ? ` LibreOffice output: ${output}` : '';
+    const error = isTimeout
+      ? `.doc conversion timed out after ${DOC_TIMEOUT_MS}ms.${outputSuffix}`
+      : `Could not convert .doc to .docx: ${e instanceof Error ? e.message : String(e)}.${outputSuffix}`;
+    log(`.doc conversion failed for ${rawPath}: ${error}`);
+    return { error };
+  }
+
+  const convertedName = `${path.basename(rawPath, path.extname(rawPath))}.docx`;
+  const convertedPath = path.join(scratchDir, convertedName);
+  if (!fs.existsSync(convertedPath)) {
+    const error = 'LibreOffice did not produce a converted .docx — the source .doc may be corrupted or unsupported.';
+    log(`.doc conversion failed for ${rawPath}: ${error}`);
+    return { error };
+  }
+  return { path: convertedPath };
+}
+
+/**
+ * The .doc-origin disclosure only belongs on a response that represents an
+ * actually-completed fill (a new file was written — see FILL_SUCCESS_MARKER
+ * above). A bare-discovery response, a "row is required" / table-count
+ * prompt, or an ambiguous-slug clarification never wrote a file at all, so
+ * appending "converted to .docx" to one of those would be a factually wrong
+ * claim about work that didn't happen.
+ */
+function withDocConversionNote(
+  result: ReturnType<typeof ok> | ReturnType<typeof err>,
+): ReturnType<typeof ok> | ReturnType<typeof err> {
+  if ('isError' in result && result.isError) return result;
+  const text = result.content[0]?.text;
+  if (typeof text !== 'string' || !text.includes(FILL_SUCCESS_MARKER)) return result;
+  return ok(`${text}${DOC_CONVERSION_NOTE}`);
+}
+
+async function fillDoc(
+  rawPath: string,
+  meta: DocumentMeta,
+  args: Record<string, unknown>,
+  opts: FillOpts,
+): Promise<ReturnType<typeof ok> | ReturnType<typeof err>> {
+  // A true ephemeral os.tmpdir() location, NOT opts.baseDir (the agent
+  // group's *persistent* memory volume) — a container death mid-conversion
+  // (OOM, host restart) must never orphan a scratch dir (including the
+  // LibreOffice profile) permanently in durable storage the way it would
+  // if this lived under baseDir. The finally below still cleans up the
+  // normal path; os.tmpdir() only changes where an *abandoned* one ends up.
+  // crypto.randomUUID() (rather than Date.now()+Math.random()) rules out
+  // any realistic collision between concurrent fills on the same document.
+  const scratchDir = path.join(os.tmpdir(), 'nanoclaw-doc-conversion', crypto.randomUUID());
+  try {
+    const converted = convertDocToDocx(rawPath, scratchDir);
+    if ('error' in converted) return err(converted.error);
+    const result = await fillDocx(converted.path, meta, args, opts);
+    return withDocConversionNote(result);
+  } finally {
+    try {
+      fs.rmSync(scratchDir, { recursive: true, force: true });
+    } catch {
+      // Best effort — a leftover scratch dir is harmless, never blocks the response.
+    }
+  }
+}
+
 // `lineNumber` is a shared arg (Story 1.4 adds it to .docx text-line targeting, alongside
 // its pre-existing Story 1.2 use for a .pdf text-layer line) — it belongs in neither
 // file-type-exclusive list below.
@@ -1663,7 +1896,7 @@ export async function fillDocumentFieldImpl(
     } else {
       const wrongArgs = presentArgNames(args, PDF_ONLY_ARGS);
       if (wrongArgs.length > 0) {
-        return err(`These arguments don't apply to a .docx document: ${wrongArgs.join(', ')}.`);
+        return err(`These arguments don't apply to a .${meta.ext} document: ${wrongArgs.join(', ')}.`);
       }
     }
 
@@ -1671,7 +1904,11 @@ export async function fillDocumentFieldImpl(
     if (!fs.existsSync(rawPath)) return err(`Saved raw file for "${meta.slug}" is missing.`);
 
     const result =
-      meta.ext === 'docx' ? await fillDocx(rawPath, meta, args, opts) : await fillPdf(rawPath, meta, args, opts);
+      meta.ext === 'docx'
+        ? await fillDocx(rawPath, meta, args, opts)
+        : meta.ext === 'doc'
+          ? await fillDoc(rawPath, meta, args, opts)
+          : await fillPdf(rawPath, meta, args, opts);
     log(`fill_document_field: ${meta.slug} (${meta.ext}) -> ${'isError' in result && result.isError ? 'error' : 'ok'}`);
     return result;
   } catch (e) {
@@ -1693,7 +1930,9 @@ export const fillDocumentField: McpToolDefinition = {
       'blanks). Never pass row/table together with lineNumber. For a .pdf: targets an AcroForm field (fieldName) ' +
       'if the PDF has one matching, otherwise a text-layer line (a first call with no lineNumber returns the ' +
       'detected lines to choose from) or, for a scanned PDF, a pixel position on a rendered page (a first call ' +
-      'with no pixelX/pixelY renders page 1 and returns its pixel dimensions).',
+      'with no pixelX/pixelY renders page 1 and returns its pixel dimensions). For a legacy .doc: converts it to ' +
+      '.docx once (via LibreOffice), then applies the same .docx targeting rules above — the returned file is ' +
+      'always .docx, never a reconstructed .doc.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -1755,8 +1994,8 @@ export const saveDocument: McpToolDefinition = {
   tool: {
     name: 'save_document',
     description:
-      "Save a Word (.docx) or PDF file to this agent group's persistent memory: copies the raw file, " +
-      'extracts its text, and records an entry in memory/index.md so it can be recalled later without ' +
+      "Save a Word (.docx or legacy .doc) or PDF file to this agent group's persistent memory: copies the raw " +
+      'file, extracts its text, and records an entry in memory/index.md so it can be recalled later without ' +
       'resending it. Declines cleanly for any other file type.',
     inputSchema: {
       type: 'object' as const,

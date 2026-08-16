@@ -627,11 +627,14 @@ Implementation: write a `messages_out` row with `operation: 'reaction'`.
 
 #### save_document
 
-Persist a Word (`.docx`) or PDF attachment into the agent group's durable memory under
-`memory/documents/` (see `docs/memory.md`'s OKF convention) so a later, unrelated
-conversation can be answered from it without the file being resent. `.pdf` text-layer or
-`.docx` text is extracted synchronously in-container; a scanned/image-only PDF is a two-call
-flow (render page 1 to a PNG, agent reads it itself, calls back with `extractedText`).
+Persist a Word (`.docx` or legacy binary `.doc`) or PDF attachment into the agent group's
+durable memory under `memory/documents/` (see `docs/memory.md`'s OKF convention) so a later,
+unrelated conversation can be answered from it without the file being resent. `.pdf`
+text-layer, `.docx`, or `.doc` text is extracted synchronously in-container; a scanned/
+image-only PDF is a two-call flow (render page 1 to a PNG, agent reads it itself, calls back
+with `extractedText`). `.doc` extraction uses `word-extractor` (pure JS, OLE2/Compound File
+Binary reader) — no LibreOffice call in this read path; LibreOffice is only ever invoked from
+`fill_document_field`'s `.doc` conversion path, below.
 
 ```typescript
 {
@@ -674,7 +677,15 @@ Fill a value into a table row of a saved `.docx`, an AcroForm field of a saved `
 text-layer line / scanned-page pixel position on a saved `.pdf`, and produce a new file (the
 stored copy is never modified) — the agent calls `send_file` itself with the returned path to
 deliver it. Never targets a raw inbox path directly, only a document already saved via
-`save_document`.
+`save_document`. A saved legacy `.doc` is filled the same way as a `.docx` (same
+`row`/`table`/`column`/`lineNumber` arguments): the tool converts it to `.docx` once via
+headless LibreOffice (`soffice --headless --convert-to docx`, into a throwaway
+`os.tmpdir()`-based scratch dir with a unique per-call profile — see the `documents.ts`
+implementation note below), then hands the result to the same, unmodified `.docx` fill logic.
+Output is always `.docx` — never a reconstructed `.doc` — and a successful `.doc`-origin fill
+response says so explicitly. If `soffice` isn't installed, or the conversion itself fails
+(corrupted/unrecognized `.doc` content, or a conversion timeout), the tool declines clearly
+with no file written.
 
 ```typescript
 {
@@ -712,6 +723,14 @@ Implementation: `documents.ts` (`fillDocumentFieldImpl`).
   `@fontsource/noto-sans-hebrew` font (via `@pdf-lib/fontkit`) instead of the
   `StandardFonts.Helvetica` default, which throws on non-Latin1 characters; a mixed
   Hebrew/Latin value is split into per-script runs, each drawn with the matching font.
+- `.doc`: `convertDocToDocx` shells out to `soffice --headless --convert-to docx`
+  (`sofficeConvertArgs` builds the argv, shared with the test suite's own `.doc` fixture
+  builder so the two invocations can't drift apart) and hands the converted file to the exact
+  same `fillDocx` used for a native `.docx`. The success-only `.doc`-origin disclosure is
+  gated on the same `"New file at "` marker every fill path's success message already
+  contains, so a discovery/candidate-list response (no file written) never carries it.
+
+
 
 #### Agent-to-agent sends (no dedicated tool)
 

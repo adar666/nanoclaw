@@ -20,6 +20,7 @@ This document provides the complete epic and story breakdown for **Document Memo
 FR1: When a user sends a Word or PDF attachment and asks to save/remember it, the agent stores the file and its extracted text content in the agent group's memory, with a summary entry in `memory/index.md`. For a PDF with no text layer, extraction falls back to the agent reading the rendered page image directly.
 FR2: A user can ask about a previously saved document's content at any later point, and the agent answers from the stored memory/index entry and extracted text rather than requiring the file again. If the reference is ambiguous, the agent presents a numbered list of candidates and the user picks by number.
 FR3: A user can name a target inside a specific saved document — a Word table row (table number + row number), a Word fill-in-the-blank text line (line number, when no table matches — added post-launch after live use showed most real forms aren't tables), a PDF form field, or a PDF text line/position — plus a value, and the agent produces an updated copy of the document with that value applied, delivered back in chat. If the target document is ambiguous, the same numbered disambiguation as FR2 applies first.
+FR4: A user can save and fill a legacy `.doc` (binary Word 97-2003) file the same as a `.docx` — save/recall extracts its text directly; a fill request converts it to `.docx` first (LibreOffice headless, one-time) then reuses FR3's `.docx` targeting, always returning `.docx` (never a reconstructed `.doc`), disclosed to the user.
 
 ### NonFunctional Requirements
 
@@ -45,6 +46,7 @@ NFR7: When the target saved document is ambiguous, the agent presents a numbered
 - **AD-10** One shared slug-generation function (filename → lowercase kebab-case, strip extension, `-2`/`-3`… on collision) used by every tool in `documents.ts` — no per-tool reinvention.
 - **AD-11** Every write to a shared per-group memory index file (`memory/index.md`, `memory/documents/index.md`) goes through locked read-modify-write — concurrent sessions of the same group can save at the same time.
 - **AD-12** Docx fill-in-the-blank text lines (a paragraph with an underscore run or trailing colon/blank, no matching table) get their own targeting mode, distinct from AD-5's table-cell editing — same two-call discovery pattern as AD-4's PDF text-layer branch. Added post-launch: live production use showed real-world forms are built this way far more often than as Word tables.
+- **AD-13** `.doc` support: `word-extractor` (pure-JS, base-image dependency) extracts text for the read path (save/recall) — no LibreOffice needed there. `libreoffice-writer` (apt system dependency, headless) converts `.doc`→`.docx` once for the fill path, after which the existing docx fill pipeline (AD-5/AD-12) runs unchanged. Output is always `.docx`, never a reconstructed `.doc`. User-approved despite the container image size cost; `soffice`-dependent tests must detect its absence and skip gracefully since the host `bun test` sandbox has no LibreOffice installed.
 - New `container/skills/document-memory/SKILL.md` (agent-facing prose, same shape as `audio-report/SKILL.md`) teaches the agent when/how to call the three tools and how to run the numbered-pick-list disambiguation.
 - Deferred (spine-acknowledged, not built now): whether an edit refreshes the stored raw copy and/or stored extracted text (default: neither — a re-save is a separate, unspecified action); OCR fallback if agent-vision reading proves insufficient in practice; multi-file/batch fill operations; version history/undo for edited documents.
 
@@ -59,6 +61,7 @@ N/A — no UX design contract exists and none is needed. This feature has no UI 
 | FR1 | CAP-1 | AD-1, AD-2, AD-3, AD-4, AD-6, AD-9, AD-10, AD-11 |
 | FR2 | CAP-2 | AD-6, AD-7, AD-10 |
 | FR3 | CAP-3 | AD-1, AD-2, AD-3, AD-4, AD-5, AD-7, AD-8, AD-10, AD-12 |
+| FR4 | CAP-4 | AD-1, AD-3, AD-13 |
 | NFR1, NFR2, NFR3 | CAP-1, CAP-3 | AD-4, AD-5 |
 | NFR4 | CAP-1, CAP-2 | AD-6 |
 | NFR5 | CAP-3 | (existing `send_file`, unchanged) |
@@ -201,3 +204,31 @@ So that forms built the way real forms actually are can be filled without me doi
 **Given** no paragraph in the document matches (no table, no fill-in-the-blank marker found either)
 **When** `fill_document_field` runs
 **Then** it declines clearly (AD-8) — never guesses at inserting the value somewhere
+
+### Story 1.5: Support Legacy .doc Files (Save, Recall, and Fill via Conversion)
+
+As a NanoClaw user,
+I want to save and fill a `.doc` file the same way I already can with `.docx`,
+So that I don't have to convert old-format Word files myself before the agent can help with them.
+
+**Acceptance Criteria:**
+
+**Given** a `.doc` attachment and a request to save/remember it
+**When** `save_document` runs
+**Then** the raw `.doc` is stored under `memory/documents/files/<slug>.doc`, its text is extracted via `word-extractor` (no LibreOffice needed), and a concept file + index entry are written exactly like a `.docx` save (FR4, AD-13)
+
+**Given** a saved `.doc` document
+**When** the user asks a recall question about it
+**Then** the agent answers from its stored extracted text — no different from a `.docx` recall (FR2/FR4)
+
+**Given** a saved `.doc` document and a fill request (table row, or a fill-in-the-blank line)
+**When** `fill_document_field` runs
+**Then** the tool converts it to `.docx` via headless LibreOffice once, then runs the existing table-row (AD-5) or text-line (AD-12) fill logic against the converted file unchanged, and returns the result as a `.docx` — the response explicitly states the output is `.docx`, not the original `.doc` (FR4, AD-13)
+
+**Given** the LibreOffice conversion itself fails (corrupted `.doc`, unexpected content)
+**When** `fill_document_field` runs
+**Then** it declines clearly (AD-8) rather than producing a broken or partial file
+
+**Given** a test exercises the actual `soffice` conversion subprocess
+**When** `bun test` runs on a machine without LibreOffice installed (the standard host dev sandbox)
+**Then** that specific test detects `soffice`'s absence and skips rather than failing the suite

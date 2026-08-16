@@ -26,6 +26,10 @@ A pain to solve: right now a user who sends a Word or PDF file to their agent ge
   - **intent:** A user can name a target inside a specific saved document — a Word table row (by table number + row number), a Word plain-paragraph fill-in-the-blank line (by line number, when no table matches), a PDF form field, or a PDF text line/position — plus a value, and the agent produces an updated copy of the document with that value applied, delivered back in chat. If the target document is ambiguous, the agent presents a numbered list of candidates first (same disambiguation as CAP-2).
   - **success:** For a Word document with a matching table, the named table's named row's cell contains the new value and the rest of the document is otherwise unchanged. For a Word document with a fill-in-the-blank line (no matching table), the blank on that one paragraph is filled and every other paragraph is unchanged. For a PDF, a new PDF is returned with the value overlaid/stamped at the correct location and the original page content otherwise unchanged.
 
+- **CAP-4**
+  - **intent:** A user can save and fill a legacy `.doc` (binary Word 97-2003) file the same way as a `.docx` — save/recall extracts its text directly (no format conversion needed for reading); a fill request converts it to `.docx` first (LibreOffice headless, one-time, at fill time) and then reuses CAP-3's `.docx` targeting (table row or fill-in-the-blank line) against the converted copy.
+  - **success:** A `.doc` file saves and answers recall questions exactly like a `.docx` would. A fill request against a saved `.doc` returns a new `.docx` (not `.doc` — the legacy binary format isn't rewritten) containing the value in the right place, with the user told plainly that the returned file is `.docx`.
+
 ## Constraints
 
 - PDF value-filling must use an overlay/stamp technique — draw the new text on top of the existing page and save as a new PDF. Parsing and reflowing PDF text in place is ruled out entirely (user-mandated, see `row-targeting-matrix.md`).
@@ -36,13 +40,16 @@ A pain to solve: right now a user who sends a Word or PDF file to their agent ge
 - Editing must return the updated file through the existing `send_file` MCP tool / outbox delivery path. No new outbound delivery mechanism.
 - No docx/pdf read or write library exists in the container today. Shipping this feature requires adding a new dependency to the agent-runner (Bun) package tree and a container image rebuild — accepted as in-scope for this spec, not deferred to a later epic.
 - PDF fill values must render correctly for non-Latin-1 scripts (Hebrew, confirmed working) via an embedded Unicode-coverage font, not just the Latin-1-only PDF standard fonts — added during implementation review, not originally planned here; see `architecture-nanoclaw-v2-2026-08-16/ARCHITECTURE-SPINE.md`'s Stack table.
+- `.doc` reading (save/recall) uses a pure-JS extraction library — no system-level conversion dependency for CAP-1/CAP-2. `.doc` filling (CAP-4) is the one path in this whole feature that needs a real document-conversion engine (LibreOffice headless) rather than a parsing library, since no practical way exists to edit the legacy binary format directly — accepted as in-scope, user-approved knowing the container image size cost.
+- A `.doc` fill always returns `.docx`, never reconstructs `.doc` — the conversion is one-directional and disclosed to the user, not silent.
 
 ## Non-goals
 
 - Restructuring, reformatting, or redesigning document layout — only single-value fill-ins into an existing row/field/line, never new sections, styling changes, or content beyond the requested value.
 - Concurrent/collaborative multi-user editing of the same saved document, or version-conflict resolution across overlapping edit requests.
-- File types other than Word (`.docx`) and PDF (`.pdf`) — other formats (xlsx, pptx, images, plain text) are out of scope.
+- File types other than Word (`.docx`, and `.doc` via CAP-4) and PDF (`.pdf`) — other formats (xlsx, pptx, images, plain text) are out of scope.
 - Full reflow / re-typeset PDF text editing — explicitly excluded in favor of the overlay approach.
+- Reconstructing an edited document back into the legacy `.doc` binary format — a `.doc` fill always returns `.docx`.
 
 ## Success signal
 

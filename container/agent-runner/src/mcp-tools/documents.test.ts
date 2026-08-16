@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { execFileSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -12,6 +13,7 @@ import {
   listDocuments,
   fillDocumentFieldImpl,
   fillDocumentField,
+  sofficeConvertArgs,
 } from './documents.js';
 
 // ---------------------------------------------------------------------------
@@ -153,6 +155,54 @@ function buildMinimalPdf(text: string | null): Buffer {
   parts.push(xref, `trailer\n<< /Size ${total} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`);
 
   return Buffer.from(parts.join(''), 'latin1');
+}
+
+// ---------------------------------------------------------------------------
+// soffice (LibreOffice) availability — the .doc conversion path (fill_document_
+// field on a saved .doc) and any test that needs a *real* .doc fixture (there's
+// no hand-rollable minimal .doc the way buildDocx/buildMinimalPdf hand-roll a
+// minimal zip/PDF — .doc is a full OLE2/Compound File Binary structure) both
+// depend on the real `soffice` subprocess, which this `bun test` sandbox does
+// not have installed. Every test that shells out to it is gated on this check
+// and skips cleanly rather than failing the suite (spec requirement).
+// ---------------------------------------------------------------------------
+
+function isSofficeAvailable(): boolean {
+  try {
+    execFileSync('soffice', ['--version'], { stdio: 'ignore', timeout: 5000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const SOFFICE_AVAILABLE = isSofficeAvailable();
+
+/**
+ * Builds a real, on-disk .doc file by handing LibreOffice a plain-text
+ * source and converting it — the "throwaway .doc via LibreOffice itself"
+ * bootstrap the spec's Design Notes call out, avoided for anything more
+ * elaborate than a text file because getting LibreOffice to accept a
+ * hand-rolled/minimal .docx as *input* isn't reliable (it needs a real
+ * OPC package, not just a bare word/document.xml). A plain-text source
+ * converted through Writer's "MS Word 97" filter preserves each line as
+ * its own paragraph verbatim (including a literal run of underscores),
+ * which is exactly what the .doc text-line fill path needs to detect.
+ *
+ * Reuses `sofficeConvertArgs` (the exact argv-builder `convertDocToDocx`
+ * itself calls in production) rather than a second, hand-copied flag list —
+ * a future flag change to the production invocation can't silently leave
+ * this fixture builder behind.
+ */
+function buildDocViaSoffice(workDir: string, lines: string[]): Buffer {
+  const txtPath = path.join(workDir, 'source.txt');
+  fs.writeFileSync(txtPath, lines.join('\n'), 'utf-8');
+  const outDir = path.join(workDir, 'converted');
+  fs.mkdirSync(outDir, { recursive: true });
+  const profileDir = path.join(workDir, 'profile');
+  fs.mkdirSync(profileDir, { recursive: true });
+  execFileSync('soffice', sofficeConvertArgs(txtPath, 'doc', outDir, profileDir), { timeout: 30_000, stdio: 'pipe' });
+  return fs.readFileSync(path.join(outDir, 'source.doc'));
 }
 
 // ---------------------------------------------------------------------------
@@ -376,13 +426,29 @@ describe('save_document — unsupported file type', () => {
     expect(fs.existsSync(path.join(baseDir, 'memory'))).toBe(false);
   });
 
-  it('declines legacy .doc (binary, not in scope for this story)', async () => {
-    const filePath = writeInboxFile('legacy.doc', Buffer.from('not a real doc file', 'utf-8'));
+  it('declines an unrelated Office format (.xlsx) — .doc is now in scope, .xlsx still is not', async () => {
+    const filePath = writeInboxFile('numbers.xlsx', Buffer.from('not a real xlsx file', 'utf-8'));
 
     const result = await saveDocumentImpl({ path: filePath }, opts());
 
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain('Unsupported file type');
+  });
+});
+
+describe('save_document — .doc with unreadable content', () => {
+  it('still saves the raw file, with an extraction-failed note instead of throwing', async () => {
+    // Not a real OLE2/Compound File Binary structure — word-extractor should
+    // fail to parse it, and that failure must not be fatal to the save
+    // (mirrors the "docx with missing/broken word/document.xml" case above).
+    const filePath = writeInboxFile('legacy.doc', Buffer.from('not a real doc file at all', 'utf-8'));
+
+    const result = await saveDocumentImpl({ path: filePath }, opts());
+
+    expect(result.isError).toBeFalsy();
+    expect(fs.existsSync(path.join(baseDir, 'memory', 'documents', 'files', 'legacy.doc'))).toBe(true);
+    const concept = fs.readFileSync(path.join(baseDir, 'memory', 'documents', 'legacy.md'), 'utf-8');
+    expect(concept).toContain('Could not extract text automatically');
   });
 });
 
@@ -1726,5 +1792,186 @@ describe('fill_document_field — PDF AcroForm field matched but not a text fiel
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain('Agree');
     expect(result.content[0].text).toContain("isn't a fillable text field");
+  });
+});
+
+// --- 14. .doc — soffice unavailable ------------------------------------------
+//
+// This describe block runs only when `soffice` is NOT on PATH — the normal
+// state of this `bun test` sandbox (spec: "the host bun test sandbox has no
+// LibreOffice installed"). It's the deterministic counterpart to the
+// soffice-gated block below: it exercises the real absence-handling path
+// (execFileSync throwing ENOENT) rather than skipping outright.
+
+// Conversion scratch dirs live under a true ephemeral os.tmpdir() location
+// (never opts.baseDir — that's the agent group's *persistent* memory
+// volume, and a container death mid-conversion must not orphan a scratch
+// dir there), so that's what these tests check for leftovers, not baseDir.
+const DOC_CONVERSION_SCRATCH_ROOT = path.join(os.tmpdir(), 'nanoclaw-doc-conversion');
+
+function conversionScratchLeftoverCount(): number {
+  return fs.existsSync(DOC_CONVERSION_SCRATCH_ROOT) ? fs.readdirSync(DOC_CONVERSION_SCRATCH_ROOT).length : 0;
+}
+
+describe.skipIf(SOFFICE_AVAILABLE)('fill_document_field — .doc, soffice not installed', () => {
+  it('declines clearly instead of throwing, when LibreOffice is unavailable', async () => {
+    const filePath = writeInboxFile('legacy.doc', Buffer.from('not a real doc file at all', 'utf-8'));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const before = conversionScratchLeftoverCount();
+    const result = await fillDocumentFieldImpl({ document: 'legacy', lineNumber: 1, value: 'X' }, opts());
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('LibreOffice');
+    expect(result.content[0].text).toContain('not installed');
+    // No conversion scratch dir left behind (per-call subdir is cleaned up
+    // in a finally, even on failure), and no fill output file produced.
+    expect(conversionScratchLeftoverCount()).toBe(before);
+    expect(fs.existsSync(path.join(baseDir, '.document-fills'))).toBe(false);
+  });
+});
+
+// --- 15. .doc — save, recall, and fill via real LibreOffice conversion ------
+//
+// Gated on a real `soffice` binary being present (see isSofficeAvailable
+// above) — skips cleanly rather than failing when it's absent, per the spec's
+// explicit requirement. The .doc fixture itself is generated at test time by
+// converting a plain-text source through LibreOffice (see buildDocViaSoffice)
+// rather than hand-rolled, since .doc is a full OLE2/Compound File Binary
+// structure with no practical way to construct one inline.
+
+describe.skipIf(!SOFFICE_AVAILABLE)('save_document / fill_document_field — .doc via real LibreOffice', () => {
+  it('saves a .doc, extracting real text via word-extractor (no LibreOffice call in this path)', async () => {
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'doc-fixture-'));
+    const docBytes = buildDocViaSoffice(work, ['Hello from a legacy .doc file.', 'Second paragraph.']);
+    const filePath = writeInboxFile('legacy.doc', docBytes);
+
+    const result = await saveDocumentImpl({ path: filePath }, opts());
+
+    expect(result.isError).toBeFalsy();
+    const rawFile = path.join(baseDir, 'memory', 'documents', 'files', 'legacy.doc');
+    expect(fs.existsSync(rawFile)).toBe(true);
+    expect(fs.readFileSync(rawFile).equals(docBytes)).toBe(true);
+
+    const concept = fs.readFileSync(path.join(baseDir, 'memory', 'documents', 'legacy.md'), 'utf-8');
+    expect(concept).toContain('raw-file: "files/legacy.doc"');
+    expect(concept).toContain('Hello from a legacy .doc file.');
+    expect(concept).toContain('Second paragraph.');
+
+    fs.rmSync(work, { recursive: true, force: true });
+  });
+
+  it('fills a fill-in-the-blank line on a saved .doc: converts once, reuses fillDocx, returns .docx with a disclosure note', async () => {
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'doc-fixture-'));
+    try {
+      const docBytes = buildDocViaSoffice(work, ['Name: ___________']);
+      const filePath = writeInboxFile('intake.doc', docBytes);
+      await saveDocumentImpl({ path: filePath }, opts());
+
+      const before = conversionScratchLeftoverCount();
+      const result = await fillDocumentFieldImpl({ document: 'intake', lineNumber: 1, value: 'Ada Lovelace' }, opts());
+
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toContain('Ada Lovelace');
+      // Explicit format-change disclosure — never implies the original .doc was edited.
+      expect(result.content[0].text).toContain('legacy .doc file');
+      expect(result.content[0].text).toContain('.docx');
+      // The disclosure note is appended exactly once, not duplicated.
+      expect(result.content[0].text.split('legacy .doc file')).toHaveLength(2);
+
+      const fillsDir = path.join(baseDir, '.document-fills');
+      const produced = fs.readdirSync(fillsDir);
+      expect(produced.length).toBe(1);
+      expect(produced[0]).toMatch(/\.docx$/);
+
+      // Conversion scratch space is cleaned up — not left behind per call.
+      expect(conversionScratchLeftoverCount()).toBe(before);
+    } finally {
+      fs.rmSync(work, { recursive: true, force: true });
+    }
+  });
+
+  it('bare-discovery call on a saved .doc never carries the .doc-origin disclosure — no file was written', async () => {
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'doc-fixture-'));
+    try {
+      const docBytes = buildDocViaSoffice(work, ['Name: ___________']);
+      const filePath = writeInboxFile('intake.doc', docBytes);
+      await saveDocumentImpl({ path: filePath }, opts());
+
+      // No row/table/lineNumber given — discovery only, nothing filled.
+      const result = await fillDocumentFieldImpl({ document: 'intake' }, opts());
+
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toContain('Detected fill-in-the-blank line');
+      // The disclosure only belongs on a completed fill (FILL_SUCCESS_MARKER
+      // present) — a discovery response wrote no file, so claiming "this was
+      // converted to .docx" here would be factually wrong.
+      expect(result.content[0].text).not.toContain('legacy .doc file');
+      expect(fs.existsSync(path.join(baseDir, '.document-fills'))).toBe(false);
+    } finally {
+      fs.rmSync(work, { recursive: true, force: true });
+    }
+  });
+
+  it('reuses the real (unmodified) fillDocx table dispatch after conversion — no table present, so it declines with the same "no tables" error', async () => {
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'doc-fixture-'));
+    try {
+      const docBytes = buildDocViaSoffice(work, ['Just a plain paragraph, no table here.']);
+      const filePath = writeInboxFile('plain.doc', docBytes);
+      await saveDocumentImpl({ path: filePath }, opts());
+
+      const result = await fillDocumentFieldImpl({ document: 'plain', row: 1, value: 'X' }, opts());
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('no tables to fill');
+      // An error result must never carry the success-only disclosure note.
+      expect(result.content[0].text).not.toContain('legacy .doc file');
+    } finally {
+      fs.rmSync(work, { recursive: true, force: true });
+    }
+  });
+
+  it('conversion failure (unreadable .doc content) declines clearly, with no partial/broken output file', async () => {
+    // Saved successfully (extraction failure alone is never fatal to a save —
+    // see the "unreadable content" save test above), but LibreOffice itself
+    // cannot make sense of this as a document when fill tries to convert it.
+    const filePath = writeInboxFile('garbage.doc', Buffer.from('not a real doc file at all', 'utf-8'));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'garbage', lineNumber: 1, value: 'X' }, opts());
+
+    expect(result.isError).toBe(true);
+    // No output .docx produced from a failed conversion.
+    const fillsDir = path.join(baseDir, '.document-fills');
+    expect(fs.existsSync(fillsDir) ? fs.readdirSync(fillsDir).length : 0).toBe(0);
+  });
+
+  it('two concurrent .doc fills on the same document do not collide (unique scratch dir per call)', async () => {
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'doc-fixture-'));
+    try {
+      const docBytes = buildDocViaSoffice(work, ['Name: ___________']);
+      const filePath = writeInboxFile('concurrent.doc', docBytes);
+      await saveDocumentImpl({ path: filePath }, opts());
+
+      const [r1, r2] = await Promise.all([
+        fillDocumentFieldImpl({ document: 'concurrent', lineNumber: 1, value: 'Ada Lovelace' }, opts()),
+        fillDocumentFieldImpl({ document: 'concurrent', lineNumber: 1, value: 'Grace Hopper' }, opts()),
+      ]);
+
+      expect(r1.isError).toBeFalsy();
+      expect(r2.isError).toBeFalsy();
+      expect(r1.content[0].text).toContain('Ada Lovelace');
+      expect(r2.content[0].text).toContain('Grace Hopper');
+
+      // Two distinct, uncorrupted output files — no shared scratch dir/profile collision.
+      const fillsDir = path.join(baseDir, '.document-fills');
+      const produced = fs.readdirSync(fillsDir);
+      expect(produced.length).toBe(2);
+      for (const name of produced) {
+        expect(name).toMatch(/\.docx$/);
+      }
+    } finally {
+      fs.rmSync(work, { recursive: true, force: true });
+    }
   });
 });
