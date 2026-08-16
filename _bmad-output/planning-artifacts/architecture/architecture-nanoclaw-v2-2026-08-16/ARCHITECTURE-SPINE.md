@@ -8,7 +8,7 @@ scope: 'The NanoClaw v2 slice touched by SPEC-document-memory: inbound attachmen
 status: final
 created: '2026-08-16'
 updated: '2026-08-16'
-binds: [CAP-1, CAP-2, CAP-3]
+binds: [CAP-1, CAP-2, CAP-3, CAP-4]
 sources: []
 companions: ['../../specs/spec-document-memory/SPEC.md', '../../specs/spec-document-memory/row-targeting-matrix.md', '../../specs/spec-document-memory/brownfield.md']
 ---
@@ -106,6 +106,12 @@ flowchart LR
 - **Prevents:** treating "no table matches" as a hard failure when the document is a real, common shape (a plain paragraph ending in a run of underscores or a label+colon blank) that a human would obviously call "fill this line" — discovered live in production use (real household forms), where table-based docx forms turned out to be the minority case, not the default assumed at spec time.
 - **Rule:** When `fill_document_field` is called against a `.docx` and no table/row targeting applies, the tool scans paragraphs for a fill-in-the-blank marker (an underscore run of 3+ characters, or a trailing colon with nothing after it) and treats matches as numbered lines — same two-call discovery pattern as the PDF text-layer branch (AD-4): a first call with no `lineNumber` lists candidates, a second call with `lineNumber` + `value` fills one. The write replaces only the matched underscore run (or inserts right after the label if there's no underscore run) — never reflows the paragraph, never touches any other paragraph. This is a `.docx`-side mechanism, structurally independent of AD-5's table-cell editing; a document can offer either mode depending on what's actually in it, never both for the same target.
 
+### AD-13 — `.doc` (legacy binary Word) support: parsing library for reads, LibreOffice conversion for writes
+
+- **Binds:** CAP-1, CAP-4
+- **Prevents:** reaching for a document-conversion engine (heavy, subprocess-based, unavailable in the `bun test` host sandbox) for the read path when a pure-JS parsing library does the job; conversely, pretending the legacy binary format can be edited directly the way `.docx`'s zip/XML structure can — no such approach exists.
+- **Rule:** Reading (`save_document`/CAP-1, `list_documents`/CAP-2): the `word-extractor` npm package (pure JS, no native binary, no system dependency) extracts text directly from `.doc` — same base-image-dependency mechanism as AD-3, no LibreOffice involved. Writing (`fill_document_field`/CAP-4): the only practical path is `libreoffice-writer` (headless, apt-installed system dependency, `container/Dockerfile`'s existing pattern — not a `bun`/`npm` dependency) converting `.doc` → `.docx` once via `soffice --headless --convert-to docx`, after which the existing `.docx` fill pipeline (AD-5, AD-12) runs unchanged against the converted file. The output is always `.docx` — never a reconstructed `.doc` — and the tool's response says so explicitly, never implying the original binary format was edited in place. Because `soffice` is a system binary absent from the `bun test` host sandbox (tests run on the host directly, not inside the built container image), any test exercising the actual conversion subprocess must detect its absence and skip gracefully rather than fail the suite on machines without LibreOffice installed.
+
 ## Consistency Conventions
 
 | Concern | Convention |
@@ -123,6 +129,8 @@ flowchart LR
 | pdfjs-dist | ~6.2.108 | Extract PDF text with per-item positional data when a text layer exists. Actively maintained (Mozilla), verified current. |
 | @hyzyla/pdfium | 2.1.13 | Render a PDF page to an image (scanned-content read fallback, overlay position-estimate fallback, AD-4). `[ADOPTED]` Verified: ships a bundled WASM fallback, so its optional `sharp` dependency is not a native-binary blocker for this Bun/Docker base image. |
 | jszip | 3.10.1 | Unzip/rezip `.docx` for direct OOXML cell-text edits (AD-5). Stable since 2022, not deprecated — not "actively released" but still the ecosystem-standard choice; no better-adopted alternative found. |
+| word-extractor | TBD (verify at build time) | Pure-JS `.doc` text extraction for CAP-1/CAP-2 (AD-13) — no native binary, no system dependency, same base-image-dependency mechanism as the rest of this table. |
+| libreoffice-writer | Debian repo version (apt, not a bun dependency) | Headless `.doc`→`.docx` conversion for CAP-4's fill path (AD-13) — the one system-level (not `bun`/`npm`) addition in this feature, installed via `container/Dockerfile`'s existing `apt-get install` pattern. User-approved despite the container image size cost (~500MB-1GB); no lighter alternative exists for editing a legacy binary format. |
 | @pdf-lib/fontkit | 1.1.1 | Registers a custom-font embedder for `pdf-lib` — required for any non-Standard-14 (non-Latin-1) glyph, added mid-Story-1.2 during code review after Helvetica-only drawing was found to crash on Hebrew `value` input. `[UNDOCUMENTED IN PLANNING]` landed via implementation-time review judgment, not a pre-planned decision — see `implementation-artifacts/epic-1-retro-2026-08-16.md` action item AI-4. |
 | @fontsource/noto-sans-hebrew | 5.3.0 | The Unicode/Hebrew-coverage font asset `@pdf-lib/fontkit` embeds, drawn alongside Helvetica per run via script detection (`documents.ts`'s `splitByScript`/`drawUnicodeText`) so mixed-script `value`s render correctly. Same undocumented-in-planning note as above. |
 
@@ -150,6 +158,7 @@ groups/<folder>/memory/
 | CAP-1 (save to memory) | `save_document` tool; `memory/documents/<slug>.md` + `files/` | AD-1, AD-3, AD-4, AD-6, AD-9, AD-10, AD-11 |
 | CAP-2 (recall content) | `list_documents` tool + agent reading `memory/index.md`/concept files | AD-6, AD-7, AD-10 |
 | CAP-3 (fill & return) | `fill_document_field` tool; pdf-lib/pdfjs-dist/pdfium/jszip | AD-1, AD-2, AD-3, AD-4, AD-5, AD-7, AD-8, AD-10, AD-12 |
+| CAP-4 (`.doc` support) | `save_document`/`fill_document_field`; word-extractor (read), libreoffice-writer (write) | AD-1, AD-3, AD-13 |
 
 ## Deferred
 

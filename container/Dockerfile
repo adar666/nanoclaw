@@ -26,6 +26,15 @@ ARG BUN_VERSION=1.3.12
 # ---- System dependencies -----------------------------------------------------
 # tini: correct PID 1 / signal forwarding so outbound.db writes finalize on
 # SIGTERM instead of being orphaned by the shell entrypoint.
+# libreoffice-writer: adds ~500MB-1GB to the image (the Writer-only slim
+# package, not the full `libreoffice` suite) — unlike INSTALL_CJK_FONTS above
+# this is NOT opt-in: it's core to the legacy .doc fill path (converts .doc
+# -> .docx once, then the existing docx fill pipeline runs unchanged), and
+# the size cost was user-approved on that basis. Pinned to the exact apt
+# version this image was built and verified against (`apt-cache policy
+# libreoffice-writer` on a matching debian:bookworm/node:22-slim context) —
+# same reproducibility discipline as the ARGs above, applied to an apt
+# package instead of a curl-installed binary.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends \
@@ -48,6 +57,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         ca-certificates \
         curl \
         git \
+        libreoffice-writer=4:7.4.7-1+deb12u14 \
         tini \
         unzip \
     && if [ "$INSTALL_CJK_FONTS" = "true" ]; then \

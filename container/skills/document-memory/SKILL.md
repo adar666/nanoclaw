@@ -1,20 +1,20 @@
 ---
 name: document-memory
-description: Save a Word (.docx) or PDF file the user sends into this agent group's persistent memory, so its content can be recalled in a later, unrelated conversation without resending the file. Also fill a value into a table row, form field, or line of a document already saved this way and send back a new file, or recall/answer questions about what a previously saved document says. Use when the user sends a Word/PDF attachment and asks to save/remember/keep it, asks to fill in / complete a blank on a document already saved, or asks what a saved document says/contains, or asks to summarize/recall a document already saved.
+description: Save a Word (.docx or legacy .doc) or PDF file the user sends into this agent group's persistent memory, so its content can be recalled in a later, unrelated conversation without resending the file. Also fill a value into a table row, form field, or line of a document already saved this way and send back a new file, or recall/answer questions about what a previously saved document says. Use when the user sends a Word/PDF attachment and asks to save/remember/keep it, asks to fill in / complete a blank on a document already saved, or asks what a saved document says/contains, or asks to summarize/recall a document already saved.
 ---
 
 # Saving a document to memory
 
 ## When to use this
 
-The user sends a `.docx` or `.pdf` file — shown to you as an inbox
-attachment tag like `[document: report.pdf — saved to
+The user sends a `.docx`, legacy `.doc`, or `.pdf` file — shown to you as an
+inbox attachment tag like `[document: report.pdf — saved to
 /workspace/inbox/<msgId>/report.pdf]` (the exact type word before the colon
 varies by channel) — and asks something like "remember this", "save this",
 "תשמרי את זה", or otherwise wants it kept for later. This is **not** for a
 short voice note or an audio file (see the `audio-report` skill for those),
-and it only handles Word/PDF — any other file type, say so plainly instead
-of trying to save it.
+and it only handles Word (.docx/.doc)/PDF — any other file type, say so
+plainly instead of trying to save it.
 
 ## Workflow
 
@@ -44,20 +44,21 @@ of trying to save it.
    partial memory entry is ever created for a type it doesn't handle. Relay
    that to the user rather than retrying or guessing a workaround.
 
-4. **Word documents (.docx) always save in one call** — no rendering step,
-   since Word documents have a real text layer to read directly. If text
-   extraction from a particular `.docx` happens to come back empty (rare —
-   an unusual/corrupted document), the file is still saved with a note that
-   automatic extraction didn't find text; say so plainly rather than
-   inventing a summary of content you don't actually have. **Only the main
-   body is read** — headers, footers, footnotes, and text boxes are not
-   captured, so don't claim those are covered if the user asks.
+4. **Word documents (`.docx` and legacy `.doc`) always save in one call** —
+   no rendering step, since Word documents have a real text layer to read
+   directly. If text extraction from a particular `.docx`/`.doc` happens to
+   come back empty (rare — an unusual/corrupted document), the file is
+   still saved with a note that automatic extraction didn't find text; say
+   so plainly rather than inventing a summary of content you don't actually
+   have. **Only the main body is read** — headers, footers, footnotes, and
+   text boxes are not captured, so don't claim those are covered if the
+   user asks.
 
 ## What NOT to do
 
-- Don't call this for `.doc` (the old binary Word format, not `.docx`),
-  `.xlsx`, images, or plain text — only `.docx`/`.pdf` are in scope. Decline
-  those plainly instead of calling the tool.
+- Don't call this for `.xlsx`, images, or plain text — only
+  `.docx`/`.doc`/`.pdf` are in scope. Decline those plainly instead of
+  calling the tool.
 - Don't try to OCR a scanned PDF yourself some other way, and don't ask the
   user to resend it as an image — the render-and-read flow above already
   handles it.
@@ -96,7 +97,16 @@ description (same matching either way).
   conversation. If nothing matches, that *is* an error — say so plainly
   rather than guessing.
 
-## Filling a `.docx`
+## Filling a `.docx` (or a saved legacy `.doc`)
+
+A saved `.doc` is filled exactly like a `.docx` — same `document`/`row`/
+`table`/`column`/`lineNumber`/`value` arguments, same targeting rules below.
+Under the hood the tool converts it to `.docx` once (via LibreOffice) before
+filling, and the response says so — **the file you get back and deliver
+with `send_file` is always `.docx`, never a reconstructed `.doc`**; mention
+that to the user rather than implying the original binary format was
+edited. If LibreOffice isn't available or the conversion fails, the tool
+declines clearly with no file written — don't retry with a workaround.
 
 Two targeting modes, auto-selected by the document's shape and which
 argument you give — you never pick a mode explicitly:

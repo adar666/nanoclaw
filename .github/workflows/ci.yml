@@ -34,6 +34,9 @@ jobs:
       - name: Host tests
         run: pnpm exec vitest run
 
+      - name: Install LibreOffice (for .doc conversion tests)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libreoffice-writer
+
       - name: Container tests
         working-directory: container/agent-runner
         run: bun test

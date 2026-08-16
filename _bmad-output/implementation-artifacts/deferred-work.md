@@ -27,3 +27,12 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-1-2-fill-a-named-target-in-a-saved-document-and-return-it.md`
   summary: Non-`w:`-prefixed OOXML namespace bindings are not recognized by the table parser (reports "no tables" rather than a specific unsupported-namespace message).
   evidence: Blind-hunter finding; rare in practice since Word's own default binds `w:`, not worth solving now.
+- source_spec: `_bmad-output/implementation-artifacts/spec-1-5-support-legacy-doc-files-save-recall-and-fill-via-conversion.md`
+  summary: No test simulates a crash/interruption mid-conversion (between claiming the scratch dir and the finally cleanup) -- only the happy path and synchronous-failure paths are covered.
+  evidence: Blind-hunter finding; the fix moving scratch dirs to os.tmpdir() (patch round) reduces the blast radius (host OS temp cleanup vs. leaking into a persistent memory volume), but doesn't add crash-simulation coverage.
+- source_spec: `_bmad-output/implementation-artifacts/spec-1-5-support-legacy-doc-files-save-recall-and-fill-via-conversion.md`
+  summary: execFileSync's timeout sends SIGTERM only to the immediate tracked child process; if headless LibreOffice forks into a separate soffice.bin worker in this base image, a timeout-triggered kill may not reliably terminate it, risking an orphaned LibreOffice process for the container's remaining lifetime.
+  evidence: Blind-hunter finding; needs direct verification against the installed libreoffice-writer package's actual process model (process-group kill via a negative PID or --pgid) before a real fix is justified, not assumed and patched blind.
+- source_spec: `_bmad-output/implementation-artifacts/spec-1-5-support-legacy-doc-files-save-recall-and-fill-via-conversion.md`
+  summary: The test fixture builder (buildDocViaSoffice) independently duplicates the production conversion invocation's flags rather than sharing them -- a future change to the production flags has no structural guarantee the test fixture generator stays in sync.
+  evidence: Blind-hunter finding; a shared-constant refactor is a minor drift-prevention nice-to-have, not urgent.
