@@ -11,6 +11,7 @@ import './agents.js';
 import './self-mod.js';
 import './recorder.js';
 import './transcribe-audio.js';
+import './documents.js';
 import { startMcpServer } from './server.js';
 
 function log(msg: string): void {

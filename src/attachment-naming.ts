@@ -31,6 +31,8 @@ const MIME_TO_EXT: Record<string, string> = {
   'video/webm': 'webm',
   'video/quicktime': 'mov',
   'application/pdf': 'pdf',
+  'application/msword': 'doc',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
   'text/plain': 'txt',
   'application/json': 'json',
   'application/zip': 'zip',
