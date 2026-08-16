@@ -100,6 +100,12 @@ flowchart LR
 - **Prevents:** two concurrent `save_document` calls (memory is per-agent-group, not per-session — two live sessions of the same group can run containers at once) racing on the same `memory/index.md` or `memory/documents/index.md`, corrupting or dropping an entry
 - **Rule:** Every write to a shared memory index file goes through read-modify-write guarded by a file lock (or an equivalent atomic-append discipline) inside the tool handler — never an unguarded read-then-overwrite.
 
+### AD-12 — Docx fill-in-the-blank text lines are a distinct targeting mode from table cells
+
+- **Binds:** CAP-3
+- **Prevents:** treating "no table matches" as a hard failure when the document is a real, common shape (a plain paragraph ending in a run of underscores or a label+colon blank) that a human would obviously call "fill this line" — discovered live in production use (real household forms), where table-based docx forms turned out to be the minority case, not the default assumed at spec time.
+- **Rule:** When `fill_document_field` is called against a `.docx` and no table/row targeting applies, the tool scans paragraphs for a fill-in-the-blank marker (an underscore run of 3+ characters, or a trailing colon with nothing after it) and treats matches as numbered lines — same two-call discovery pattern as the PDF text-layer branch (AD-4): a first call with no `lineNumber` lists candidates, a second call with `lineNumber` + `value` fills one. The write replaces only the matched underscore run (or inserts right after the label if there's no underscore run) — never reflows the paragraph, never touches any other paragraph. This is a `.docx`-side mechanism, structurally independent of AD-5's table-cell editing; a document can offer either mode depending on what's actually in it, never both for the same target.
+
 ## Consistency Conventions
 
 | Concern | Convention |
@@ -143,7 +149,7 @@ groups/<folder>/memory/
 | --- | --- | --- |
 | CAP-1 (save to memory) | `save_document` tool; `memory/documents/<slug>.md` + `files/` | AD-1, AD-3, AD-4, AD-6, AD-9, AD-10, AD-11 |
 | CAP-2 (recall content) | `list_documents` tool + agent reading `memory/index.md`/concept files | AD-6, AD-7, AD-10 |
-| CAP-3 (fill & return) | `fill_document_field` tool; pdf-lib/pdfjs-dist/pdfium/jszip | AD-1, AD-2, AD-3, AD-4, AD-5, AD-7, AD-8, AD-10 |
+| CAP-3 (fill & return) | `fill_document_field` tool; pdf-lib/pdfjs-dist/pdfium/jszip | AD-1, AD-2, AD-3, AD-4, AD-5, AD-7, AD-8, AD-10, AD-12 |
 
 ## Deferred
 
@@ -164,6 +170,11 @@ groups/<folder>/memory/
 - Full cleanup/GC of abandoned `.document-renders/` and `.document-fills/` files when the agent never follows up on a two-call flow — only the successful-completion path cleans up after itself.
 - Full merged-cell-aware (`w:gridSpan`) visual-column targeting for `.docx` fills — the shipped code only detects and declines a gridSpan row rather than silently miscounting.
 - Non-`w:`-prefixed OOXML namespace bindings are not recognized by the table parser (reports "no tables" rather than a specific unsupported-namespace message) — rare in practice since Word's own default binds `w:`.
+
+**From `spec-1-4-fill-a-docx-fill-in-the-blank-text-line-no-table.md` (code review, patch #12):**
+
+- Shared-run label loss on a `.docx` text-line fill: when a paragraph's label and its underscore blank share a single `<w:r>` run (no formatting break between them), filling it wholesale-replaces that run's text, losing the label — the same accepted wholesale-splice behavior as a table cell (Story 1.2). Now disclosed to the agent via SKILL.md's Text-line section (patch #9) and covered by a dedicated test, not silent; not fixed since it's the same accepted precedent, not a new gap.
+- A `value` containing a literal `\n` is not converted to a Word line break (`<w:br/>`) on either a table-cell or text-line `.docx` fill — pre-existing risk shared with Story 1.2's table-cell fill, more likely to matter for a text-line's free-text blank (which invites longer answers) than a single table cell; not fixed now.
 
 **Also accepted, self-documented only in-code (epic-1 retro action item AI-6):**
 

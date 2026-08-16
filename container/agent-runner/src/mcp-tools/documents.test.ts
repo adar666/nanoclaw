@@ -966,6 +966,329 @@ describe('fill_document_field — docx, unresolvable target', () => {
 });
 
 // ---------------------------------------------------------------------------
+// fill_document_field — .docx text-line fill (Story 1.4)
+// ---------------------------------------------------------------------------
+
+function bodyParagraphXml(text: string): string {
+  return `<w:p><w:r><w:t xml:space="preserve">${text.replace(/&/g, '&amp;')}</w:t></w:r></w:p>`;
+}
+
+/** A paragraph whose text is split across multiple runs, e.g. a label run followed by a separate blank run. */
+function bodyParagraphWithRunsXml(texts: string[]): string {
+  const runs = texts.map((t) => `<w:r><w:t xml:space="preserve">${t.replace(/&/g, '&amp;')}</w:t></w:r>`).join('');
+  return `<w:p>${runs}</w:p>`;
+}
+
+function buildDocxRawBody(bodyPartsXml: string[]): Buffer {
+  const xml =
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' +
+    '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">' +
+    `<w:body>${bodyPartsXml.join('')}</w:body></w:document>`;
+  return buildStoredZip([{ name: 'word/document.xml', data: Buffer.from(xml, 'utf-8') }]);
+}
+
+describe('fill_document_field — docx text-line, discovery (no tables)', () => {
+  it('returns a numbered list of detected fill-in-the-blank paragraphs, excluding plain prose', async () => {
+    const filePath = writeInboxFile(
+      'intake.docx',
+      buildDocx(['שם: ___________', 'Just a sentence with no blank.', 'תאריך:']),
+    );
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'intake' }, opts());
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('1. שם: ___________');
+    expect(result.content[0].text).toContain('2. תאריך:');
+    expect(result.content[0].text).not.toContain('Just a sentence');
+    expect(fs.existsSync(path.join(baseDir, '.document-fills'))).toBe(false);
+  });
+});
+
+describe('fill_document_field — docx text-line, underscore blank in its own run', () => {
+  it('replaces exactly the underscore run, leaving a separate label run and other paragraphs byte-identical', async () => {
+    const original = buildDocxRawBody([
+      bodyParagraphWithRunsXml(['שם: ', '___________']),
+      bodyParagraphXml('Second paragraph, untouched.'),
+    ]);
+    const filePath = writeInboxFile('intake.docx', original);
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'intake', lineNumber: 1, value: 'Ada Lovelace' }, opts());
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('Filled line 1');
+
+    const outPath = extractOutPath(result.content[0].text);
+    const originalXml = await readDocxXml(original);
+    const newXml = await readDocxXml(fs.readFileSync(outPath));
+
+    expect(newXml).not.toEqual(originalXml);
+    const { before, after } = diffMiddle(originalXml, newXml);
+    expect(before).toBe('___________');
+    expect(after).toBe('Ada Lovelace');
+
+    expect(docxXmlToText(newXml)).toContain('שם: Ada Lovelace');
+    expect(docxXmlToText(newXml)).toContain('Second paragraph, untouched.');
+  });
+});
+
+describe('fill_document_field — docx text-line, label and blank sharing a single run', () => {
+  it('replaces the whole run (accepted limitation, same wholesale-splice behavior as a table cell)', async () => {
+    const filePath = writeInboxFile('intake.docx', buildDocx(['שם: ___________']));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'intake', lineNumber: 1, value: 'Ada Lovelace' }, opts());
+    expect(result.isError).toBeFalsy();
+
+    const outPath = extractOutPath(result.content[0].text);
+    const newXml = await readDocxXml(fs.readFileSync(outPath));
+    expect(docxXmlToText(newXml)).toBe('Ada Lovelace');
+  });
+});
+
+describe('fill_document_field — docx text-line, underscore run fragmented across multiple <w:t> nodes', () => {
+  it('sets the value on the first overlapping run and blanks the rest, mirroring replaceCellText', async () => {
+    const original = buildDocxRawBody([bodyParagraphWithRunsXml(['label: ', '___', '________'])]);
+    const filePath = writeInboxFile('intake.docx', original);
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'intake', lineNumber: 1, value: 'X' }, opts());
+    expect(result.isError).toBeFalsy();
+
+    const outPath = extractOutPath(result.content[0].text);
+    const newXml = await readDocxXml(fs.readFileSync(outPath));
+    expect(docxXmlToText(newXml)).toBe('label: X');
+  });
+});
+
+describe('fill_document_field — docx text-line, trailing-colon blank (no underscores)', () => {
+  it('inserts a new run right after the paragraph\'s last existing run', async () => {
+    const original = buildDocxRawBody([bodyParagraphXml('תאריך:'), bodyParagraphXml('Untouched paragraph.')]);
+    const filePath = writeInboxFile('intake.docx', original);
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'intake', lineNumber: 1, value: '16/08/2026' }, opts());
+    expect(result.isError).toBeFalsy();
+
+    const outPath = extractOutPath(result.content[0].text);
+    const originalXml = await readDocxXml(original);
+    const newXml = await readDocxXml(fs.readFileSync(outPath));
+
+    expect(newXml).not.toEqual(originalXml);
+    // The original run ("תאריך:") is untouched; a brand-new <w:t> run was inserted right after it.
+    expect(newXml).toContain('<w:t xml:space="preserve">תאריך:</w:t>');
+    expect(docxXmlToText(newXml)).toContain('תאריך: 16/08/2026');
+    expect(docxXmlToText(newXml)).toContain('Untouched paragraph.');
+  });
+});
+
+describe('fill_document_field — docx, table + non-table paragraph, row given', () => {
+  it('table-row targeting wins; the non-table blank-line paragraph is untouched', async () => {
+    const original = buildDocxRawBody([tableXml([['a1', 'b1']]), bodyParagraphXml('שם: ___________')]);
+    const filePath = writeInboxFile('mixed.docx', original);
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'mixed', row: 1, value: 'X' }, opts());
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('table 1');
+
+    const outPath = extractOutPath(result.content[0].text);
+    const newXml = await readDocxXml(fs.readFileSync(outPath));
+    expect(docxXmlToText(newXml)).toContain('a1');
+    expect(docxXmlToText(newXml)).toContain('X');
+    expect(docxXmlToText(newXml)).toContain('שם: ___________');
+  });
+});
+
+describe('fill_document_field — docx, table + non-table paragraph, lineNumber given', () => {
+  it('text-line targeting wins against the paragraph; the table is untouched', async () => {
+    const original = buildDocxRawBody([tableXml([['a1', 'b1']]), bodyParagraphXml('שם: ___________')]);
+    const filePath = writeInboxFile('mixed.docx', original);
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'mixed', lineNumber: 1, value: 'Ada Lovelace' }, opts());
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('Filled line 1');
+
+    const outPath = extractOutPath(result.content[0].text);
+    const newXml = await readDocxXml(fs.readFileSync(outPath));
+    expect(docxXmlToText(newXml)).toContain('a1');
+    expect(docxXmlToText(newXml)).toContain('b1');
+    expect(docxXmlToText(newXml)).not.toContain('___________');
+    expect(docxXmlToText(newXml)).toContain('Ada Lovelace');
+  });
+});
+
+describe('fill_document_field — docx, table + non-table paragraph, bare discovery', () => {
+  it('names both possibilities: the table-row prompt AND the numbered blank-line list', async () => {
+    const original = buildDocxRawBody([tableXml([['a1', 'b1']]), bodyParagraphXml('שם: ___________')]);
+    const filePath = writeInboxFile('mixed.docx', original);
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'mixed' }, opts());
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('row is required');
+    expect(result.content[0].text).toContain('lineNumber');
+    expect(result.content[0].text).toContain('1. שם: ___________');
+    expect(fs.existsSync(path.join(baseDir, '.document-fills'))).toBe(false);
+  });
+});
+
+describe('fill_document_field — docx, table only, bare discovery', () => {
+  it('still returns the table-row prompt (no blank-line list, unchanged from Story 1.2)', async () => {
+    const filePath = writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]]));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'report' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('row is required');
+    expect(result.content[0].text).not.toContain('Detected fill-in-the-blank');
+  });
+});
+
+describe('fill_document_field — docx text-line, lineNumber given with no value', () => {
+  it('returns the specific "value is required together with lineNumber" error', async () => {
+    const filePath = writeInboxFile('intake.docx', buildDocx(['שם: ___________']));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'intake', lineNumber: 1 }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('value is required together with lineNumber');
+  });
+});
+
+describe('fill_document_field — docx, row and lineNumber given together', () => {
+  it('errors instead of silently picking the table path', async () => {
+    const filePath = writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]]));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, lineNumber: 1, value: 'X' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('row');
+    expect(result.content[0].text).toContain('lineNumber');
+    expect(result.content[0].text).toContain('not both');
+    expect(fs.existsSync(path.join(baseDir, '.document-fills'))).toBe(false);
+  });
+});
+
+describe('fill_document_field — docx, column given without row/table', () => {
+  it('errors instead of silently ignoring column', async () => {
+    const filePath = writeInboxFile('intake.docx', buildDocx(['שם: ___________']));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl(
+      { document: 'intake', column: 2, lineNumber: 1, value: 'X' },
+      opts(),
+    );
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('column');
+    expect(result.content[0].text).toContain('row');
+    expect(fs.existsSync(path.join(baseDir, '.document-fills'))).toBe(false);
+  });
+});
+
+describe('fill_document_field — docx text-line, two blanks in one paragraph', () => {
+  it('produces two separate numbered candidates, both independently fillable', async () => {
+    // Each blank in its own <w:t> run (the realistic Word shape) so filling one never
+    // wholesale-replaces the other -- that's the separate, already-documented single-run
+    // limitation (see "label and blank sharing a single run" above), not this case.
+    const original = buildDocxRawBody([bodyParagraphWithRunsXml(['Name: ', '___', ' Date: ', '___'])]);
+    const filePath = writeInboxFile('intake.docx', original);
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const discovery = await fillDocumentFieldImpl({ document: 'intake' }, opts());
+    expect(discovery.isError).toBeFalsy();
+    expect(discovery.content[0].text).toContain('1. Name: ___ Date: ___');
+    expect(discovery.content[0].text).toContain('2. Name: ___ Date: ___');
+
+    const firstFill = await fillDocumentFieldImpl({ document: 'intake', lineNumber: 1, value: 'Ada' }, opts());
+    expect(firstFill.isError).toBeFalsy();
+    const firstOutPath = extractOutPath(firstFill.content[0].text);
+    const firstXml = await readDocxXml(fs.readFileSync(firstOutPath));
+    expect(docxXmlToText(firstXml)).toContain('Ada');
+    expect(docxXmlToText(firstXml)).toContain('Date: ___');
+
+    const secondFill = await fillDocumentFieldImpl({ document: 'intake', lineNumber: 2, value: '16/08/2026' }, opts());
+    expect(secondFill.isError).toBeFalsy();
+    const secondOutPath = extractOutPath(secondFill.content[0].text);
+    const secondXml = await readDocxXml(fs.readFileSync(secondOutPath));
+    expect(docxXmlToText(secondXml)).toContain('Name: ___');
+    expect(docxXmlToText(secondXml)).toContain('16/08/2026');
+  });
+});
+
+describe('fill_document_field — docx text-line, purely decorative underscore divider', () => {
+  it('is never offered as a fill target (no label text once underscores are stripped)', async () => {
+    const filePath = writeInboxFile(
+      'intake.docx',
+      buildDocx(['_____________________________', 'שם: ___________']),
+    );
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'intake' }, opts());
+    expect(result.isError).toBeFalsy();
+    // Only the real label+blank line is listed, numbered 1 -- the pure divider is skipped entirely.
+    expect(result.content[0].text).toContain('1. שם: ___________');
+    expect(result.content[0].text).not.toContain('_____________________________');
+  });
+});
+
+describe('fill_document_field — docx text-line, trailing-colon false-positive guard', () => {
+  it('does not treat a long prose sentence ending in ":" as a fill-in-the-blank line', async () => {
+    const filePath = writeInboxFile(
+      'prose.docx',
+      buildDocx(['Please review the following important items before signing:', 'תאריך:']),
+    );
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'prose' }, opts());
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('1. תאריך:');
+    expect(result.content[0].text).not.toContain('Please review');
+  });
+});
+
+describe('fill_document_field — docx text-line, tab between label and blank', () => {
+  it('renders the tab as a space in the discovery listing text', async () => {
+    // Label run, then a run containing only a <w:tab/>, then the blank run.
+    const paragraph =
+      '<w:p><w:r><w:t xml:space="preserve">שם:</w:t></w:r><w:r><w:tab/></w:r>' +
+      '<w:r><w:t xml:space="preserve">___________</w:t></w:r></w:p>';
+    const doc = buildDocxRawBody([paragraph]);
+    const filePath = writeInboxFile('intake.docx', doc);
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'intake' }, opts());
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('1. שם: ___________');
+  });
+});
+
+describe('fill_document_field — docx text-line, no marker found anywhere', () => {
+  it('declines clearly when there is no table and no fill-in-the-blank line, no file written', async () => {
+    const filePath = writeInboxFile('prose.docx', buildDocx(['Just a plain sentence.', 'Another one, no blanks.']));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'prose' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('no tables');
+    expect(result.content[0].text).toContain('fill-in-the-blank');
+    expect(fs.existsSync(path.join(baseDir, '.document-fills'))).toBe(false);
+  });
+});
+
+describe('fill_document_field — docx text-line, lineNumber out of range', () => {
+  it('declines clearly and states how many lines were found, no file written', async () => {
+    const filePath = writeInboxFile('intake.docx', buildDocx(['שם: ___________', 'תאריך:']));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'intake', lineNumber: 5, value: 'X' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('2 detected');
+    expect(fs.existsSync(path.join(baseDir, '.document-fills'))).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // fill_document_field — .pdf AcroForm path
 // ---------------------------------------------------------------------------
 
@@ -1228,10 +1551,23 @@ describe('fill_document_field — wrong-file-type arguments', () => {
     const filePath = writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]]));
     await saveDocumentImpl({ path: filePath }, opts());
 
-    const result = await fillDocumentFieldImpl({ document: 'report', lineNumber: 1, value: 'X' }, opts());
+    const result = await fillDocumentFieldImpl({ document: 'report', fieldName: 'X', value: 'X' }, opts());
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain('.docx');
-    expect(result.content[0].text).toContain('lineNumber');
+    expect(result.content[0].text).toContain('fieldName');
+  });
+
+  // Story 1.4: lineNumber moved from PDF-exclusive to a shared arg — a .docx
+  // no longer rejects it outright (it addresses the text-line fill path
+  // below instead).
+  it('no longer rejects lineNumber against a .docx (now a shared arg); a table cell paragraph is never a candidate', async () => {
+    const filePath = writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]]));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'report', lineNumber: 1, value: 'X' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).not.toContain("don't apply to a .docx");
+    expect(result.content[0].text).toContain('0 detected fill-in-the-blank line');
   });
 });
 
