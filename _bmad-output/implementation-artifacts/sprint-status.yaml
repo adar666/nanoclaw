@@ -35,8 +35,8 @@ project_key: NOKEY
 tracking_system: file-system
 story_location: _bmad-output/implementation-artifacts
 development_status:
-  epic-1: in-progress
-  1-1-save-a-word-pdf-document-to-memory: review
-  1-2-fill-a-named-target-in-a-saved-document-and-return-it: review
-  1-3-recall-a-saved-document-s-content: review
+  epic-1: done
+  1-1-save-a-word-pdf-document-to-memory: done
+  1-2-fill-a-named-target-in-a-saved-document-and-return-it: done
+  1-3-recall-a-saved-document-s-content: done
   epic-1-retrospective: optional
