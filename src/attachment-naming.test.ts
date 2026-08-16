@@ -17,6 +17,11 @@ describe('extForMime', () => {
     expect(extForMime('audio/ogg')).toBe('ogg');
   });
 
+  it('maps Word MIME types to canonical extensions', () => {
+    expect(extForMime('application/msword')).toBe('doc');
+    expect(extForMime('application/vnd.openxmlformats-officedocument.wordprocessingml.document')).toBe('docx');
+  });
+
   it('strips parameters and is case-insensitive', () => {
     expect(extForMime('image/JPEG; foo=bar')).toBe('jpg');
     expect(extForMime('  Application/PDF  ')).toBe('pdf');
@@ -45,6 +50,13 @@ describe('deriveAttachmentName', () => {
   it('derives extension from mimeType when no name', () => {
     expect(deriveAttachmentName({ mimeType: 'application/pdf' })).toMatch(/^attachment-\d+\.pdf$/);
     expect(deriveAttachmentName({ mimeType: 'image/jpeg' })).toMatch(/^attachment-\d+\.jpg$/);
+  });
+
+  it('derives .docx/.doc extension from Word mimeType when no name', () => {
+    expect(
+      deriveAttachmentName({ mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' }),
+    ).toMatch(/^attachment-\d+\.docx$/);
+    expect(deriveAttachmentName({ mimeType: 'application/msword' })).toMatch(/^attachment-\d+\.doc$/);
   });
 
   it('falls back to att.type when mimeType is missing (Telegram photos/stickers)', () => {
