@@ -535,6 +535,9 @@ export async function saveDocumentImpl(
           `description: ${yamlEscape(description)}`,
           `source-filename: ${yamlEscape(originalFilename)}`,
           `saved-date: ${savedDate}`,
+          // Relative path back to the canonical raw copy, per AD-6 — recorded explicitly
+          // rather than left only derivable from <slug>.<ext> by convention.
+          `raw-file: ${yamlEscape(`files/${slug}.${ext}`)}`,
           '---',
           '',
           `# ${escapeMarkdown(stripControlChars(originalFilename))}`,
@@ -723,11 +726,14 @@ export async function listDocumentsImpl(
 
     const matches = matchDocuments(documentsDir, filesDir, query);
     if (query && query.trim() !== '' && matches.length === 0) {
+      log(`list_documents: no match for query "${query}"`);
       return err(`No saved document matches "${query}".`);
     }
     if (matches.length === 0) {
+      log('list_documents: no saved documents yet');
       return ok('No saved documents yet.');
     }
+    log(`list_documents: ${matches.length} match(es) for query ${query ? `"${query}"` : '(none)'}`);
     return ok(formatDocumentCandidates(matches));
   } catch (e) {
     return err(`list_documents failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -846,8 +852,11 @@ function collectDescendants(node: XmlNode, tag: OoxmlTag): XmlNode[] {
   return found;
 }
 
+// stripControlChars first: `value` is untrusted (model-controlled), same as the filenames
+// stripControlChars already guards elsewhere — a raw control byte other than tab/CR/LF is not
+// legal XML 1.0 character data and would otherwise corrupt the produced word/document.xml.
 function xmlEscapeText(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return stripControlChars(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 /** Ensures a <w:t...> opening tag carries xml:space="preserve" — replacing any other value it already has. */
@@ -1372,9 +1381,11 @@ export async function fillDocumentFieldImpl(
     const resolution = resolveDocument(documentsDir, filesDir, documentQuery);
 
     if (resolution.kind === 'not-found') {
+      log(`fill_document_field: no match for document "${documentQuery}"`);
       return err(`No saved document matches "${documentQuery}".`);
     }
     if (resolution.kind === 'candidates') {
+      log(`fill_document_field: ${resolution.metas.length} candidates for document "${documentQuery}"`);
       return ok(
         `Multiple saved documents match "${documentQuery}":\n${formatDocumentCandidates(resolution.metas)}\n\n` +
           'Call fill_document_field again with the exact slug (first column) to pick one.',
@@ -1404,7 +1415,10 @@ export async function fillDocumentFieldImpl(
     const rawPath = path.join(filesDir, `${meta.slug}.${meta.ext}`);
     if (!fs.existsSync(rawPath)) return err(`Saved raw file for "${meta.slug}" is missing.`);
 
-    return meta.ext === 'docx' ? await fillDocx(rawPath, meta, args, opts) : await fillPdf(rawPath, meta, args, opts);
+    const result =
+      meta.ext === 'docx' ? await fillDocx(rawPath, meta, args, opts) : await fillPdf(rawPath, meta, args, opts);
+    log(`fill_document_field: ${meta.slug} (${meta.ext}) -> ${'isError' in result && result.isError ? 'error' : 'ok'}`);
+    return result;
   } catch (e) {
     return err(`fill_document_field failed: ${e instanceof Error ? e.message : String(e)}`);
   }

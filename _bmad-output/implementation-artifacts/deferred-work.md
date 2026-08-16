@@ -1,3 +1,5 @@
+> **Superseded (epic-1 retro action item AI-5):** these items were merged into `_bmad-output/planning-artifacts/architecture/architecture-nanoclaw-v2-2026-08-16/ARCHITECTURE-SPINE.md`'s own Deferred section, which is the single source of truth going forward. Kept here only for the append-only history this file's format assumes.
+
 - source_spec: `_bmad-output/implementation-artifacts/spec-1-1-save-a-word-pdf-document-to-memory.md`
   summary: No size limits / decompression-bomb protection on docx unzip or PDF read (whole-file reads, only a 64MB unzip output cap).
   evidence: Blind-hunter review finding; robustness hardening, not blocking for a trusted single-operator use case.

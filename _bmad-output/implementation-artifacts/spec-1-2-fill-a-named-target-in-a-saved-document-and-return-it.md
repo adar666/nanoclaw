@@ -82,6 +82,8 @@ baseline_commit: 'e417131b94acb5241ad16f94e470ad6ef2ac10a2'
 
 ## Spec Change Log
 
+- 2026-08-16 (retro backfill, epic-1-retro-2026-08-16.md action item AI-7): the AcroForm write branch is implemented as **argument-gated** (only attempted when the caller supplies `fieldName`), not fully content-auto-detected from the file the way row-targeting-matrix.md's priority order literally describes. Softened during the code-review patch round by having the first no-target-params call also surface any discovered AcroForm field names alongside the line list (`documents.ts:1150-1156`, comment at `1323-1328`), so the agent still discovers and uses the field-name path without a separate "does this PDF have a form" probe. This was a deliberate, review-driven simplification at implementation time that was never recorded here — backfilled now for the record; no code change accompanies this entry.
+
 ## Design Notes
 
 Docx column default (assumption, not in SPEC/spine): the row's *last* cell, matching the common "label | value" two-column form-row shape; `column` argument is the escape hatch for anything else. Flag to the user in the completion summary as a judgment call, not silently invented.

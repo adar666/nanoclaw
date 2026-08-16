@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 08-16-2026 12:00
-last_updated: 08-16-2026 16:55
+last_updated: 08-16-2026 20:05
 project: nanoclaw-v2
 project_key: NOKEY
 tracking_system: file-system
@@ -46,54 +46,54 @@ action_items:
     action: "Add log() calls to list_documents/fill_document_field on success/failure,
       matching save_document existing pattern"
     owner: "dev"
-    status: open
+    status: done
     ref: "_bmad-output/implementation-artifacts/epic-1-retro-2026-08-16.md"
   - id: "epic-1-retro-item-2-add-a-raw-file-frontmatter-field-to-the"
     epic: 1
     action: "Add a raw-file frontmatter field to the concept file recording the relative
       path back to files/<slug>.<ext>, per AD-6"
     owner: "dev"
-    status: open
+    status: done
     ref: "_bmad-output/implementation-artifacts/epic-1-retro-2026-08-16.md"
   - id: "epic-1-retro-item-3-spec-reconciliation-reword-spec-md-cap-1"
     epic: 1
     action: "Spec reconciliation: reword SPEC.md CAP-1 summary entry wording to match
       reality, or scope a future story to build a real summary"
     owner: "spec-owner"
-    status: open
+    status: done
     ref: "_bmad-output/implementation-artifacts/epic-1-retro-2026-08-16.md"
   - id: "epic-1-retro-item-4-spec-reconciliation-record-hebrew-unicod"
     epic: 1
     action: "Spec reconciliation: record Hebrew/Unicode PDF font support in ARCHITECTURE-SPINE.md
       Stack table and SPEC.md"
     owner: "spec-owner"
-    status: open
+    status: done
     ref: "_bmad-output/implementation-artifacts/epic-1-retro-2026-08-16.md"
   - id: "epic-1-retro-item-5-merge-deferred-work-md-items-into-archit"
     epic: 1
     action: "Merge deferred-work.md items into ARCHITECTURE-SPINE.md Deferred section
       as single source of truth"
     owner: "spec-owner"
-    status: open
+    status: done
     ref: "_bmad-output/implementation-artifacts/epic-1-retro-2026-08-16.md"
   - id: "epic-1-retro-item-6-record-ad-7-as-an-accepted-implementatio"
     epic: 1
     action: "Record AD-7 as an accepted implementation simplification (tool pre-renders
       candidate text rather than the agent)"
     owner: "spec-owner"
-    status: open
+    status: done
     ref: "_bmad-output/implementation-artifacts/epic-1-retro-2026-08-16.md"
   - id: "epic-1-retro-item-7-backfill-spec-1-2-empty-spec-change-log"
     epic: 1
     action: "Backfill spec-1-2 empty Spec Change Log with the AcroForm-priority-is-argument-gated
       deviation"
     owner: "dev"
-    status: open
+    status: done
     ref: "_bmad-output/implementation-artifacts/epic-1-retro-2026-08-16.md"
   - id: "epic-1-retro-item-8-run-fill_document_field-value-argument-t"
     epic: 1
     action: "Run fill_document_field value argument through stripControlChars before
       splicing into generated OOXML text nodes"
     owner: "dev"
-    status: open
+    status: done
     ref: "_bmad-output/implementation-artifacts/epic-1-retro-2026-08-16.md"
