@@ -3,7 +3,16 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { slugify, docxXmlToText, saveDocumentImpl, saveDocument } from './documents.js';
+import {
+  slugify,
+  docxXmlToText,
+  saveDocumentImpl,
+  saveDocument,
+  listDocumentsImpl,
+  listDocuments,
+  fillDocumentFieldImpl,
+  fillDocumentField,
+} from './documents.js';
 
 // ---------------------------------------------------------------------------
 // Test fixtures — hand-rolled, dependency-free builders so these tests don't
@@ -584,5 +593,779 @@ describe('save_document — YAML/Markdown escaping of untrusted filenames', () =
     const linkLine = index.split('\n').find((l) => l.includes('saved document,'));
     expect(linkLine).toBeDefined();
     expect(linkLine).not.toMatch(/[^\\]\[v2[^\\]\]/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// fill_document_field / list_documents (Story 1.2) fixtures
+// ---------------------------------------------------------------------------
+
+function cellXml(text: string): string {
+  return `<w:tc><w:p><w:r><w:t xml:space="preserve">${text}</w:t></w:r></w:p></w:tc>`;
+}
+
+function emptyCellXml(): string {
+  return '<w:tc><w:p><w:pPr/></w:p></w:tc>';
+}
+
+function rowXml(cells: string[]): string {
+  return `<w:tr>${cells.map(cellXml).join('')}</w:tr>`;
+}
+
+function tableXml(rows: string[][]): string {
+  return `<w:tbl><w:tblPr/>${rows.map(rowXml).join('')}</w:tbl>`;
+}
+
+/** A row whose last cell's <w:tc> holds a nested <w:tbl> — the "decline, don't miscount" case. */
+function nestedTableRowXml(): string {
+  return `<w:tr>${cellXml('a')}<w:tc>${tableXml([['nested-a', 'nested-b']])}</w:tc></w:tr>`;
+}
+
+/** A row whose last cell has a paragraph but no <w:t> run at all — the "insert a run" case. */
+function rowWithEmptyLastCellXml(firstCellText: string): string {
+  return `<w:tr>${cellXml(firstCellText)}${emptyCellXml()}</w:tr>`;
+}
+
+function buildDocxWithTables(tables: string[][][]): Buffer {
+  const body = tables.map(tableXml).join('');
+  const xml =
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' +
+    '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">' +
+    `<w:body>${body}</w:body></w:document>`;
+  return buildStoredZip([{ name: 'word/document.xml', data: Buffer.from(xml, 'utf-8') }]);
+}
+
+function buildDocxWithRawTable(tableInnerXml: string): Buffer {
+  const xml =
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' +
+    '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">' +
+    `<w:body><w:tbl><w:tblPr/>${tableInnerXml}</w:tbl></w:body></w:document>`;
+  return buildStoredZip([{ name: 'word/document.xml', data: Buffer.from(xml, 'utf-8') }]);
+}
+
+async function readDocxXml(buf: Buffer): Promise<string> {
+  const JSZip = (await import('jszip')).default;
+  const zip = await JSZip.loadAsync(buf);
+  const file = zip.file('word/document.xml');
+  if (!file) throw new Error('word/document.xml missing from produced docx');
+  return file.async('string');
+}
+
+/** Returns the single contiguous region where `original` and `modified` differ. */
+function diffMiddle(original: string, modified: string): { before: string; after: string } {
+  let prefix = 0;
+  while (prefix < original.length && prefix < modified.length && original[prefix] === modified[prefix]) prefix++;
+  let suffix = 0;
+  while (
+    suffix < original.length - prefix &&
+    suffix < modified.length - prefix &&
+    original[original.length - 1 - suffix] === modified[modified.length - 1 - suffix]
+  ) {
+    suffix++;
+  }
+  return {
+    before: original.slice(prefix, original.length - suffix),
+    after: modified.slice(prefix, modified.length - suffix),
+  };
+}
+
+function extractOutPath(text: string): string {
+  const m = /New file at (.+?) — call send_file/.exec(text);
+  if (!m) throw new Error(`No output path found in response: ${text}`);
+  return m[1];
+}
+
+async function extractAllPdfText(filePath: string): Promise<string> {
+  const { getDocument } = await import('pdfjs-dist/legacy/build/pdf.mjs');
+  const data = new Uint8Array(fs.readFileSync(filePath));
+  const loadingTask = getDocument({ data, verbosity: 0 });
+  try {
+    const doc = await loadingTask.promise;
+    const texts: string[] = [];
+    for (let i = 1; i <= doc.numPages; i++) {
+      const page = await doc.getPage(i);
+      const content = await page.getTextContent();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      texts.push(content.items.map((it: any) => ('str' in it ? it.str : '')).join(' '));
+      page.cleanup();
+    }
+    return texts.join('\n');
+  } finally {
+    await loadingTask.destroy();
+  }
+}
+
+async function buildAcroFormPdf(fieldName: string): Promise<Buffer> {
+  const { PDFDocument } = await import('pdf-lib');
+  const pdfDoc = await PDFDocument.create();
+  const page = pdfDoc.addPage([200, 200]);
+  const form = pdfDoc.getForm();
+  const textField = form.createTextField(fieldName);
+  textField.addToPage(page, { x: 20, y: 100, width: 150, height: 20 });
+  return Buffer.from(await pdfDoc.save());
+}
+
+/** Same object-table boilerplate as buildMinimalPdf, but with N text lines at distinct y positions. */
+function buildMultilineTextPdf(lines: string[]): Buffer {
+  const catalog = '<< /Type /Catalog /Pages 2 0 R >>';
+  const pages = '<< /Type /Pages /Kids [3 0 R] /Count 1 >>';
+  const page =
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] ' +
+    '/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>';
+  const streamContent = lines.map((text, i) => `BT /F1 14 Tf 20 ${160 - i * 20} Td (${escapePdfString(text)}) Tj ET`).join('\n');
+  const font = '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>';
+
+  const parts: string[] = ['%PDF-1.4\n'];
+  const offsets: number[] = [0];
+  let cursor = parts[0].length;
+
+  function pushObj(num: number, body: string): void {
+    offsets[num] = cursor;
+    const s = `${num} 0 obj\n${body}\nendobj\n`;
+    parts.push(s);
+    cursor += s.length;
+  }
+
+  pushObj(1, catalog);
+  pushObj(2, pages);
+  pushObj(3, page);
+  pushObj(4, `<< /Length ${streamContent.length} >>\nstream\n${streamContent}\nendstream`);
+  pushObj(5, font);
+
+  const xrefOffset = cursor;
+  const total = 6;
+  let xref = `xref\n0 ${total}\n0000000000 65535 f \n`;
+  for (let i = 1; i < total; i++) {
+    xref += `${String(offsets[i]).padStart(10, '0')} 00000 n \n`;
+  }
+  parts.push(xref, `trailer\n<< /Size ${total} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`);
+
+  return Buffer.from(parts.join(''), 'latin1');
+}
+
+// ---------------------------------------------------------------------------
+// list_documents
+// ---------------------------------------------------------------------------
+
+describe('list_documents tool metadata', () => {
+  it('has no required arguments', () => {
+    expect(listDocuments.tool.name).toBe('list_documents');
+    expect(listDocuments.tool.inputSchema.required ?? []).toEqual([]);
+  });
+});
+
+describe('list_documents', () => {
+  it('reports no saved documents when memory is empty', async () => {
+    const result = await listDocumentsImpl({}, opts());
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('No saved documents');
+  });
+
+  it('returns everything when no query is given', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('alpha.docx', buildDocx(['A'])) }, opts());
+    await saveDocumentImpl({ path: writeInboxFile('beta.docx', buildDocx(['B'])) }, opts());
+
+    const result = await listDocumentsImpl({}, opts());
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('alpha');
+    expect(result.content[0].text).toContain('beta');
+  });
+
+  it('errors clearly when a query matches nothing', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('alpha.docx', buildDocx(['A'])) }, opts());
+
+    const result = await listDocumentsImpl({ query: 'no-such-document' }, opts());
+    expect(result.isError).toBe(true);
+  });
+
+  it('returns a numbered candidate list when a query matches more than one document', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('Report A.docx', buildDocx(['A'])) }, opts());
+    await saveDocumentImpl({ path: writeInboxFile('Report B.docx', buildDocx(['B'])) }, opts());
+
+    const result = await listDocumentsImpl({ query: 'report' }, opts());
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('1.');
+    expect(result.content[0].text).toContain('2.');
+    expect(result.content[0].text).toContain('report-a');
+    expect(result.content[0].text).toContain('report-b');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// fill_document_field — targeting/tool metadata + document resolution
+// ---------------------------------------------------------------------------
+
+describe('fill_document_field tool metadata', () => {
+  it('declares document as the only required argument', () => {
+    expect(fillDocumentField.tool.name).toBe('fill_document_field');
+    expect(fillDocumentField.tool.inputSchema).toMatchObject({ required: ['document'] });
+  });
+});
+
+describe('fill_document_field — document resolution', () => {
+  it('errors clearly when no saved document matches', async () => {
+    const result = await fillDocumentFieldImpl({ document: 'nonexistent', row: 1, value: 'X' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('nonexistent');
+  });
+
+  it('returns a numbered candidate list (not an error) when the reference is ambiguous', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('Report A.docx', buildDocx(['A'])) }, opts());
+    await saveDocumentImpl({ path: writeInboxFile('Report B.docx', buildDocx(['B'])) }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, value: 'X' }, opts());
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('report-a');
+    expect(result.content[0].text).toContain('report-b');
+    expect(fs.existsSync(path.join(baseDir, '.document-fills'))).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// fill_document_field — .docx table-row path
+// ---------------------------------------------------------------------------
+
+describe('fill_document_field — docx happy path', () => {
+  it('fills the row\'s last cell by default, leaving everything else byte-identical', async () => {
+    const original = buildDocxWithTables([
+      [
+        ['a1', 'b1'],
+        ['a2', 'b2'],
+      ],
+    ]);
+    const filePath = writeInboxFile('report.docx', original);
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'report', table: 1, row: 2, value: 'X' }, opts());
+    expect(result.isError).toBeFalsy();
+
+    const outPath = extractOutPath(result.content[0].text);
+    const originalXml = await readDocxXml(original);
+    const newBuf = fs.readFileSync(outPath);
+    const newXml = await readDocxXml(newBuf);
+
+    expect(newXml).not.toEqual(originalXml);
+    const { before, after } = diffMiddle(originalXml, newXml);
+    expect(before).toBe('b2');
+    expect(after).toBe('X');
+
+    // Rest of the document round-trips through jszip untouched.
+    expect(docxXmlToText(newXml)).toContain('a1');
+    expect(docxXmlToText(newXml)).toContain('b1');
+    expect(docxXmlToText(newXml)).toContain('a2');
+    expect(docxXmlToText(newXml)).not.toContain('b2');
+    expect(docxXmlToText(newXml)).toContain('X');
+  });
+});
+
+describe('fill_document_field — docx, explicit column', () => {
+  it('fills the first cell instead of the last when column is given', async () => {
+    const original = buildDocxWithTables([[['a1', 'b1']]]);
+    const filePath = writeInboxFile('report.docx', original);
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, column: 1, value: 'X' }, opts());
+    expect(result.isError).toBeFalsy();
+
+    const outPath = extractOutPath(result.content[0].text);
+    const newXml = await readDocxXml(fs.readFileSync(outPath));
+    expect(docxXmlToText(newXml)).toContain('X');
+    expect(docxXmlToText(newXml)).toContain('b1');
+    expect(docxXmlToText(newXml)).not.toContain('a1');
+  });
+});
+
+describe('fill_document_field — docx, single table, no table number given', () => {
+  it('infers table 1', async () => {
+    const filePath = writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]]));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, value: 'X' }, opts());
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('table 1');
+  });
+
+  it('asks for a table number when more than one table exists', async () => {
+    const filePath = writeInboxFile('report.docx', buildDocxWithTables([[['a1']], [['a2']]]));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, value: 'X' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('table');
+  });
+});
+
+describe('fill_document_field — docx, nested table', () => {
+  it('declines cleanly instead of miscounting or corrupting the cell', async () => {
+    const filePath = writeInboxFile('report.docx', buildDocxWithRawTable(nestedTableRowXml()));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, value: 'X' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('nested table');
+    expect(fs.existsSync(path.join(baseDir, '.document-fills'))).toBe(false);
+  });
+});
+
+describe('fill_document_field — docx, empty target cell (no existing run)', () => {
+  it('inserts a new run rather than erroring', async () => {
+    const filePath = writeInboxFile('report.docx', buildDocxWithRawTable(rowWithEmptyLastCellXml('a1')));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, value: 'X' }, opts());
+    expect(result.isError).toBeFalsy();
+
+    const outPath = extractOutPath(result.content[0].text);
+    const newXml = await readDocxXml(fs.readFileSync(outPath));
+    expect(docxXmlToText(newXml)).toContain('X');
+    expect(docxXmlToText(newXml)).toContain('a1');
+  });
+});
+
+describe('fill_document_field — docx, unresolvable target', () => {
+  it('declines cleanly when the table number does not exist, no file written', async () => {
+    const filePath = writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]]));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'report', table: 9, row: 1, value: 'X' }, opts());
+    expect(result.isError).toBe(true);
+    expect(fs.existsSync(path.join(baseDir, '.document-fills'))).toBe(false);
+  });
+
+  it('declines cleanly when the row number does not exist, no file written', async () => {
+    const filePath = writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]]));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'report', row: 9, value: 'X' }, opts());
+    expect(result.isError).toBe(true);
+    expect(fs.existsSync(path.join(baseDir, '.document-fills'))).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// fill_document_field — .pdf AcroForm path
+// ---------------------------------------------------------------------------
+
+describe('fill_document_field — PDF AcroForm field match', () => {
+  it('sets the field value via pdf-lib with no page redraw', async () => {
+    const pdfBytes = await buildAcroFormPdf('Name');
+    const filePath = writeInboxFile('form.pdf', pdfBytes);
+    // This fixture has no page content stream text (only a form widget), so
+    // save_document takes its scanned/no-text-layer two-call path.
+    await saveDocumentImpl({ path: filePath }, opts());
+    await saveDocumentImpl({ path: filePath, extractedText: 'A form with a Name field.' }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'form', fieldName: 'Name', value: 'Ada Lovelace' }, opts());
+    expect(result.isError).toBeFalsy();
+
+    const outPath = extractOutPath(result.content[0].text);
+    const { PDFDocument } = await import('pdf-lib');
+    const filledDoc = await PDFDocument.load(fs.readFileSync(outPath));
+    expect(filledDoc.getForm().getTextField('Name').getText()).toBe('Ada Lovelace');
+  });
+});
+
+describe('fill_document_field — PDF AcroForm no match', () => {
+  it('errors listing the actual field names on the form', async () => {
+    const pdfBytes = await buildAcroFormPdf('Name');
+    const filePath = writeInboxFile('form.pdf', pdfBytes);
+    await saveDocumentImpl({ path: filePath }, opts());
+    await saveDocumentImpl({ path: filePath, extractedText: 'A form with a Name field.' }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'form', fieldName: 'DoesNotExist', value: 'X' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('Name');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// fill_document_field — .pdf text-layer line-overlay path (two-call)
+// ---------------------------------------------------------------------------
+
+describe('fill_document_field — PDF text-layer, first call', () => {
+  it('returns a numbered list of detected lines', async () => {
+    const filePath = writeInboxFile('letter.pdf', buildMultilineTextPdf(['Name: ______', 'Date: ______']));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'letter' }, opts());
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('Name:');
+    expect(result.content[0].text).toContain('Date:');
+    expect(result.content[0].text).toContain('lineNumber');
+  });
+});
+
+describe('fill_document_field — PDF text-layer, second call', () => {
+  it('draws the value right after the chosen line, preserving the original content', async () => {
+    const filePath = writeInboxFile('letter.pdf', buildMultilineTextPdf(['Name: ______', 'Date: ______']));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'letter', lineNumber: 1, value: 'Ada Lovelace' }, opts());
+    expect(result.isError).toBeFalsy();
+
+    const outPath = extractOutPath(result.content[0].text);
+    const text = await extractAllPdfText(outPath);
+    expect(text).toContain('Name:');
+    expect(text).toContain('Date:');
+    expect(text).toContain('Ada Lovelace');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// fill_document_field — .pdf scanned pixel-overlay path (two-call)
+// ---------------------------------------------------------------------------
+
+describe('fill_document_field — PDF scanned, first call', () => {
+  it('renders page 1 and returns its pixel dimensions', async () => {
+    const filePath = writeInboxFile('scan.pdf', buildMinimalPdf(null));
+    await saveDocumentImpl({ path: filePath }, opts());
+    await saveDocumentImpl({ path: filePath, extractedText: 'A scanned page.' }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'scan' }, opts());
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toMatch(/\d+x\d+px/);
+    expect(result.content[0].text).toContain('pixelX');
+  });
+});
+
+describe('fill_document_field — PDF scanned, second call', () => {
+  it('draws the value at the converted point-space position', async () => {
+    const filePath = writeInboxFile('scan.pdf', buildMinimalPdf(null));
+    await saveDocumentImpl({ path: filePath }, opts());
+    await saveDocumentImpl({ path: filePath, extractedText: 'A scanned page.' }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'scan', pixelX: 40, pixelY: 60, value: 'X' }, opts());
+    expect(result.isError).toBeFalsy();
+
+    const outPath = extractOutPath(result.content[0].text);
+    expect(fs.existsSync(outPath)).toBe(true);
+    const text = await extractAllPdfText(outPath);
+    expect(text).toContain('X');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Storage never mutated by a fill (spine's Deferred default)
+// ---------------------------------------------------------------------------
+
+describe('fill_document_field — stored canonical copy is never modified', () => {
+  it('leaves the stored .docx and its extracted-text concept file untouched', async () => {
+    const original = buildDocxWithTables([[['a1', 'b1']]]);
+    const filePath = writeInboxFile('report.docx', original);
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const rawPath = path.join(baseDir, 'memory', 'documents', 'files', 'report.docx');
+    const conceptPath = path.join(baseDir, 'memory', 'documents', 'report.md');
+    const rawBefore = fs.readFileSync(rawPath);
+    const conceptBefore = fs.readFileSync(conceptPath, 'utf-8');
+
+    await fillDocumentFieldImpl({ document: 'report', row: 1, value: 'X' }, opts());
+
+    expect(fs.readFileSync(rawPath).equals(rawBefore)).toBe(true);
+    expect(fs.readFileSync(conceptPath, 'utf-8')).toBe(conceptBefore);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Code-review findings (patch tier), applied to this same story:
+//   1. AcroForm auto-discovery on a PDF's first call
+//   2. Hebrew (non-Latin1) values on PDF fills
+//   3. Overlay-render filename uniqueness (concurrency)
+//   4. Wrong-file-type args rejected instead of silently ignored
+//   5. Merged-cell (gridSpan) detect-and-decline
+//   6. Malformed-OOXML safety
+//   7. PDF pixel-position bounds check
+//   8. Off-page line-overlay check
+//   9. Empty/whitespace document query rejected
+//  10. CRLF-tolerant frontmatter parsing
+//  12. Ambiguous-slug (two raw files under one slug) clarity
+//  13. Multi-run <w:t> cell / non-text AcroForm field coverage
+// ---------------------------------------------------------------------------
+
+function cellWithMultipleRunsXml(texts: string[]): string {
+  const runs = texts.map((t) => `<w:r><w:t xml:space="preserve">${t}</w:t></w:r>`).join('');
+  return `<w:tc><w:p>${runs}</w:p></w:tc>`;
+}
+
+function gridSpanRowXml(): string {
+  return (
+    '<w:tr>' +
+    '<w:tc><w:tcPr><w:gridSpan w:val="2"/></w:tcPr><w:p><w:r><w:t xml:space="preserve">merged</w:t></w:r></w:p></w:tc>' +
+    '<w:tc><w:p><w:r><w:t xml:space="preserve">c3</w:t></w:r></w:p></w:tc>' +
+    '</w:tr>'
+  );
+}
+
+/** An unclosed <w:tr> — </w:tbl> ends up closing the table while the row/cell/paragraph/run are still open. */
+function unclosedRowXml(): string {
+  return '<w:tr><w:tc><w:p><w:r><w:t xml:space="preserve">a</w:t></w:r></w:p>';
+}
+
+async function buildTextPdfWithAcroForm(text: string, fieldName: string): Promise<Buffer> {
+  const { PDFDocument, StandardFonts } = await import('pdf-lib');
+  const pdfDoc = await PDFDocument.create();
+  const page = pdfDoc.addPage([300, 200]);
+  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  page.drawText(text, { x: 20, y: 150, size: 14, font });
+  const form = pdfDoc.getForm();
+  const textField = form.createTextField(fieldName);
+  textField.addToPage(page, { x: 20, y: 100, width: 150, height: 20 });
+  return Buffer.from(await pdfDoc.save());
+}
+
+async function buildAcroFormCheckboxPdf(fieldName: string): Promise<Buffer> {
+  const { PDFDocument } = await import('pdf-lib');
+  const pdfDoc = await PDFDocument.create();
+  const page = pdfDoc.addPage([200, 200]);
+  const form = pdfDoc.getForm();
+  const checkBox = form.createCheckBox(fieldName);
+  checkBox.addToPage(page, { x: 20, y: 100, width: 20, height: 20 });
+  return Buffer.from(await pdfDoc.save());
+}
+
+function extractRenderPath(text: string): string {
+  const m = /to (\S+\.png)\./.exec(text);
+  if (!m) throw new Error(`No render path found in response: ${text}`);
+  return m[1];
+}
+
+// --- 1. AcroForm auto-discovery ---------------------------------------------
+
+describe('fill_document_field — PDF AcroForm auto-discovery', () => {
+  it('surfaces the field name alongside the detected-lines list on a first call', async () => {
+    const pdfBytes = await buildTextPdfWithAcroForm('Name: ______', 'Name');
+    const filePath = writeInboxFile('form.pdf', pdfBytes);
+    await saveDocumentImpl({ path: filePath }, opts()); // real text layer -> single-call save
+
+    const result = await fillDocumentFieldImpl({ document: 'form' }, opts());
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('Name: ______');
+    expect(result.content[0].text).toContain('fillable form field');
+    expect(result.content[0].text).toContain('Name');
+    expect(result.content[0].text).toContain('fieldName');
+  });
+});
+
+// --- 2. Hebrew (non-Latin1) values -------------------------------------------
+
+describe('fill_document_field — Hebrew value on the PDF line-overlay path', () => {
+  it('does not throw and produces a real, non-trivial output PDF', async () => {
+    const filePath = writeInboxFile('letter.pdf', buildMultilineTextPdf(['Name: ______', 'Date: ______']));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'letter', lineNumber: 1, value: 'שלום עולם' }, opts());
+    expect(result.isError).toBeFalsy();
+
+    const outPath = extractOutPath(result.content[0].text);
+    const bytes = fs.readFileSync(outPath);
+    expect(bytes.length).toBeGreaterThan(500);
+    expect(bytes.subarray(0, 5).toString('latin1')).toBe('%PDF-');
+  });
+});
+
+// --- 3. Overlay-render filename uniqueness (concurrency) -------------------
+
+describe('fill_document_field — concurrent scanned-PDF first calls', () => {
+  it('renders to distinct paths, neither clobbering the other', async () => {
+    const filePath = writeInboxFile('scan.pdf', buildMinimalPdf(null));
+    await saveDocumentImpl({ path: filePath }, opts());
+    await saveDocumentImpl({ path: filePath, extractedText: 'A scanned page.' }, opts());
+
+    const [r1, r2] = await Promise.all([
+      fillDocumentFieldImpl({ document: 'scan' }, opts()),
+      fillDocumentFieldImpl({ document: 'scan' }, opts()),
+    ]);
+    expect(r1.isError).toBeFalsy();
+    expect(r2.isError).toBeFalsy();
+
+    const p1 = extractRenderPath(r1.content[0].text);
+    const p2 = extractRenderPath(r2.content[0].text);
+    expect(p1).not.toBe(p2);
+    expect(fs.existsSync(p1)).toBe(true);
+    expect(fs.existsSync(p2)).toBe(true);
+    expect(fs.readFileSync(p1).length).toBeGreaterThan(0);
+    expect(fs.readFileSync(p2).length).toBeGreaterThan(0);
+  });
+});
+
+// --- 4. Wrong-file-type args rejected ---------------------------------------
+
+describe('fill_document_field — wrong-file-type arguments', () => {
+  it('rejects .docx-only args against a .pdf document', async () => {
+    const filePath = writeInboxFile('letter.pdf', buildMultilineTextPdf(['Line one']));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'letter', row: 1, value: 'X' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('.pdf');
+    expect(result.content[0].text).toContain('row');
+  });
+
+  it('rejects .pdf-only args against a .docx document', async () => {
+    const filePath = writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]]));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'report', lineNumber: 1, value: 'X' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('.docx');
+    expect(result.content[0].text).toContain('lineNumber');
+  });
+});
+
+// --- 5. Merged-cell (gridSpan) detect-and-decline ---------------------------
+
+describe('fill_document_field — docx, merged cell (gridSpan)', () => {
+  it('declines cleanly instead of miscounting the visual column', async () => {
+    const filePath = writeInboxFile('report.docx', buildDocxWithRawTable(gridSpanRowXml()));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, column: 2, value: 'X' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('merged cell');
+    expect(fs.existsSync(path.join(baseDir, '.document-fills'))).toBe(false);
+  });
+});
+
+// --- 6. Malformed-OOXML safety ----------------------------------------------
+
+describe('fill_document_field — docx, malformed table XML', () => {
+  it('declines cleanly on an unbalanced tag instead of corrupting the output', async () => {
+    const filePath = writeInboxFile('report.docx', buildDocxWithRawTable(unclosedRowXml()));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, value: 'X' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text.toLowerCase()).toContain('malformed');
+    expect(fs.existsSync(path.join(baseDir, '.document-fills'))).toBe(false);
+  });
+});
+
+// --- 7. PDF pixel-position bounds check -------------------------------------
+
+describe('fill_document_field — PDF scanned, out-of-bounds pixel position', () => {
+  it('errors clearly rather than drawing off the page', async () => {
+    const filePath = writeInboxFile('scan.pdf', buildMinimalPdf(null));
+    await saveDocumentImpl({ path: filePath }, opts());
+    await saveDocumentImpl({ path: filePath, extractedText: 'A scanned page.' }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'scan', pixelX: 99999, pixelY: 60, value: 'X' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('bounds');
+  });
+});
+
+// --- 8. Off-page line-overlay check ------------------------------------------
+
+describe('fill_document_field — PDF text-layer, line already at the page edge', () => {
+  it('errors clearly instead of drawing off the visible page', async () => {
+    // MediaBox is 300pt wide; a line whose text already runs to the edge
+    // leaves no room to draw anything after it on the same baseline.
+    const filePath = writeInboxFile('letter.pdf', buildMultilineTextPdf(['x'.repeat(80)]));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'letter', lineNumber: 1, value: 'X' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('right edge');
+  });
+});
+
+// --- 9. Empty/whitespace document query -------------------------------------
+
+describe('fill_document_field — whitespace-only document query', () => {
+  it('is rejected the same as a missing document argument', async () => {
+    const result = await fillDocumentFieldImpl({ document: '   ', row: 1, value: 'X' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('document is required');
+  });
+});
+
+// --- 10. CRLF-tolerant frontmatter parsing -----------------------------------
+
+describe('list_documents / fill_document_field — CRLF frontmatter', () => {
+  it('parses a concept file whose frontmatter uses CRLF line endings', async () => {
+    const documentsDir = path.join(baseDir, 'memory', 'documents');
+    const filesDir = path.join(documentsDir, 'files');
+    fs.mkdirSync(filesDir, { recursive: true });
+    fs.writeFileSync(path.join(filesDir, 'crlf-doc.docx'), buildDocxWithTables([[['a1', 'b1']]]));
+
+    const conceptBody = [
+      '---',
+      'type: saved-document',
+      'description: "A CRLF test document"',
+      'source-filename: "crlf-doc.docx"',
+      'saved-date: 2026-01-01T00:00:00.000Z',
+      '---',
+      '',
+      '# crlf-doc.docx',
+      '',
+      'body text',
+      '',
+    ].join('\r\n');
+    fs.writeFileSync(path.join(documentsDir, 'crlf-doc.md'), conceptBody);
+
+    const listResult = await listDocumentsImpl({ query: 'crlf' }, opts());
+    expect(listResult.isError).toBeFalsy();
+    expect(listResult.content[0].text).toContain('crlf-doc');
+    expect(listResult.content[0].text).toContain('A CRLF test document');
+
+    const fillResult = await fillDocumentFieldImpl({ document: 'crlf-doc', row: 1, value: 'X' }, opts());
+    expect(fillResult.isError).toBeFalsy();
+  });
+});
+
+// --- 12. Ambiguous-slug clarity ----------------------------------------------
+
+describe('fill_document_field — ambiguous slug (two raw files under one slug)', () => {
+  it('errors with a specific message instead of a generic not-found', async () => {
+    const documentsDir = path.join(baseDir, 'memory', 'documents');
+    const filesDir = path.join(documentsDir, 'files');
+    fs.mkdirSync(filesDir, { recursive: true });
+    fs.writeFileSync(path.join(filesDir, 'dup.docx'), buildDocxWithTables([[['a1', 'b1']]]));
+    fs.writeFileSync(path.join(filesDir, 'dup.pdf'), buildMinimalPdf('Hello'));
+    fs.writeFileSync(
+      path.join(documentsDir, 'dup.md'),
+      '---\ntype: saved-document\ndescription: "A duplicated slug"\nsource-filename: "dup"\nsaved-date: 2026-01-01T00:00:00.000Z\n---\n\nbody\n',
+    );
+
+    const result = await fillDocumentFieldImpl({ document: 'dup', row: 1, value: 'X' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('dup');
+    expect(result.content[0].text).toContain('Multiple files');
+  });
+});
+
+// --- 13a. Multi-run <w:t> cell -----------------------------------------------
+
+describe('fill_document_field — docx, multi-run target cell', () => {
+  it('sets the value on the first run in document order and blanks the rest', async () => {
+    const row = `<w:tr>${cellXml('a1')}${cellWithMultipleRunsXml(['first', 'second'])}</w:tr>`;
+    const filePath = writeInboxFile('report.docx', buildDocxWithRawTable(row));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, value: 'X' }, opts());
+    expect(result.isError).toBeFalsy();
+
+    const outPath = extractOutPath(result.content[0].text);
+    const newXml = await readDocxXml(fs.readFileSync(outPath));
+    const text = docxXmlToText(newXml);
+    expect(text).toContain('X');
+    expect(text).not.toContain('first');
+    expect(text).not.toContain('second');
+  });
+});
+
+// --- 13b. Non-text AcroForm field --------------------------------------------
+
+describe('fill_document_field — PDF AcroForm field matched but not a text field', () => {
+  it('errors clearly rather than throwing uncaught', async () => {
+    const pdfBytes = await buildAcroFormCheckboxPdf('Agree');
+    const filePath = writeInboxFile('form.pdf', pdfBytes);
+    await saveDocumentImpl({ path: filePath }, opts());
+    await saveDocumentImpl({ path: filePath, extractedText: 'A form with a checkbox.' }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'form', fieldName: 'Agree', value: 'X' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('Agree');
+    expect(result.content[0].text).toContain("isn't a fillable text field");
   });
 });

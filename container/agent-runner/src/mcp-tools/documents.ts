@@ -49,7 +49,10 @@
 import { execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import zlib from 'zlib';
+
+import type { PDFDocument as PDFDocumentType, PDFFont, PDFPage, PDFTextField as PDFTextFieldType } from 'pdf-lib';
 
 import type { McpToolDefinition } from './types.js';
 import { registerTools } from './server.js';
@@ -591,6 +594,880 @@ export async function saveDocumentImpl(
   }
 }
 
+// ---------------------------------------------------------------------------
+// list_documents / fill_document_field (Story 1.2)
+//
+// `resolveDocument` is the single shared matcher both tools use to turn a
+// free-text `document` argument into a saved document: case-insensitive
+// substring match against slug, source filename, and description
+// (Design Notes — no fuzzy/ranked search needed yet). 0 matches is an
+// error; 1 match resolves directly; 2+ matches is *not* an error — it's a
+// numbered candidate list for the agent to relay to the user and re-call
+// with the exact slug (AD-7).
+// ---------------------------------------------------------------------------
+
+interface DocumentMeta {
+  slug: string;
+  ext: 'docx' | 'pdf';
+  sourceFilename: string;
+  description: string;
+  /**
+   * Set when more than one raw file matches this slug (e.g. both a .docx
+   * and a .pdf under files/<slug>.*) — shouldn't normally happen, but
+   * silently picking one via extension-iteration order would risk editing
+   * the wrong file. `ext` above is whichever was found first; callers that
+   * are about to actually target this document must check this field and
+   * surface a specific error instead of proceeding.
+   */
+  ambiguousExtensions?: Array<'docx' | 'pdf'>;
+}
+
+/** Reverses yamlEscape(): strips the surrounding quotes and unescapes `\x` -> `x`. */
+function parseYamlScalar(raw: string): string {
+  const trimmed = raw.trim();
+  const m = /^"((?:[^"\\]|\\.)*)"$/.exec(trimmed);
+  if (!m) return trimmed;
+  return m[1].replace(/\\(.)/g, '$1');
+}
+
+function readConceptMeta(documentsDir: string, filesDir: string, slug: string): DocumentMeta | undefined {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(path.join(documentsDir, `${slug}.md`), 'utf-8');
+  } catch {
+    return undefined;
+  }
+
+  // \r?\n tolerates a CRLF-saved concept file (e.g. hand-edited on Windows) —
+  // a bare \n-only regex would fail to match the frontmatter block at all.
+  const fmMatch = /^---\r?\n([\s\S]*?)\r?\n---\r?\n/.exec(raw);
+  const fields: Record<string, string> = {};
+  if (fmMatch) {
+    for (const line of fmMatch[1].split(/\r?\n/)) {
+      const m = /^([a-zA-Z][a-zA-Z0-9-]*):\s?(.*)$/.exec(line);
+      if (m) fields[m[1]] = parseYamlScalar(m[2]);
+    }
+  }
+
+  const matchingExts: Array<'docx' | 'pdf'> = [];
+  for (const candidate of SUPPORTED_EXTENSIONS) {
+    if (fs.existsSync(path.join(filesDir, `${slug}.${candidate}`))) {
+      matchingExts.push(candidate as 'docx' | 'pdf');
+    }
+  }
+  if (matchingExts.length === 0) return undefined; // concept file with no matching raw copy — orphaned, skip it
+
+  return {
+    slug,
+    ext: matchingExts[0],
+    sourceFilename: fields['source-filename'] ?? slug,
+    description: fields['description'] ?? '',
+    ambiguousExtensions: matchingExts.length > 1 ? matchingExts : undefined,
+  };
+}
+
+function listDocumentMeta(documentsDir: string, filesDir: string): DocumentMeta[] {
+  if (!fs.existsSync(documentsDir)) return [];
+  const files = fs.readdirSync(documentsDir).filter((f) => f.endsWith('.md') && f !== 'index.md');
+  const metas: DocumentMeta[] = [];
+  for (const f of files) {
+    const meta = readConceptMeta(documentsDir, filesDir, f.slice(0, -3));
+    if (meta) metas.push(meta);
+  }
+  return metas;
+}
+
+function matchDocuments(documentsDir: string, filesDir: string, query: string | undefined): DocumentMeta[] {
+  const all = listDocumentMeta(documentsDir, filesDir);
+  if (!query || query.trim() === '') return all;
+  const q = query.toLowerCase();
+  return all.filter(
+    (m) =>
+      m.slug.toLowerCase().includes(q) ||
+      m.sourceFilename.toLowerCase().includes(q) ||
+      m.description.toLowerCase().includes(q),
+  );
+}
+
+function formatDocumentCandidates(metas: DocumentMeta[]): string {
+  return metas
+    .map((m, i) => `${i + 1}. ${m.slug} — ${m.sourceFilename}${m.description ? ` (${m.description})` : ''}`)
+    .join('\n');
+}
+
+type DocumentResolution =
+  | { kind: 'resolved'; meta: DocumentMeta }
+  | { kind: 'candidates'; metas: DocumentMeta[] }
+  | { kind: 'not-found' };
+
+/** Used by fill_document_field's own targeting — 1 match proceeds, 2+ halts with a candidate list, 0 errors. */
+function resolveDocument(documentsDir: string, filesDir: string, query: string): DocumentResolution {
+  const matches = matchDocuments(documentsDir, filesDir, query);
+  if (matches.length === 0) return { kind: 'not-found' };
+  if (matches.length === 1) return { kind: 'resolved', meta: matches[0] };
+  return { kind: 'candidates', metas: matches };
+}
+
+interface ListDocumentsOpts {
+  baseDir: string;
+}
+
+export async function listDocumentsImpl(
+  args: Record<string, unknown>,
+  opts: ListDocumentsOpts,
+): Promise<ReturnType<typeof ok> | ReturnType<typeof err>> {
+  try {
+    const query = typeof args.query === 'string' ? args.query : undefined;
+    const documentsDir = path.join(opts.baseDir, 'memory', 'documents');
+    const filesDir = path.join(documentsDir, 'files');
+
+    const matches = matchDocuments(documentsDir, filesDir, query);
+    if (query && query.trim() !== '' && matches.length === 0) {
+      return err(`No saved document matches "${query}".`);
+    }
+    if (matches.length === 0) {
+      return ok('No saved documents yet.');
+    }
+    return ok(formatDocumentCandidates(matches));
+  } catch (e) {
+    return err(`list_documents failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+export const listDocuments: McpToolDefinition = {
+  tool: {
+    name: 'list_documents',
+    description:
+      "List saved documents (from save_document) matching a free-text query against each document's slug, " +
+      'original filename, and description. Omit "query" to list everything. Used to find the exact slug for ' +
+      'fill_document_field when a name/topic reference could match more than one saved document.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        query: {
+          type: 'string',
+          description: 'Free-text match against slug/filename/description. Omit to list all saved documents.',
+        },
+      },
+    },
+  },
+  handler: (args) => listDocumentsImpl(args, { baseDir: '/workspace/agent' }),
+};
+
+// ---------------------------------------------------------------------------
+// fill_document_field — .docx table-cell path
+//
+// A tiny stack-based tokenizer limited to the six OOXML tag names a table
+// can be built from (tbl/tr/tc/p/r/t). Any other tag (tblPr, trPr, tcPr,
+// rPr, pPr, ...) is treated as opaque content that never affects nesting,
+// which is safe because real OOXML is well-formed: those tags always live
+// fully inside one of our six, never straddling a boundary. This gives an
+// exact tree with byte offsets, letting later edits splice precise ranges
+// out of the original string rather than doing any string-based rebuild.
+// ---------------------------------------------------------------------------
+
+const OOXML_TAGS = ['tbl', 'tr', 'tc', 'p', 'r', 't'] as const;
+type OoxmlTag = (typeof OOXML_TAGS)[number];
+
+interface XmlNode {
+  tag: OoxmlTag;
+  start: number; // index of '<' of the opening (or self-closing) tag
+  openEnd: number; // index right after the opening tag's '>'
+  close: number; // index of '<' of the closing tag (== openEnd if self-closing)
+  end: number; // index right after the closing tag's '>' (== openEnd if self-closing)
+  selfClosing: boolean;
+  children: XmlNode[];
+}
+
+function parseOoxmlTree(xml: string): XmlNode[] {
+  const tagAlt = OOXML_TAGS.join('|');
+  const re = new RegExp(`<w:(${tagAlt})\\b([^>]*)>|<\\/w:(${tagAlt})>`, 'g');
+  const stack: XmlNode[] = [];
+  const roots: XmlNode[] = [];
+  let m: RegExpExecArray | null;
+  // eslint-disable-next-line no-cond-assign
+  while ((m = re.exec(xml))) {
+    const isClose = m[0].startsWith('</');
+    if (!isClose) {
+      const tag = m[1] as OoxmlTag;
+      const selfClosing = /\/\s*$/.test(m[2] ?? '');
+      const openEnd = m.index + m[0].length;
+      const node: XmlNode = {
+        tag,
+        start: m.index,
+        openEnd,
+        close: selfClosing ? openEnd : -1,
+        end: selfClosing ? openEnd : -1,
+        selfClosing,
+        children: [],
+      };
+      if (stack.length > 0) stack[stack.length - 1].children.push(node);
+      else roots.push(node);
+      if (!selfClosing) stack.push(node);
+    } else {
+      const tag = m[3] as OoxmlTag;
+      for (let i = stack.length - 1; i >= 0; i--) {
+        if (stack[i].tag === tag) {
+          stack[i].close = m.index;
+          stack[i].end = m.index + m[0].length;
+          stack.length = i; // pop it (and, defensively, anything left dangling above it)
+          break;
+        }
+      }
+    }
+  }
+  return roots;
+}
+
+function nodeContainsTag(node: XmlNode, tag: OoxmlTag): boolean {
+  for (const child of node.children) {
+    if (child.tag === tag || nodeContainsTag(child, tag)) return true;
+  }
+  return false;
+}
+
+/**
+ * An unbalanced closing tag (or truncated document.xml) leaves some node's
+ * close/end at -1 (never matched — see parseOoxmlTree's close-tag branch).
+ * Slicing the original string using a -1 offset would silently corrupt the
+ * output rather than erroring, so this is checked up front, once, over the
+ * whole parsed tree, before any of it is used for an edit.
+ */
+function treeIsWellFormed(nodes: XmlNode[]): boolean {
+  return nodes.every((n) => n.close !== -1 && n.end !== -1 && treeIsWellFormed(n.children));
+}
+
+function collectDescendants(node: XmlNode, tag: OoxmlTag): XmlNode[] {
+  const found: XmlNode[] = [];
+  for (const child of node.children) {
+    if (child.tag === tag) found.push(child);
+    found.push(...collectDescendants(child, tag));
+  }
+  return found;
+}
+
+function xmlEscapeText(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/** Ensures a <w:t...> opening tag carries xml:space="preserve" — replacing any other value it already has. */
+function ensurePreserveSpace(openTag: string): string {
+  if (/xml:space\s*=\s*"[^"]*"/.test(openTag)) {
+    return openTag.replace(/xml:space\s*=\s*"[^"]*"/, 'xml:space="preserve"');
+  }
+  return openTag.replace(/^<w:t/, '<w:t xml:space="preserve"');
+}
+
+/**
+ * Sets the cell's displayed text to `value`. The first <w:t> run (in
+ * document order) receives the value; any additional runs in the same cell
+ * are blanked rather than left to concatenate stray leftover text after it.
+ */
+function replaceCellText(xml: string, tNodes: XmlNode[], value: string): string {
+  const primary = tNodes[0];
+  const byPositionDesc = [...tNodes].sort((a, b) => b.start - a.start);
+  let result = xml;
+  for (const node of byPositionDesc) {
+    if (node.close === -1 || node.end === -1) {
+      // Should be unreachable — fillDocx checks treeIsWellFormed() before
+      // reaching here — but slicing on a -1 offset would silently corrupt
+      // the output, so this is a hard stop rather than a fallback.
+      throw new Error('Malformed table cell XML (unclosed run) — cannot fill.');
+    }
+    const isPrimary = node === primary;
+    const inner = isPrimary ? xmlEscapeText(value) : '';
+    if (node.selfClosing) {
+      if (!isPrimary) continue; // already empty — nothing to blank
+      const raw = result.slice(node.start, node.end);
+      const opened = ensurePreserveSpace(raw.replace(/\/\s*>\s*$/, '>'));
+      result = result.slice(0, node.start) + opened + inner + '</w:t>' + result.slice(node.end);
+    } else {
+      const openTagRaw = result.slice(node.start, node.openEnd);
+      const openTag = isPrimary ? ensurePreserveSpace(openTagRaw) : openTagRaw;
+      result = result.slice(0, node.start) + openTag + inner + result.slice(node.close);
+    }
+  }
+  return result;
+}
+
+/** Cell has no <w:t> at all — insert a new run into its last paragraph (or a new paragraph if it has none). */
+function insertRunIntoCell(xml: string, cellNode: XmlNode, value: string): string {
+  const runXml = `<w:r><w:t xml:space="preserve">${xmlEscapeText(value)}</w:t></w:r>`;
+  const paragraphs = cellNode.children.filter((c) => c.tag === 'p');
+  if (paragraphs.length > 0) {
+    const lastP = paragraphs[paragraphs.length - 1];
+    if (lastP.close === -1) throw new Error('Malformed table cell XML (unclosed paragraph) — cannot fill.');
+    const insertAt = lastP.close;
+    return xml.slice(0, insertAt) + runXml + xml.slice(insertAt);
+  }
+  if (cellNode.close === -1) throw new Error('Malformed table cell XML (unclosed cell) — cannot fill.');
+  const insertAt = cellNode.close;
+  return xml.slice(0, insertAt) + `<w:p>${runXml}</w:p>` + xml.slice(insertAt);
+}
+
+function writeFillOutput(baseDir: string, slug: string, ext: string, data: Buffer): string {
+  const dir = path.join(baseDir, '.document-fills');
+  fs.mkdirSync(dir, { recursive: true });
+  const outPath = path.join(dir, `${slug}-filled-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`);
+  fs.writeFileSync(outPath, data);
+  return outPath;
+}
+
+interface FillOpts {
+  baseDir: string;
+}
+
+async function fillDocx(
+  rawPath: string,
+  meta: DocumentMeta,
+  args: Record<string, unknown>,
+  opts: FillOpts,
+): Promise<ReturnType<typeof ok> | ReturnType<typeof err>> {
+  const row = typeof args.row === 'number' ? args.row : undefined;
+  if (row === undefined) return err('row is required for a .docx fill (1-indexed row within the target table).');
+  const value = typeof args.value === 'string' ? args.value : undefined;
+  if (value === undefined) return err('value is required.');
+  const tableArg = typeof args.table === 'number' ? args.table : undefined;
+  const columnArg = typeof args.column === 'number' ? args.column : undefined;
+
+  const JSZipModule = await import('jszip');
+  const JSZip = JSZipModule.default;
+  const zip = await JSZip.loadAsync(fs.readFileSync(rawPath));
+  const docFile = zip.file('word/document.xml');
+  if (!docFile) return err('This .docx has no word/document.xml — cannot edit it.');
+  const xml = await docFile.async('string');
+
+  const roots = parseOoxmlTree(xml);
+  if (!treeIsWellFormed(roots)) {
+    return err("This document's table XML looks malformed (an unbalanced tag) — declining to edit it.");
+  }
+  const tables = roots.filter((n) => n.tag === 'tbl');
+  if (tables.length === 0) return err('This document has no tables to fill.');
+
+  let tableIndex: number;
+  if (tableArg !== undefined) {
+    tableIndex = tableArg;
+  } else if (tables.length === 1) {
+    tableIndex = 1;
+  } else {
+    return err(`This document has ${tables.length} tables — specify "table" (1-${tables.length}).`);
+  }
+  const table = tables[tableIndex - 1];
+  if (!table) return err(`Table ${tableIndex} not found — this document has ${tables.length} table(s).`);
+
+  const rows = table.children.filter((n) => n.tag === 'tr');
+  const targetRow = rows[row - 1];
+  if (!targetRow) return err(`Row ${row} not found in table ${tableIndex} — it has ${rows.length} row(s).`);
+
+  // gridSpan (a merged cell) makes direct-<w:tc>-position counting unreliable
+  // for the *visual* column the user means — decline rather than silently
+  // filling the wrong one. Full merged-cell-aware targeting is out of scope
+  // (see deferred-work.md); this is detect-and-decline only.
+  if (/<w:gridSpan\b/.test(xml.slice(targetRow.start, targetRow.end))) {
+    return err(
+      `Row ${row} of table ${tableIndex} contains a merged cell (gridSpan) — column-by-position targeting isn't ` +
+        'reliable here, declining to edit it.',
+    );
+  }
+
+  const cells = targetRow.children.filter((n) => n.tag === 'tc');
+  if (cells.length === 0) return err(`Row ${row} in table ${tableIndex} has no cells.`);
+  const cellIndex = columnArg !== undefined ? columnArg : cells.length; // default: last cell (label|value shape)
+  const targetCell = cells[cellIndex - 1];
+  if (!targetCell) {
+    return err(`Column ${cellIndex} not found in row ${row} of table ${tableIndex} — it has ${cells.length} cell(s).`);
+  }
+
+  if (nodeContainsTag(targetCell, 'tbl')) {
+    return err(
+      `Row ${row}, column ${cellIndex} of table ${tableIndex} contains a nested table — declining to edit it ` +
+        'rather than risk miscounting or corrupting its content.',
+    );
+  }
+
+  const tNodes = collectDescendants(targetCell, 't');
+  const newXml = tNodes.length > 0 ? replaceCellText(xml, tNodes, value) : insertRunIntoCell(xml, targetCell, value);
+
+  zip.file('word/document.xml', newXml);
+  const outBytes = await zip.generateAsync({ type: 'nodebuffer' });
+  const outPath = writeFillOutput(opts.baseDir, meta.slug, 'docx', outBytes);
+  return ok(
+    `Filled table ${tableIndex}, row ${row}, column ${cellIndex} of "${meta.slug}" with "${value}". New file at ` +
+      `${outPath} — call send_file to deliver it.`,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// fill_document_field — .pdf paths (AcroForm field, text-layer line overlay,
+// scanned-page pixel overlay), in the priority order row-targeting-matrix.md
+// specifies.
+// ---------------------------------------------------------------------------
+
+interface PdfLine {
+  pageIndex: number; // 0-based
+  y: number; // PDF point-space, bottom-left origin
+  endX: number; // rightmost extent of the line's existing text, in points
+  text: string;
+}
+
+const LINE_Y_TOLERANCE_PT = 2;
+
+async function pdfExtractLinesAllPages(filePath: string): Promise<PdfLine[]> {
+  const { getDocument } = await import('pdfjs-dist/legacy/build/pdf.mjs');
+  const data = new Uint8Array(fs.readFileSync(filePath));
+  const loadingTask = getDocument({ data, verbosity: 0 });
+  try {
+    const doc = await loadingTask.promise;
+    const lines: PdfLine[] = [];
+    for (let p = 1; p <= doc.numPages; p++) {
+      const page = await doc.getPage(p);
+      const content = await page.getTextContent();
+      const items: Array<{ x: number; y: number; width: number; str: string }> = [];
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      for (const raw of content.items as any[]) {
+        if (!('str' in raw) || raw.str === '') continue;
+        const transform = raw.transform as number[];
+        items.push({ x: transform[4], y: transform[5], width: raw.width ?? 0, str: raw.str });
+      }
+      page.cleanup();
+
+      items.sort((a, b) => b.y - a.y || a.x - b.x);
+      let current: typeof items = [];
+      const flush = () => {
+        if (current.length === 0) return;
+        const text = current
+          .map((it) => it.str)
+          .join(' ')
+          .replace(/\s+/g, ' ')
+          .trim();
+        if (text) {
+          lines.push({
+            pageIndex: p - 1,
+            y: current[0].y,
+            endX: Math.max(...current.map((it) => it.x + it.width)),
+            text,
+          });
+        }
+        current = [];
+      };
+      for (const item of items) {
+        if (current.length > 0 && Math.abs(current[0].y - item.y) > LINE_Y_TOLERANCE_PT) flush();
+        current.push(item);
+      }
+      flush();
+    }
+    return lines;
+  } finally {
+    await loadingTask.destroy();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Unicode text support for PDF drawing/appearances. StandardFonts.Helvetica
+// is a WinAnsi (Latin-1) standard font — pdf-lib throws when asked to draw
+// or set field text containing characters outside it (Hebrew, this
+// project's actual user's language, included). @pdf-lib/fontkit lets
+// pdf-lib embed an arbitrary TrueType/OpenType/WOFF/WOFF2 font instead of a
+// standard one; @fontsource/noto-sans-hebrew ships one, but split into
+// per-Unicode-range files for web use (a "hebrew" subset with no Latin/
+// digits, a separate "latin" subset with no Hebrew) — no single file in it
+// covers both scripts. Rather than pull in a second font package, text is
+// split into per-script runs and each run is drawn with whichever embedded
+// font actually covers it (Helvetica for everything else, the Hebrew
+// subset only for the Hebrew runs) — this does not attempt bidi/visual
+// reordering, only "don't throw and keep both scripts legible".
+// ---------------------------------------------------------------------------
+
+const HEBREW_RANGE = /[\u0590-\u05FF\uFB1D-\uFB4F]/;
+
+let cachedHebrewFontBytes: Buffer | undefined;
+
+function loadHebrewFontBytes(): Buffer {
+  if (!cachedHebrewFontBytes) {
+    const url = import.meta.resolve('@fontsource/noto-sans-hebrew/files/noto-sans-hebrew-hebrew-400-normal.woff2');
+    cachedHebrewFontBytes = fs.readFileSync(fileURLToPath(url));
+  }
+  return cachedHebrewFontBytes;
+}
+
+interface TextFonts {
+  latin: PDFFont;
+  hebrew?: PDFFont;
+}
+
+/** Embeds Helvetica always; the Hebrew-coverage font too, but only when the value being drawn actually needs it. */
+async function embedTextFonts(pdfDoc: PDFDocumentType, needsHebrew: boolean): Promise<TextFonts> {
+  const { StandardFonts } = await import('pdf-lib');
+  const latin = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  if (!needsHebrew) return { latin };
+
+  const fontkitModule = await import('@pdf-lib/fontkit');
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  pdfDoc.registerFontkit(((fontkitModule as any).default ?? fontkitModule) as any);
+  const hebrew = await pdfDoc.embedFont(loadHebrewFontBytes(), { subset: true });
+  return { latin, hebrew };
+}
+
+/** Splits `text` into maximal runs that are each entirely Hebrew-range or entirely not. */
+function splitByScript(text: string): Array<{ text: string; hebrew: boolean }> {
+  const runs: Array<{ text: string; hebrew: boolean }> = [];
+  let current = '';
+  let currentHebrew: boolean | null = null;
+  for (const ch of text) {
+    const hebrew = HEBREW_RANGE.test(ch);
+    if (currentHebrew !== null && hebrew !== currentHebrew) {
+      runs.push({ text: current, hebrew: currentHebrew });
+      current = '';
+    }
+    current += ch;
+    currentHebrew = hebrew;
+  }
+  if (current) runs.push({ text: current, hebrew: currentHebrew ?? false });
+  return runs;
+}
+
+/** Draws `text` at (x, y), switching fonts per script run so a Hebrew run doesn't throw on the Latin-only font. */
+function drawUnicodeText(page: PDFPage, text: string, x: number, y: number, size: number, fonts: TextFonts): void {
+  let cursorX = x;
+  for (const run of splitByScript(text)) {
+    const font = run.hebrew && fonts.hebrew ? fonts.hebrew : fonts.latin;
+    page.drawText(run.text, { x: cursorX, y, size, font });
+    cursorX += font.widthOfTextAtSize(run.text, size);
+  }
+}
+
+/** AcroForm text-field names, for surfacing alongside a first-call line list/render (priority-1 discovery — AD-1). */
+async function getAcroFormTextFieldNames(filePath: string): Promise<string[]> {
+  const { PDFDocument, PDFTextField } = await import('pdf-lib');
+  const pdfDoc = await PDFDocument.load(fs.readFileSync(filePath));
+  const form = pdfDoc.getForm();
+  return form
+    .getFields()
+    .filter((f): f is PDFTextFieldType => f instanceof PDFTextField)
+    .map((f) => f.getName());
+}
+
+function formatFieldNamesNote(fieldNames: string[]): string {
+  if (fieldNames.length === 0) return '';
+  return (
+    `\n\nThis PDF also has fillable form field(s): ${fieldNames.join(', ')}. Call fill_document_field again with ` +
+    '"fieldName" and "value" to fill one of those directly instead, if that\'s a better match than a line/position.'
+  );
+}
+
+async function pdfListLines(rawPath: string): Promise<ReturnType<typeof ok> | ReturnType<typeof err>> {
+  const [lines, fieldNames] = await Promise.all([pdfExtractLinesAllPages(rawPath), getAcroFormTextFieldNames(rawPath)]);
+  if (lines.length === 0 && fieldNames.length === 0) {
+    return err('No text lines or fillable form fields detected on this PDF to target.');
+  }
+
+  // Hoisted once rather than recomputed per line (was an O(n^2) scan inside the .map() below).
+  const hasMultiplePages = lines.length > 0 && lines.some((l) => l.pageIndex !== lines[0].pageIndex);
+  const linesPart =
+    lines.length > 0
+      ? `Detected lines:\n${lines
+          .map((l, i) => (hasMultiplePages ? `${i + 1}. (page ${l.pageIndex + 1}) ${l.text}` : `${i + 1}. ${l.text}`))
+          .join('\n')}\n\nCall fill_document_field again with the same "document", this "lineNumber", and a ` +
+        '"value" to draw text right after that line, on the same baseline.'
+      : 'No text lines detected on this PDF to target as a line overlay.';
+
+  return ok(linesPart + formatFieldNamesNote(fieldNames));
+}
+
+async function pdfFillLine(
+  rawPath: string,
+  meta: DocumentMeta,
+  lineNumber: number,
+  value: string,
+  opts: FillOpts,
+): Promise<ReturnType<typeof ok> | ReturnType<typeof err>> {
+  const lines = await pdfExtractLinesAllPages(rawPath);
+  const target = lines[lineNumber - 1];
+  if (!target) return err(`No line ${lineNumber} found — this document has ${lines.length} detected line(s).`);
+
+  const { PDFDocument } = await import('pdf-lib');
+  const pdfDoc = await PDFDocument.load(fs.readFileSync(rawPath));
+  const page = pdfDoc.getPages()[target.pageIndex];
+  const gapPt = 8;
+  const drawX = target.endX + gapPt;
+  if (drawX > page.getWidth()) {
+    return err(
+      `Line ${lineNumber}'s existing content already reaches the page's right edge — no room to draw "${value}" ` +
+        'after it on the same line.',
+    );
+  }
+
+  const fonts = await embedTextFonts(pdfDoc, HEBREW_RANGE.test(value));
+  drawUnicodeText(page, value, drawX, target.y, 11, fonts);
+
+  const outBytes = Buffer.from(await pdfDoc.save());
+  const outPath = writeFillOutput(opts.baseDir, meta.slug, 'pdf', outBytes);
+  return ok(
+    `Drew "${value}" right after line ${lineNumber} ("${target.text}") on "${meta.slug}". New file at ${outPath} — ` +
+      'call send_file to deliver it.',
+  );
+}
+
+/** Unique render filename per call (mirrors save_document's slug+crc32 pattern) — two concurrent fills on the same document must not clobber each other's render. */
+function overlayRenderFileNameFor(slug: string): string {
+  const unique = crc32(Buffer.from(`${slug}-${process.hrtime.bigint()}-${Math.random()}`, 'utf-8'))
+    .toString(16)
+    .padStart(8, '0');
+  return `${slug}-overlay-${unique}-p1.png`;
+}
+
+async function pdfRenderForOverlay(
+  rawPath: string,
+  meta: DocumentMeta,
+  opts: FillOpts,
+): Promise<ReturnType<typeof ok> | ReturnType<typeof err>> {
+  const renderPath = path.join(opts.baseDir, '.document-fills', overlayRenderFileNameFor(meta.slug));
+  let dims: { width: number; height: number };
+  try {
+    dims = await renderFirstPageToPng(rawPath, renderPath);
+  } catch (e) {
+    return err(`Could not render page for overlay targeting: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  const fieldNames = await getAcroFormTextFieldNames(rawPath);
+  return ok(
+    'This PDF has no text layer (scanned/image-only). I rendered page 1 ' +
+      `(page 1 only), ${dims.width}x${dims.height}px, to ${renderPath}. Look at it, estimate the pixel position ` +
+      '(x,y from the top-left corner) where the value should go, then call fill_document_field again with the ' +
+      'same "document", "pixelX", "pixelY", and "value" to complete the fill.' +
+      formatFieldNamesNote(fieldNames),
+  );
+}
+
+async function pdfFillPixel(
+  rawPath: string,
+  meta: DocumentMeta,
+  pixelX: number,
+  pixelY: number,
+  value: string,
+  opts: FillOpts,
+): Promise<ReturnType<typeof ok> | ReturnType<typeof err>> {
+  const { PDFDocument } = await import('pdf-lib');
+  const pdfDoc = await PDFDocument.load(fs.readFileSync(rawPath));
+  const page = pdfDoc.getPages()[0];
+  const { width: pageWidthPts, height: pageHeightPts } = page.getSize();
+
+  // Mirrors renderFirstPageToPng's RENDER_SCALE convention: the rendered PNG
+  // is pageSizePts * RENDER_SCALE pixels on each axis (72-DPI-native PDF
+  // point space, rendered at RENDER_SCALE pixels per point).
+  const imageWidthPx = pageWidthPts * RENDER_SCALE;
+  const imageHeightPx = pageHeightPts * RENDER_SCALE;
+  if (pixelX < 0 || pixelX > imageWidthPx || pixelY < 0 || pixelY > imageHeightPx) {
+    return err(
+      `pixelX/pixelY (${pixelX}, ${pixelY}) is outside the rendered page image's bounds ` +
+        `(${Math.round(imageWidthPx)}x${Math.round(imageHeightPx)}px) — pick a position within it.`,
+    );
+  }
+  const pdfX = (pixelX / imageWidthPx) * pageWidthPts;
+  const pdfY = pageHeightPts - (pixelY / imageHeightPx) * pageHeightPts;
+
+  const fonts = await embedTextFonts(pdfDoc, HEBREW_RANGE.test(value));
+  drawUnicodeText(page, value, pdfX, pdfY, 11, fonts);
+
+  const outBytes = Buffer.from(await pdfDoc.save());
+  const outPath = writeFillOutput(opts.baseDir, meta.slug, 'pdf', outBytes);
+  return ok(`Drew "${value}" at the position you specified on "${meta.slug}". New file at ${outPath} — call send_file to deliver it.`);
+}
+
+async function pdfFillAcroForm(
+  rawPath: string,
+  meta: DocumentMeta,
+  fieldName: string,
+  value: string,
+  opts: FillOpts,
+): Promise<ReturnType<typeof ok> | ReturnType<typeof err>> {
+  const { PDFDocument } = await import('pdf-lib');
+  const pdfDoc = await PDFDocument.load(fs.readFileSync(rawPath));
+  const form = pdfDoc.getForm();
+
+  const field = form.getFieldMaybe(fieldName);
+  if (!field) {
+    const names = form.getFields().map((f) => f.getName());
+    return err(
+      `No field named "${fieldName}" on this PDF's form. Available fields: ${names.length ? names.join(', ') : '(none)'}`,
+    );
+  }
+
+  let textField: ReturnType<typeof form.getTextField>;
+  try {
+    textField = form.getTextField(fieldName);
+  } catch (e) {
+    return err(`Field "${fieldName}" exists but isn't a fillable text field: ${e instanceof Error ? e.message : String(e)}`);
+  }
+
+  textField.setText(value);
+  const fonts = await embedTextFonts(pdfDoc, HEBREW_RANGE.test(value));
+  form.updateFieldAppearances(fonts.hebrew ?? fonts.latin);
+
+  const outBytes = Buffer.from(await pdfDoc.save());
+  const outPath = writeFillOutput(opts.baseDir, meta.slug, 'pdf', outBytes);
+  return ok(`Filled field "${fieldName}" on "${meta.slug}". New file at ${outPath} — call send_file to deliver it.`);
+}
+
+async function fillPdf(
+  rawPath: string,
+  meta: DocumentMeta,
+  args: Record<string, unknown>,
+  opts: FillOpts,
+): Promise<ReturnType<typeof ok> | ReturnType<typeof err>> {
+  const fieldName = typeof args.fieldName === 'string' ? args.fieldName : undefined;
+  const value = typeof args.value === 'string' ? args.value : undefined;
+  const lineNumber = typeof args.lineNumber === 'number' ? args.lineNumber : undefined;
+  const pixelX = typeof args.pixelX === 'number' ? args.pixelX : undefined;
+  const pixelY = typeof args.pixelY === 'number' ? args.pixelY : undefined;
+
+  // Priority 1: AcroForm field — if fieldName is given at all, this is the
+  // only path tried; a mismatch is a clear error, never a silent fall
+  // through to the overlay paths. (When fieldName is NOT given, the
+  // "first call" branches below still surface any AcroForm field names
+  // they find, so the caller can discover and use this path next time —
+  // see getAcroFormTextFieldNames/formatFieldNamesNote.)
+  if (fieldName !== undefined) {
+    if (value === undefined) return err('value is required together with fieldName.');
+    return pdfFillAcroForm(rawPath, meta, fieldName, value, opts);
+  }
+
+  let pdfText: string;
+  try {
+    pdfText = await extractPdfText(rawPath);
+  } catch (e) {
+    return err(`Could not read PDF: ${e instanceof Error ? e.message : String(e)}`);
+  }
+
+  // Priority 2: text layer with no matching field requested — line overlay.
+  if (hasTextLayer(pdfText)) {
+    if (lineNumber === undefined) return pdfListLines(rawPath);
+    if (value === undefined) return err('value is required together with lineNumber.');
+    return pdfFillLine(rawPath, meta, lineNumber, value, opts);
+  }
+
+  // Priority 3: no text layer at all — scanned-page pixel overlay.
+  if (pixelX === undefined || pixelY === undefined) return pdfRenderForOverlay(rawPath, meta, opts);
+  if (value === undefined) return err('value is required together with pixelX/pixelY.');
+  return pdfFillPixel(rawPath, meta, pixelX, pixelY, value, opts);
+}
+
+const DOCX_ONLY_ARGS = ['table', 'row', 'column'] as const;
+const PDF_ONLY_ARGS = ['fieldName', 'lineNumber', 'pixelX', 'pixelY'] as const;
+
+function presentArgNames(args: Record<string, unknown>, keys: readonly string[]): string[] {
+  return keys.filter((k) => args[k] !== undefined);
+}
+
+export async function fillDocumentFieldImpl(
+  args: Record<string, unknown>,
+  opts: FillOpts,
+): Promise<ReturnType<typeof ok> | ReturnType<typeof err>> {
+  try {
+    const documentQueryRaw = typeof args.document === 'string' ? args.document : undefined;
+    const documentQuery = documentQueryRaw?.trim();
+    if (!documentQuery) return err('document is required — the saved document\'s name/slug/topic to fill.');
+
+    const documentsDir = path.join(opts.baseDir, 'memory', 'documents');
+    const filesDir = path.join(documentsDir, 'files');
+    const resolution = resolveDocument(documentsDir, filesDir, documentQuery);
+
+    if (resolution.kind === 'not-found') {
+      return err(`No saved document matches "${documentQuery}".`);
+    }
+    if (resolution.kind === 'candidates') {
+      return ok(
+        `Multiple saved documents match "${documentQuery}":\n${formatDocumentCandidates(resolution.metas)}\n\n` +
+          'Call fill_document_field again with the exact slug (first column) to pick one.',
+      );
+    }
+
+    const meta = resolution.meta;
+    if (meta.ambiguousExtensions) {
+      return err(
+        `Multiple files found for document "${meta.slug}" (${meta.ambiguousExtensions.join(', ')}) — this ` +
+          'shouldn\'t normally happen. Check memory/documents/files/ for this slug manually before retrying.',
+      );
+    }
+
+    if (meta.ext === 'pdf') {
+      const wrongArgs = presentArgNames(args, DOCX_ONLY_ARGS);
+      if (wrongArgs.length > 0) {
+        return err(`These arguments don't apply to a .pdf document: ${wrongArgs.join(', ')}.`);
+      }
+    } else {
+      const wrongArgs = presentArgNames(args, PDF_ONLY_ARGS);
+      if (wrongArgs.length > 0) {
+        return err(`These arguments don't apply to a .docx document: ${wrongArgs.join(', ')}.`);
+      }
+    }
+
+    const rawPath = path.join(filesDir, `${meta.slug}.${meta.ext}`);
+    if (!fs.existsSync(rawPath)) return err(`Saved raw file for "${meta.slug}" is missing.`);
+
+    return meta.ext === 'docx' ? await fillDocx(rawPath, meta, args, opts) : await fillPdf(rawPath, meta, args, opts);
+  } catch (e) {
+    return err(`fill_document_field failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+export const fillDocumentField: McpToolDefinition = {
+  tool: {
+    name: 'fill_document_field',
+    description:
+      'Fill a value into a named target in a document already saved via save_document, and produce a new file ' +
+      "(the stored copy is never modified) — call send_file with the returned path to deliver it. For a .docx: " +
+      'targets a table row (table/row, column optional — defaults to the row\'s last cell). For a .pdf: targets ' +
+      'an AcroForm field (fieldName) if the PDF has one matching, otherwise a text-layer line (a first call with ' +
+      'no lineNumber returns the detected lines to choose from) or, for a scanned PDF, a pixel position on a ' +
+      'rendered page (a first call with no pixelX/pixelY renders page 1 and returns its pixel dimensions).',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        document: {
+          type: 'string',
+          description: 'Name/slug/topic of the saved document to fill (same matching as list_documents).',
+        },
+        value: {
+          type: 'string',
+          description: 'The value to write. Required on the call that actually performs the fill.',
+        },
+        table: {
+          type: 'integer',
+          description: '.docx only: 1-indexed table number. Optional if the document has exactly one table.',
+        },
+        row: {
+          type: 'integer',
+          description: '.docx only: 1-indexed row number within the target table. Required for a .docx fill.',
+        },
+        column: {
+          type: 'integer',
+          description: '.docx only: 1-indexed column (cell) within the target row. Defaults to the last cell.',
+        },
+        fieldName: {
+          type: 'string',
+          description: '.pdf only: an AcroForm field name to fill directly, no page redraw.',
+        },
+        lineNumber: {
+          type: 'integer',
+          description:
+            '.pdf, text-layer only: 1-indexed line (from a prior no-argument call\'s numbered list) to draw the ' +
+            'value after, on the same baseline.',
+        },
+        pixelX: {
+          type: 'number',
+          description: '.pdf, scanned only: x pixel position (from top-left) on the rendered page-1 image.',
+        },
+        pixelY: {
+          type: 'number',
+          description: '.pdf, scanned only: y pixel position (from top-left) on the rendered page-1 image.',
+        },
+      },
+      required: ['document'],
+    },
+  },
+  handler: (args) => fillDocumentFieldImpl(args, { baseDir: '/workspace/agent' }),
+};
+
 export const saveDocument: McpToolDefinition = {
   tool: {
     name: 'save_document',
@@ -621,4 +1498,4 @@ export const saveDocument: McpToolDefinition = {
   handler: (args) => saveDocumentImpl(args, { baseDir: '/workspace/agent', workspaceRoot: '/workspace' }),
 };
 
-registerTools([saveDocument]);
+registerTools([saveDocument, listDocuments, fillDocumentField]);

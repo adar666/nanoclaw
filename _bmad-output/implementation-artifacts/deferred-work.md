@@ -16,3 +16,12 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-1-1-save-a-word-pdf-document-to-memory.md`
   summary: Full cleanup/GC of abandoned `.document-renders/` PNGs when the agent never follows up with extractedText.
   evidence: Blind-hunter + edge-case-hunter finding; patch P7 only cleans up on the successful-completion path, not abandoned first-calls.
+- source_spec: `_bmad-output/implementation-artifacts/spec-1-2-fill-a-named-target-in-a-saved-document-and-return-it.md`
+  summary: `.document-fills/` render/output files are never cleaned up.
+  evidence: Blind-hunter finding; mirrors Story 1.1's already-deferred `.document-renders/` leak, same class, not fixed there either.
+- source_spec: `_bmad-output/implementation-artifacts/spec-1-2-fill-a-named-target-in-a-saved-document-and-return-it.md`
+  summary: Full merged-cell-aware (`w:gridSpan`) visual-column targeting for `.docx` fills.
+  evidence: Blind-hunter finding; the applied patch only detects and declines a gridSpan row rather than silently miscounting -- genuine support for filling a specific visual column across merged cells is a larger feature.
+- source_spec: `_bmad-output/implementation-artifacts/spec-1-2-fill-a-named-target-in-a-saved-document-and-return-it.md`
+  summary: Non-`w:`-prefixed OOXML namespace bindings are not recognized by the table parser (reports "no tables" rather than a specific unsupported-namespace message).
+  evidence: Blind-hunter finding; rare in practice since Word's own default binds `w:`, not worth solving now.

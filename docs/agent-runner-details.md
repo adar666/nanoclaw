@@ -625,6 +625,94 @@ Add an emoji reaction to a message.
 
 Implementation: write a `messages_out` row with `operation: 'reaction'`.
 
+#### save_document
+
+Persist a Word (`.docx`) or PDF attachment into the agent group's durable memory under
+`memory/documents/` (see `docs/memory.md`'s OKF convention) so a later, unrelated
+conversation can be answered from it without the file being resent. `.pdf` text-layer or
+`.docx` text is extracted synchronously in-container; a scanned/image-only PDF is a two-call
+flow (render page 1 to a PNG, agent reads it itself, calls back with `extractedText`).
+
+```typescript
+{
+  name: 'save_document',
+  params: {
+    path: string,           // inbox-relative path to the file (required)
+    extractedText?: string, // second-call only: what the agent read off a rendered scanned page
+  }
+}
+```
+
+Implementation: `container/agent-runner/src/mcp-tools/documents.ts` (`saveDocumentImpl`). Path
+containment is checked against the session's `inbox/` root (mirrors `src/inbox-safety.ts`'s
+approach on the host side). Slug derivation, the shared documents-index lock, and the
+scanned-PDF render/read two-call pattern are reused by `fill_document_field` below.
+
+#### list_documents
+
+List saved documents matching a free-text query against each one's slug, original filename,
+and description. With no `query`, returns everything. 0 matches with a query given is an
+error; 2+ matches is a numbered candidate list, not an error — the caller relays it and
+re-calls with the exact slug.
+
+```typescript
+{
+  name: 'list_documents',
+  params: {
+    query?: string, // free-text match against slug/filename/description; omit to list all
+  }
+}
+```
+
+Implementation: `documents.ts` (`listDocumentsImpl`). Shares its matcher (`matchDocuments`)
+with `fill_document_field`'s own document-resolution step, so both tools agree on what "this
+name matches that saved document" means.
+
+#### fill_document_field
+
+Fill a value into a table row of a saved `.docx`, an AcroForm field of a saved `.pdf`, or a
+text-layer line / scanned-page pixel position on a saved `.pdf`, and produce a new file (the
+stored copy is never modified) — the agent calls `send_file` itself with the returned path to
+deliver it. Never targets a raw inbox path directly, only a document already saved via
+`save_document`.
+
+```typescript
+{
+  name: 'fill_document_field',
+  params: {
+    document: string,    // saved document's name/slug/topic (required; same matching as list_documents)
+    value?: string,       // the value to write — required on the call that performs the fill
+    table?: number,       // .docx: 1-indexed table number; optional with exactly one table
+    row?: number,          // .docx: 1-indexed row within the target table
+    column?: number,       // .docx: 1-indexed cell within the row; defaults to the last cell
+    fieldName?: string,    // .pdf: an AcroForm field name, filled directly, no page redraw
+    lineNumber?: number,   // .pdf, text-layer: 1-indexed line from a prior no-argument call's list
+    pixelX?: number,       // .pdf, scanned: x pixel position from a prior no-argument call's render
+    pixelY?: number,       // .pdf, scanned: y pixel position from a prior no-argument call's render
+  }
+}
+```
+
+Implementation: `documents.ts` (`fillDocumentFieldImpl`).
+- `.docx`: a small stack-based tokenizer limited to OOXML's `tbl/tr/tc/p/r/t` tags builds an
+  exact-offset tree from `word/document.xml` (via `jszip`), so edits splice precise byte
+  ranges rather than rebuilding XML. Declines cleanly (no file written) on a nested table, a
+  merged cell (`w:gridSpan`), or malformed/unbalanced tag XML, rather than miscounting or
+  corrupting the output.
+- `.pdf`, in priority order: (1) an AcroForm field matching `fieldName` (`pdf-lib`
+  `getFieldMaybe`/`getTextField().setText()`, no page redraw); (2) a text-layer line, chosen
+  from a numbered list returned by a first call with no `lineNumber` (`pdfjs-dist` groups text
+  items into lines by y-coordinate); (3) a scanned page, targeted by a pixel position picked
+  off a page-1 render returned by a first call with no `pixelX`/`pixelY` (same
+  `@hyzyla/pdfium` render-page-1 pattern `save_document` uses). A first call with no
+  `fieldName` also surfaces any AcroForm field names found on the PDF, alongside the line
+  list or render, so the agent can discover and use `fieldName` on a later call even without
+  already knowing it existed.
+- Values containing Hebrew (or other non-WinAnsi) text are drawn with an embedded
+  `@fontsource/noto-sans-hebrew` font (via `@pdf-lib/fontkit`) instead of the
+  `StandardFonts.Helvetica` default, which throws on non-Latin1 characters; a mixed
+  Hebrew/Latin value is split into per-script runs, each drawn with the matching font.
+
 #### Agent-to-agent sends (no dedicated tool)
 
 There is no `send_to_agent` tool. Agents and channels share one destination namespace, so
