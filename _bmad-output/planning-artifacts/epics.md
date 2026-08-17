@@ -21,6 +21,7 @@ FR1: When a user sends a Word or PDF attachment and asks to save/remember it, th
 FR2: A user can ask about a previously saved document's content at any later point, and the agent answers from the stored memory/index entry and extracted text rather than requiring the file again. If the reference is ambiguous, the agent presents a numbered list of candidates and the user picks by number.
 FR3: A user can name a target inside a specific saved document — a Word table row (table number + row number), a Word fill-in-the-blank text line (line number, when no table matches — added post-launch after live use showed most real forms aren't tables), a PDF form field, or a PDF text line/position — plus a value, and the agent produces an updated copy of the document with that value applied, delivered back in chat. If the target document is ambiguous, the same numbered disambiguation as FR2 applies first.
 FR4: A user can save and fill a legacy `.doc` (binary Word 97-2003) file the same as a `.docx` — save/recall extracts its text directly; a fill request converts it to `.docx` first (LibreOffice headless, one-time) then reuses FR3's `.docx` targeting, always returning `.docx` (never a reconstructed `.doc`), disclosed to the user.
+FR5: A user can send an image of their handwritten signature and have the agent strip its near-white background to transparent, crop it tightly to its own bounding box, and store it as a named, reusable signature asset under the requesting agent group's memory — so it can be referenced by name in a later fill request instead of resending the image.
 
 ### NonFunctional Requirements
 
@@ -47,6 +48,7 @@ NFR7: When the target saved document is ambiguous, the agent presents a numbered
 - **AD-11** Every write to a shared per-group memory index file (`memory/index.md`, `memory/documents/index.md`) goes through locked read-modify-write — concurrent sessions of the same group can save at the same time.
 - **AD-12** Docx fill-in-the-blank text lines (a paragraph with an underscore run or trailing colon/blank, no matching table) get their own targeting mode, distinct from AD-5's table-cell editing — same two-call discovery pattern as AD-4's PDF text-layer branch. Added post-launch: live production use showed real-world forms are built this way far more often than as Word tables.
 - **AD-13** `.doc` support: `word-extractor` (pure-JS, base-image dependency) extracts text for the read path (save/recall) — no LibreOffice needed there. `libreoffice-writer` (apt system dependency, headless) converts `.doc`→`.docx` once for the fill path, after which the existing docx fill pipeline (AD-5/AD-12) runs unchanged. Output is always `.docx`, never a reconstructed `.doc`. User-approved despite the container image size cost; `soffice`-dependent tests must detect its absence and skip gracefully since the host `bun test` sandbox has no LibreOffice installed.
+- **AD-14** New `save_signature` MCP tool: decodes an input PNG (`pngjs`, pure JS), thresholds near-white pixels to `alpha: 0` (fixed luminance cutoff, not configurable), computes the bounding box of remaining non-transparent pixels, crops to it, and writes to `groups/<folder>/memory/signatures/<name>.png` — reuses `documents.ts`'s existing hand-rolled `encodePng` (Story 1.1's scanned-PDF render path) for the write side. Same per-agent-group storage scoping as `memory/documents/` — no cross-group read; a signature usable from more than one group is saved once per group, response text makes this explicit.
 - New `container/skills/document-memory/SKILL.md` (agent-facing prose, same shape as `audio-report/SKILL.md`) teaches the agent when/how to call the three tools and how to run the numbered-pick-list disambiguation.
 - Deferred (spine-acknowledged, not built now): whether an edit refreshes the stored raw copy and/or stored extracted text (default: neither — a re-save is a separate, unspecified action); OCR fallback if agent-vision reading proves insufficient in practice; multi-file/batch fill operations; version history/undo for edited documents.
 
@@ -62,6 +64,7 @@ N/A — no UX design contract exists and none is needed. This feature has no UI 
 | FR2 | CAP-2 | AD-6, AD-7, AD-10 |
 | FR3 | CAP-3 | AD-1, AD-2, AD-3, AD-4, AD-5, AD-7, AD-8, AD-10, AD-12 |
 | FR4 | CAP-4 | AD-1, AD-3, AD-13 |
+| FR5 | CAP-5 | AD-1, AD-14 |
 | NFR1, NFR2, NFR3 | CAP-1, CAP-3 | AD-4, AD-5 |
 | NFR4 | CAP-1, CAP-2 | AD-6 |
 | NFR5 | CAP-3 | (existing `send_file`, unchanged) |
@@ -72,13 +75,15 @@ N/A — no UX design contract exists and none is needed. This feature has no UI 
 
 ### Epic 1: Document Memory + Fill-In Editing
 Users can send a Word or PDF file, have the agent remember it (file + extracted content, recallable later), and ask the agent to fill a named row/field/line with a value and get back an updated document — all through one new MCP-tool surface sharing one library stack and one storage shape.
-**FRs covered:** FR1, FR2, FR3
+**FRs covered:** FR1, FR2, FR3, FR4, FR5
 
 ### FR Coverage Map
 
 FR1: Epic 1 - Save a Word/PDF attachment to agent memory (file + extracted content + index summary)
 FR2: Epic 1 - Recall a previously saved document's content, with numbered disambiguation
 FR3: Epic 1 - Fill a named target in a saved document and return the updated file
+FR4: Epic 1 - Save and fill a legacy `.doc` file via conversion
+FR5: Epic 1 - Save a handwritten signature as a reusable, background-stripped, cropped image asset
 
 ## Epic 1: Document Memory + Fill-In Editing
 
@@ -232,3 +237,35 @@ So that I don't have to convert old-format Word files myself before the agent ca
 **Given** a test exercises the actual `soffice` conversion subprocess
 **When** `bun test` runs on a machine without LibreOffice installed (the standard host dev sandbox)
 **Then** that specific test detects `soffice`'s absence and skips rather than failing the suite
+
+### Story 1.6: Save a Reusable Signature Asset
+
+As a NanoClaw user,
+I want to send a photo/scan of my handwritten signature and have the agent turn it into a clean, reusable asset,
+So that I can reference it by name later to stamp documents without resending the image.
+
+**Acceptance Criteria:**
+
+**Given** a user sends a PNG image of a handwritten signature and asks the agent to save it as their signature
+**When** `save_signature` runs
+**Then** near-white pixels (fixed luminance threshold) become fully transparent, the result is cropped tightly to the bounding box of remaining non-transparent pixels, and the output is written to `memory/signatures/<name>.png` (FR5, AD-14)
+
+**Given** the user gave no explicit name for the signature
+**When** `save_signature` runs
+**Then** the agent asks for one (or uses a sensible default it states plainly, e.g. the user's own name) — never silently invents an unstated name
+
+**Given** the input image is not a PNG (e.g. JPEG, or a `.docx`/`.pdf`)
+**When** the user asks the agent to save it as a signature
+**Then** the agent declines clearly and does not create a broken or partial signature asset (spec non-goal: general background removal is out of scope)
+
+**Given** an image with no non-transparent pixels remaining after thresholding (e.g. a blank/all-white image)
+**When** `save_signature` runs
+**Then** it declines clearly (AD-8's error-shape convention) rather than writing a zero-size or empty asset
+
+**Given** a signature name collides with one already saved in this agent group
+**When** `save_signature` runs
+**Then** it overwrites only on explicit confirmation, or uses AD-10's `-2`-suffix collision behavior — never silently clobbers a prior signature
+
+**Given** the user wants the same signature usable from more than one agent group (e.g. both a household group and a personal DM group)
+**When** they ask the agent to save it in each
+**Then** the agent saves it separately in each group's own `memory/signatures/`, and its response makes plain that no cross-group sharing occurred (spec non-goal, AD-14)

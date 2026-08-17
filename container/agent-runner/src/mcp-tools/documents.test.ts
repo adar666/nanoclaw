@@ -4,6 +4,8 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
+import { PNG } from 'pngjs';
+
 import {
   slugify,
   docxXmlToText,
@@ -14,6 +16,8 @@ import {
   fillDocumentFieldImpl,
   fillDocumentField,
   sofficeConvertArgs,
+  saveSignatureImpl,
+  saveSignature,
 } from './documents.js';
 
 // ---------------------------------------------------------------------------
@@ -155,6 +159,34 @@ function buildMinimalPdf(text: string | null): Buffer {
   parts.push(xref, `trailer\n<< /Size ${total} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`);
 
   return Buffer.from(parts.join(''), 'latin1');
+}
+
+/**
+ * A white canvas with an optional solid-color ink rectangle — pngjs is
+ * already this story's real dependency (production decode/encode both go
+ * through it), so building the fixture with it is a real PNG, not a second
+ * hand-rolled encoder duplicating encodePng's byte-level work for no
+ * verification benefit.
+ */
+function buildSignaturePng(opts: {
+  width: number;
+  height: number;
+  ink?: { x: number; y: number; w: number; h: number; color?: [number, number, number] };
+}): Buffer {
+  const { width, height, ink } = opts;
+  const png = new PNG({ width, height });
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = (width * y + x) << 2;
+      const isInk = !!ink && x >= ink.x && x < ink.x + ink.w && y >= ink.y && y < ink.y + ink.h;
+      const [r, g, b] = isInk ? (ink!.color ?? [0, 0, 0]) : [255, 255, 255];
+      png.data[i] = r;
+      png.data[i + 1] = g;
+      png.data[i + 2] = b;
+      png.data[i + 3] = 255;
+    }
+  }
+  return PNG.sync.write(png);
 }
 
 // ---------------------------------------------------------------------------
@@ -1973,5 +2005,399 @@ describe.skipIf(!SOFFICE_AVAILABLE)('save_document / fill_document_field — .do
     } finally {
       fs.rmSync(work, { recursive: true, force: true });
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// save_signature (Story 1.6)
+// ---------------------------------------------------------------------------
+
+describe('save_signature tool metadata', () => {
+  it('declares path and name as required', () => {
+    expect(saveSignature.tool.name).toBe('save_signature');
+    expect(saveSignature.tool.inputSchema).toMatchObject({ required: ['path', 'name'] });
+  });
+});
+
+describe('save_signature — happy path', () => {
+  it('removes the near-white background, crops to the ink bounding box, and writes memory/signatures/<name>.png', async () => {
+    const filePath = writeInboxFile(
+      'sig.png',
+      buildSignaturePng({ width: 20, height: 20, ink: { x: 5, y: 8, w: 6, h: 3 } }),
+    );
+
+    const result = await saveSignatureImpl({ path: filePath, name: 'uriel' }, opts());
+
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('uriel');
+    expect(result.content[0].text).toContain('memory/signatures/uriel.png');
+
+    const destPath = path.join(baseDir, 'memory', 'signatures', 'uriel.png');
+    expect(fs.existsSync(destPath)).toBe(true);
+
+    const decoded = PNG.sync.read(fs.readFileSync(destPath));
+    // Output PNG's dimensions are the bounding box's, not the source image's (20x20).
+    expect(decoded.width).toBe(6);
+    expect(decoded.height).toBe(3);
+
+    // Every pixel in the tightly-cropped output is opaque ink (black, alpha 255) —
+    // no white border survived the crop.
+    for (let i = 0; i < decoded.data.length; i += 4) {
+      expect(decoded.data[i]).toBe(0);
+      expect(decoded.data[i + 1]).toBe(0);
+      expect(decoded.data[i + 2]).toBe(0);
+      expect(decoded.data[i + 3]).toBe(255);
+    }
+  });
+
+  it('makes near-white pixels (>= 240,240,240) fully transparent, leaving darker pixels opaque', async () => {
+    // A 3x1 canvas: a near-white pixel (245) that must become transparent, a
+    // borderline-dark pixel (239) that must stay opaque, and a black ink pixel.
+    const png = new PNG({ width: 3, height: 1 });
+    png.data.set([245, 245, 245, 255], 0);
+    png.data.set([239, 239, 239, 255], 4);
+    png.data.set([0, 0, 0, 255], 8);
+    const filePath = writeInboxFile('threshold.png', PNG.sync.write(png));
+
+    const result = await saveSignatureImpl({ path: filePath, name: 'threshold-test' }, opts());
+    expect(result.isError).toBeFalsy();
+
+    const decoded = PNG.sync.read(
+      fs.readFileSync(path.join(baseDir, 'memory', 'signatures', 'threshold-test.png')),
+    );
+    // Bounding box crops out the now-transparent near-white pixel at x=0,
+    // leaving just the two surviving pixels (the borderline-dark one and ink).
+    expect(decoded.width).toBe(2);
+    expect(decoded.height).toBe(1);
+    expect(decoded.data[3]).toBe(255); // former x=1 (239,239,239) stayed opaque
+    expect(decoded.data[7]).toBe(255); // former x=2 (black ink) stayed opaque
+  });
+});
+
+describe('save_signature — no name given', () => {
+  it('declines and asks for a name, without writing anything', async () => {
+    const filePath = writeInboxFile(
+      'sig.png',
+      buildSignaturePng({ width: 10, height: 10, ink: { x: 2, y: 2, w: 3, h: 3 } }),
+    );
+
+    const result = await saveSignatureImpl({ path: filePath }, opts());
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text.toLowerCase()).toContain('name is required');
+    expect(fs.existsSync(path.join(baseDir, 'memory', 'signatures'))).toBe(false);
+  });
+
+  it('also declines for a blank/whitespace-only name', async () => {
+    const filePath = writeInboxFile(
+      'sig.png',
+      buildSignaturePng({ width: 10, height: 10, ink: { x: 2, y: 2, w: 3, h: 3 } }),
+    );
+
+    const result = await saveSignatureImpl({ path: filePath, name: '   ' }, opts());
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text.toLowerCase()).toContain('name is required');
+  });
+
+  it('declines with a distinct message for a non-string name (e.g. a number), rather than a generic "required"', async () => {
+    const filePath = writeInboxFile(
+      'sig.png',
+      buildSignaturePng({ width: 10, height: 10, ink: { x: 2, y: 2, w: 3, h: 3 } }),
+    );
+
+    const result = await saveSignatureImpl({ path: filePath, name: 42 }, opts());
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text.toLowerCase()).toContain('name must be a string');
+    expect(fs.existsSync(path.join(baseDir, 'memory', 'signatures'))).toBe(false);
+  });
+});
+
+describe('save_signature — name with no Latin letters or digits', () => {
+  it('declines rather than silently falling back to slugify\'s generic "document" name', async () => {
+    const filePath = writeInboxFile(
+      'sig.png',
+      buildSignaturePng({ width: 10, height: 10, ink: { x: 2, y: 2, w: 3, h: 3 } }),
+    );
+
+    // A Hebrew-only name: slugify() strips every character (nothing survives
+    // its [^a-z0-9]+ filter) and would otherwise fall back to the literal
+    // "document" — an invented, unstated name the spec's Boundaries
+    // explicitly forbid for a signature.
+    const result = await saveSignatureImpl({ path: filePath, name: 'אוריאל' }, opts());
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text.toLowerCase()).not.toContain('name is required'); // distinct from the empty-name case
+    expect(fs.existsSync(path.join(baseDir, 'memory', 'signatures'))).toBe(false);
+    // Never silently saved under the generic fallback name either.
+    expect(fs.existsSync(path.join(baseDir, 'memory', 'signatures', 'document.png'))).toBe(false);
+  });
+
+  it('an emoji-only name is declined the same way', async () => {
+    const filePath = writeInboxFile(
+      'sig.png',
+      buildSignaturePng({ width: 10, height: 10, ink: { x: 2, y: 2, w: 3, h: 3 } }),
+    );
+
+    const result = await saveSignatureImpl({ path: filePath, name: '🖋️' }, opts());
+
+    expect(result.isError).toBe(true);
+    expect(fs.existsSync(path.join(baseDir, 'memory', 'signatures'))).toBe(false);
+  });
+
+  it('a name that is literally "document" is allowed through (not misdetected as the fallback)', async () => {
+    const filePath = writeInboxFile(
+      'sig.png',
+      buildSignaturePng({ width: 10, height: 10, ink: { x: 2, y: 2, w: 3, h: 3 } }),
+    );
+
+    const result = await saveSignatureImpl({ path: filePath, name: 'document' }, opts());
+
+    expect(result.isError).toBeFalsy();
+    expect(fs.existsSync(path.join(baseDir, 'memory', 'signatures', 'document.png'))).toBe(true);
+  });
+});
+
+describe('save_signature — non-PNG input', () => {
+  it('declines cleanly with no file written', async () => {
+    const filePath = writeInboxFile('sig.jpg', Buffer.from('not actually a png', 'utf-8'));
+
+    const result = await saveSignatureImpl({ path: filePath, name: 'uriel' }, opts());
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('.jpg');
+    expect(fs.existsSync(path.join(baseDir, 'memory', 'signatures'))).toBe(false);
+  });
+});
+
+describe('save_signature — all-white / blank input', () => {
+  it('declines cleanly (no bounding box survives thresholding)', async () => {
+    const filePath = writeInboxFile('blank.png', buildSignaturePng({ width: 10, height: 10 }));
+
+    const result = await saveSignatureImpl({ path: filePath, name: 'uriel' }, opts());
+
+    expect(result.isError).toBe(true);
+    expect(fs.existsSync(path.join(baseDir, 'memory', 'signatures', 'uriel.png'))).toBe(false);
+  });
+});
+
+describe('save_signature — name collision', () => {
+  it('appends -2 instead of overwriting the existing file', async () => {
+    const first = writeInboxFile(
+      'first.png',
+      buildSignaturePng({ width: 10, height: 10, ink: { x: 1, y: 1, w: 2, h: 2 } }),
+    );
+    const second = writeInboxFile(
+      'second.png',
+      buildSignaturePng({ width: 12, height: 12, ink: { x: 2, y: 2, w: 4, h: 4 } }),
+    );
+
+    const r1 = await saveSignatureImpl({ path: first, name: 'uriel' }, opts());
+    expect(r1.isError).toBeFalsy();
+    const originalBytes = fs.readFileSync(path.join(baseDir, 'memory', 'signatures', 'uriel.png'));
+
+    const r2 = await saveSignatureImpl({ path: second, name: 'uriel' }, opts());
+    expect(r2.isError).toBeFalsy();
+    expect(r2.content[0].text).toContain('uriel-2');
+
+    // Original untouched, second written alongside it under the suffixed name.
+    expect(fs.readFileSync(path.join(baseDir, 'memory', 'signatures', 'uriel.png')).equals(originalBytes)).toBe(
+      true,
+    );
+    expect(fs.existsSync(path.join(baseDir, 'memory', 'signatures', 'uriel-2.png'))).toBe(true);
+  });
+
+  it('replace: true overwrites the existing file instead of suffixing', async () => {
+    const first = writeInboxFile(
+      'first.png',
+      buildSignaturePng({ width: 10, height: 10, ink: { x: 1, y: 1, w: 2, h: 2 } }),
+    );
+    const second = writeInboxFile(
+      'second.png',
+      buildSignaturePng({ width: 12, height: 12, ink: { x: 2, y: 2, w: 4, h: 4 } }),
+    );
+
+    await saveSignatureImpl({ path: first, name: 'uriel' }, opts());
+    const r2 = await saveSignatureImpl({ path: second, name: 'uriel', replace: true }, opts());
+
+    expect(r2.isError).toBeFalsy();
+    expect(fs.existsSync(path.join(baseDir, 'memory', 'signatures', 'uriel-2.png'))).toBe(false);
+
+    const decoded = PNG.sync.read(fs.readFileSync(path.join(baseDir, 'memory', 'signatures', 'uriel.png')));
+    // The second (replace) save's 4x4 ink rectangle, not the first save's 2x2 one.
+    expect(decoded.width).toBe(4);
+    expect(decoded.height).toBe(4);
+  });
+
+  it('rejects a non-boolean replace argument', async () => {
+    const filePath = writeInboxFile(
+      'sig.png',
+      buildSignaturePng({ width: 10, height: 10, ink: { x: 1, y: 1, w: 2, h: 2 } }),
+    );
+
+    const result = await saveSignatureImpl({ path: filePath, name: 'uriel', replace: 'yes' }, opts());
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text.toLowerCase()).toContain('replace');
+  });
+
+  it('replace: true refuses to write through a symlink planted at the destination', async () => {
+    const signaturesDir = path.join(baseDir, 'memory', 'signatures');
+    fs.mkdirSync(signaturesDir, { recursive: true });
+
+    // Plant a symlink at the exact destination replace:true would write to,
+    // pointing at a file outside memory/signatures/ entirely — if the write
+    // followed it, that outside file would be silently truncated.
+    const outsideTarget = path.join(tmpRoot, 'outside-target.txt');
+    fs.writeFileSync(outsideTarget, 'do not touch me');
+    fs.symlinkSync(outsideTarget, path.join(signaturesDir, 'uriel.png'));
+
+    const filePath = writeInboxFile(
+      'sig.png',
+      buildSignaturePng({ width: 10, height: 10, ink: { x: 1, y: 1, w: 2, h: 2 } }),
+    );
+
+    const result = await saveSignatureImpl({ path: filePath, name: 'uriel', replace: true }, opts());
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text.toLowerCase()).toContain('symlink');
+    // The symlink target was never touched.
+    expect(fs.readFileSync(outsideTarget, 'utf-8')).toBe('do not touch me');
+  });
+});
+
+describe('save_signature — decode failure', () => {
+  it('a corrupted/non-PNG byte stream with a .png extension declines via "Could not decode PNG"', async () => {
+    const filePath = writeInboxFile('corrupt.png', Buffer.from('this is not png data at all, just text', 'utf-8'));
+
+    const result = await saveSignatureImpl({ path: filePath, name: 'uriel' }, opts());
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('Could not decode PNG');
+    expect(fs.existsSync(path.join(baseDir, 'memory', 'signatures'))).toBe(false);
+  });
+
+  it('a zero-byte .png file declines via "Could not decode PNG" rather than crashing', async () => {
+    const filePath = writeInboxFile('empty.png', Buffer.alloc(0));
+
+    const result = await saveSignatureImpl({ path: filePath, name: 'uriel' }, opts());
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('Could not decode PNG');
+    expect(fs.existsSync(path.join(baseDir, 'memory', 'signatures'))).toBe(false);
+  });
+});
+
+describe('save_signature — sequential same-group saves (not a genuine race)', () => {
+  // These two calls run through Promise.all, but saveSignatureImpl has no
+  // internal await between its fs calls, so under the single-threaded event
+  // loop the two invocations actually execute fully sequentially — never
+  // interleaved. That still proves something real (idempotent back-to-back
+  // saves, first-use mkdirSync not blowing up on a second call), just not a
+  // genuine race. The EEXIST-retry branch itself is exercised for real by
+  // the dedicated test below, which forces an actual race condition on the
+  // wx write rather than relying on incidental interleaving.
+  it('two same-name calls, back-to-back, both complete and land on separate files (uriel.png + uriel-2.png)', async () => {
+    const a = writeInboxFile('a.png', buildSignaturePng({ width: 10, height: 10, ink: { x: 1, y: 1, w: 2, h: 2 } }));
+    const b = writeInboxFile('b.png', buildSignaturePng({ width: 14, height: 14, ink: { x: 3, y: 3, w: 5, h: 5 } }));
+
+    const [r1, r2] = await Promise.all([
+      saveSignatureImpl({ path: a, name: 'race' }, opts()),
+      saveSignatureImpl({ path: b, name: 'race' }, opts()),
+    ]);
+
+    expect(r1.isError).toBeFalsy();
+    expect(r2.isError).toBeFalsy();
+
+    const signaturesDir = path.join(baseDir, 'memory', 'signatures');
+    const written = fs.readdirSync(signaturesDir);
+    // Two distinct files (race.png + race-2.png) — neither call silently
+    // overwrote the other's output.
+    expect(written.length).toBe(2);
+    expect(written).toContain('race.png');
+    expect(written).toContain('race-2.png');
+  });
+
+  it('two different-name calls, back-to-back, both succeed on the first mkdirSync of memory/signatures/', async () => {
+    const a = writeInboxFile('a.png', buildSignaturePng({ width: 10, height: 10, ink: { x: 1, y: 1, w: 2, h: 2 } }));
+    const b = writeInboxFile('b.png', buildSignaturePng({ width: 10, height: 10, ink: { x: 1, y: 1, w: 2, h: 2 } }));
+
+    const [r1, r2] = await Promise.all([
+      saveSignatureImpl({ path: a, name: 'alice' }, opts()),
+      saveSignatureImpl({ path: b, name: 'bob' }, opts()),
+    ]);
+
+    expect(r1.isError).toBeFalsy();
+    expect(r2.isError).toBeFalsy();
+    const signaturesDir = path.join(baseDir, 'memory', 'signatures');
+    expect(fs.existsSync(path.join(signaturesDir, 'alice.png'))).toBe(true);
+    expect(fs.existsSync(path.join(signaturesDir, 'bob.png'))).toBe(true);
+  });
+});
+
+describe('save_signature — EEXIST retry path (writeSignaturePng), genuinely forced', () => {
+  it('recovers from a real EEXIST on the wx write (not just uniqueName\'s up-front check) and completes on retry', async () => {
+    const signaturesDir = path.join(baseDir, 'memory', 'signatures');
+    fs.mkdirSync(signaturesDir, { recursive: true });
+    // Base name already taken, so uniqueName's first legitimate candidate is "uriel-2".
+    fs.writeFileSync(path.join(signaturesDir, 'uriel.png'), Buffer.from('existing'));
+
+    const filePath = writeInboxFile(
+      'sig.png',
+      buildSignaturePng({ width: 10, height: 10, ink: { x: 1, y: 1, w: 2, h: 2 } }),
+    );
+
+    const targetPath = path.join(signaturesDir, 'uriel-2.png');
+    const realWriteFileSync = fs.writeFileSync;
+    let attempts = 0;
+    let forced = false;
+    // Monkey-patch the exact `{ flag: 'wx' }` write for this one path to
+    // throw a real EEXIST once — simulating another writer having just
+    // claimed "uriel-2.png" between uniqueName's existsSync check and this
+    // write. This forces writeSignaturePng's actual catch block to run (not
+    // just its up-front candidate-selection logic), then lets the retry's
+    // own write through for real.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (fs as any).writeFileSync = (p: fs.PathOrFileDescriptor, data: any, options?: any) => {
+      if (p === targetPath && options && options.flag === 'wx') {
+        attempts += 1;
+        if (!forced) {
+          forced = true;
+          const eexist: NodeJS.ErrnoException = new Error(`EEXIST: file already exists, open '${p}'`);
+          eexist.code = 'EEXIST';
+          throw eexist;
+        }
+      }
+      return realWriteFileSync(p, data, options);
+    };
+
+    try {
+      const result = await saveSignatureImpl({ path: filePath, name: 'uriel' }, opts());
+
+      expect(result.isError).toBeFalsy();
+      // Two attempts at the exact same candidate path: the first genuinely
+      // threw EEXIST (forced above), the second is the real retry succeeding
+      // — proof the catch-and-retry branch itself ran, not just that the
+      // final filename happened to land correctly.
+      expect(attempts).toBe(2);
+      expect(forced).toBe(true);
+      expect(result.content[0].text).toContain('uriel-2');
+      expect(fs.existsSync(targetPath)).toBe(true);
+    } finally {
+      fs.writeFileSync = realWriteFileSync;
+    }
+  });
+});
+
+describe('save_signature — path outside inbox', () => {
+  it('declines via the existing containment check', async () => {
+    const outsidePath = path.join(tmpRoot, 'outside.png');
+    fs.writeFileSync(outsidePath, buildSignaturePng({ width: 10, height: 10, ink: { x: 1, y: 1, w: 2, h: 2 } }));
+
+    const result = await saveSignatureImpl({ path: outsidePath, name: 'uriel' }, opts());
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('inbox');
   });
 });

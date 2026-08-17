@@ -1,6 +1,6 @@
 ---
 name: document-memory
-description: Save a Word (.docx or legacy .doc) or PDF file the user sends into this agent group's persistent memory, so its content can be recalled in a later, unrelated conversation without resending the file. Also fill a value into a table row, form field, or line of a document already saved this way and send back a new file, or recall/answer questions about what a previously saved document says. Use when the user sends a Word/PDF attachment and asks to save/remember/keep it, asks to fill in / complete a blank on a document already saved, or asks what a saved document says/contains, or asks to summarize/recall a document already saved.
+description: Save a Word (.docx or legacy .doc) or PDF file the user sends into this agent group's persistent memory, so its content can be recalled in a later, unrelated conversation without resending the file. Also fill a value into a table row, form field, or line of a document already saved this way and send back a new file, or recall/answer questions about what a previously saved document says. Also save a PNG image of a handwritten signature as a reusable, background-removed asset. Use when the user sends a Word/PDF attachment and asks to save/remember/keep it, asks to fill in / complete a blank on a document already saved, asks what a saved document says/contains, asks to summarize/recall a document already saved, or sends a signature image and asks to save/remember it for reuse.
 ---
 
 # Saving a document to memory
@@ -276,3 +276,55 @@ alone, with no filename/slug hint, may not resolve on the first try.
   placeholder `save_document` writes when automatic `.docx` extraction
   found nothing), there's nothing to recall — say so; don't treat the
   placeholder itself as real content.
+
+# Saving a reusable signature
+
+## When to use this
+
+The user sends a `.png` image of a handwritten signature — a photo of ink
+on paper, or a drawn signature — shown to you as an inbox attachment tag
+like `[image: sig.png — saved to /workspace/inbox/<msgId>/sig.png]`, and
+asks to save/remember it for reuse (e.g. "save my signature", "remember
+this signature as Uriel"). This is **save-only**: `save_signature` does
+not stamp a signature into any document — that capability doesn't exist
+yet. If the user's actual goal is to sign a specific document right now,
+say plainly that saving the signature is the only part currently
+supported.
+
+## Workflow
+
+1. **Get a name.** `save_signature` always needs a `name` for the
+   signature (e.g. the person's own name, "uriel") — **never invent one**.
+   If the user didn't give one in the same message, ask before calling the
+   tool.
+2. **Call the tool.** `mcp__nanoclaw__save_signature({ path, name })` with
+   the part of the inbox tag after `/workspace/` (e.g.
+   `inbox/<msgId>/sig.png`). This runs synchronously, in the same turn.
+   - The tool removes a near-white background (a fixed threshold — not
+     something you can tune) and crops tightly to what's left, so a photo
+     with visible paper/table background around the ink comes back clean.
+   - **Not a `.png`.** Declines cleanly — only `.png` is supported for a
+     signature right now. Say so plainly rather than trying to convert
+     another format yourself.
+   - **Nothing survives background removal** (e.g. an all-white or blank
+     image, or one with no dark ink at all). Declines cleanly — nothing is
+     saved. Ask the user to resend a clearer image rather than saving an
+     empty result.
+3. **Name collision.** If a signature is already saved under that name,
+   the new one is saved alongside it with a numeric suffix
+   (`uriel-2.png`) by default — it does **not** overwrite the existing
+   one. Only pass `replace: true` when the user's message made it clearly
+   explicit they want to replace/overwrite the old one (e.g. "no, replace
+   my old signature with this one") — if it's ambiguous whether they mean
+   a new save or a replacement, ask before deciding either way.
+
+## What NOT to do
+
+- Don't call this for anything other than a `.png` image.
+- Don't guess a name — always ask if the user didn't give one.
+- Don't assume `replace: true` — a plain "save my signature again" with no
+  explicit replace/overwrite language is a new, separate save, not a
+  replacement.
+- Don't imply a signature is now usable in a document, or shared with any
+  other agent group — it's saved only for this group, and nothing in this
+  story places it into a document yet.

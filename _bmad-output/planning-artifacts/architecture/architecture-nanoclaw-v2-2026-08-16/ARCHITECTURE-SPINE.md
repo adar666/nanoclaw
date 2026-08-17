@@ -8,7 +8,7 @@ scope: 'The NanoClaw v2 slice touched by SPEC-document-memory: inbound attachmen
 status: final
 created: '2026-08-16'
 updated: '2026-08-16'
-binds: [CAP-1, CAP-2, CAP-3, CAP-4]
+binds: [CAP-1, CAP-2, CAP-3, CAP-4, CAP-5, CAP-6]
 sources: []
 companions: ['../../specs/spec-document-memory/SPEC.md', '../../specs/spec-document-memory/row-targeting-matrix.md', '../../specs/spec-document-memory/brownfield.md']
 ---
@@ -112,6 +112,12 @@ flowchart LR
 - **Prevents:** reaching for a document-conversion engine (heavy, subprocess-based, unavailable in the `bun test` host sandbox) for the read path when a pure-JS parsing library does the job; conversely, pretending the legacy binary format can be edited directly the way `.docx`'s zip/XML structure can — no such approach exists.
 - **Rule:** Reading (`save_document`/CAP-1, `list_documents`/CAP-2): the `word-extractor` npm package (pure JS, no native binary, no system dependency) extracts text directly from `.doc` — same base-image-dependency mechanism as AD-3, no LibreOffice involved. Writing (`fill_document_field`/CAP-4): the only practical path is `libreoffice-writer` (headless, apt-installed system dependency, `container/Dockerfile`'s existing pattern — not a `bun`/`npm` dependency) converting `.doc` → `.docx` once via `soffice --headless --convert-to docx`, after which the existing `.docx` fill pipeline (AD-5, AD-12) runs unchanged against the converted file. The output is always `.docx` — never a reconstructed `.doc` — and the tool's response says so explicitly, never implying the original binary format was edited in place. Because `soffice` is a system binary absent from the `bun test` host sandbox (tests run on the host directly, not inside the built container image), any test exercising the actual conversion subprocess must detect its absence and skip gracefully rather than fail the suite on machines without LibreOffice installed.
 
+### AD-14 — Signature assets: pure-JS PNG decode/threshold/crop, stored per-group like documents
+
+- **Binds:** CAP-5
+- **Prevents:** reaching for a heavy image-processing dependency (`sharp`'s native binary, an ML background-removal model) when a simple luminance threshold plus a bounding-box crop — both trivial pixel-array operations — solve the actual, narrow problem (an ink signature on plain paper/canvas); silently treating a cross-group-usable signature as if NanoClaw's memory model supported sharing it, when it structurally doesn't.
+- **Rule:** A new `save_signature` MCP tool decodes the input PNG (`pngjs`, pure JS, pairs with the existing hand-rolled `encodePng` from AD-4's scanned-PDF-render path — reuse that encoder, add a decoder), thresholds near-white pixels to `alpha: 0` (a fixed luminance cutoff, not configurable in v1), computes the bounding box of remaining non-transparent pixels, crops to it, and writes the result to `groups/<folder>/memory/signatures/<name>.png` — same per-agent-group storage scoping as `memory/documents/`, AD-6. There is no cross-group read; a signature usable from two groups is saved once per group, and the tool's response makes this explicit rather than implying a shared asset was created.
+
 ## Consistency Conventions
 
 | Concern | Convention |
@@ -129,7 +135,8 @@ flowchart LR
 | pdfjs-dist | ~6.2.108 | Extract PDF text with per-item positional data when a text layer exists. Actively maintained (Mozilla), verified current. |
 | @hyzyla/pdfium | 2.1.13 | Render a PDF page to an image (scanned-content read fallback, overlay position-estimate fallback, AD-4). `[ADOPTED]` Verified: ships a bundled WASM fallback, so its optional `sharp` dependency is not a native-binary blocker for this Bun/Docker base image. |
 | jszip | 3.10.1 | Unzip/rezip `.docx` for direct OOXML cell-text edits (AD-5). Stable since 2022, not deprecated — not "actively released" but still the ecosystem-standard choice; no better-adopted alternative found. |
-| word-extractor | TBD (verify at build time) | Pure-JS `.doc` text extraction for CAP-1/CAP-2 (AD-13) — no native binary, no system dependency, same base-image-dependency mechanism as the rest of this table. |
+| word-extractor | 1.0.4 | Pure-JS `.doc` text extraction for CAP-1/CAP-2 (AD-13) — no native binary, no system dependency, same base-image-dependency mechanism as the rest of this table. |
+| pngjs | TBD (verify at build time) | Pure-JS PNG decoder for CAP-5's signature processing (AD-14) — pairs with the existing hand-rolled `encodePng` (Story 1.1's PDF-page-render path) for the write side. |
 | libreoffice-writer | Debian repo version (apt, not a bun dependency) | Headless `.doc`→`.docx` conversion for CAP-4's fill path (AD-13) — the one system-level (not `bun`/`npm`) addition in this feature, installed via `container/Dockerfile`'s existing `apt-get install` pattern. User-approved despite the container image size cost (~500MB-1GB); no lighter alternative exists for editing a legacy binary format. |
 | @pdf-lib/fontkit | 1.1.1 | Registers a custom-font embedder for `pdf-lib` — required for any non-Standard-14 (non-Latin-1) glyph, added mid-Story-1.2 during code review after Helvetica-only drawing was found to crash on Hebrew `value` input. `[UNDOCUMENTED IN PLANNING]` landed via implementation-time review judgment, not a pre-planned decision — see `implementation-artifacts/epic-1-retro-2026-08-16.md` action item AI-4. |
 | @fontsource/noto-sans-hebrew | 5.3.0 | The Unicode/Hebrew-coverage font asset `@pdf-lib/fontkit` embeds, drawn alongside Helvetica per run via script detection (`documents.ts`'s `splitByScript`/`drawUnicodeText`) so mixed-script `value`s render correctly. Same undocumented-in-planning note as above. |
@@ -159,6 +166,8 @@ groups/<folder>/memory/
 | CAP-2 (recall content) | `list_documents` tool + agent reading `memory/index.md`/concept files | AD-6, AD-7, AD-10 |
 | CAP-3 (fill & return) | `fill_document_field` tool; pdf-lib/pdfjs-dist/pdfium/jszip | AD-1, AD-2, AD-3, AD-4, AD-5, AD-7, AD-8, AD-10, AD-12 |
 | CAP-4 (`.doc` support) | `save_document`/`fill_document_field`; word-extractor (read), libreoffice-writer (write) | AD-1, AD-3, AD-13 |
+| CAP-5 (signature asset) | `save_signature` tool; pngjs (decode) + existing `encodePng` (encode) | AD-1, AD-3, AD-14 |
+| CAP-6 (image stamping) | `fill_document_field`; pdf-lib `drawImage` (PDF, first) / OOXML media embedding (`.docx`, second) | AD-1, AD-3 (+ a story-specific AD each, added when that story starts) |
 
 ## Deferred
 
@@ -188,3 +197,8 @@ groups/<folder>/memory/
 **Also accepted, self-documented only in-code (epic-1 retro action item AI-6):**
 
 - AD-7's literal Rule ("`list_documents` returns structured data only; rendering the pick-list is the agent's own turn") isn't what shipped — the tool pre-renders the numbered candidate text itself. The **Prevents** goal (two call sites formatting differently) is honored, since both `list_documents` and `fill_document_field`'s ambiguous-match branch call the identical `formatDocumentCandidates` helper — only the letter of the Rule differs from the implementation. Accepted as a reasonable simplification; not worth un-doing.
+
+**From `spec-1-6-save-a-reusable-signature-asset.md` (code review — blind-hunter/edge-case-hunter):**
+
+- No width/height/byte-size bound before `thresholdAndCropPng`'s O(width×height) synchronous double loop runs — a large/hostile PNG could stall the container's single JS thread for a nontrivial duration, relevant given this codebase's own heartbeat/claim-stuck timing sensitivity. Not a spec requirement (spec is silent on size limits, same posture as Story 1.1's whole-file-read acceptance); revisit if a real oversized signature image surfaces in practice.
+- A saved signature has no OKF concept file or `memory/index.md` entry (unlike `save_document`'s AD-6 shape) — by design, per the frozen spec's storage shape (just `memory/signatures/<name>.png`). This means a signature is only discoverable by an agent that already knows/guesses its exact name, not via the recall/list mechanism `list_documents` provides for saved documents. Whether the future CAP-6 stamping story needs a lookup/listing mechanism for saved signatures (a `list_signatures` tool, or folding signatures into `memory/index.md` after all) is an open question for that story's spec, not resolved here.
