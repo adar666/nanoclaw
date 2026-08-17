@@ -22,6 +22,7 @@ FR2: A user can ask about a previously saved document's content at any later poi
 FR3: A user can name a target inside a specific saved document — a Word table row (table number + row number), a Word fill-in-the-blank text line (line number, when no table matches — added post-launch after live use showed most real forms aren't tables), a PDF form field, or a PDF text line/position — plus a value, and the agent produces an updated copy of the document with that value applied, delivered back in chat. If the target document is ambiguous, the same numbered disambiguation as FR2 applies first.
 FR4: A user can save and fill a legacy `.doc` (binary Word 97-2003) file the same as a `.docx` — save/recall extracts its text directly; a fill request converts it to `.docx` first (LibreOffice headless, one-time) then reuses FR3's `.docx` targeting, always returning `.docx` (never a reconstructed `.doc`), disclosed to the user.
 FR5: A user can send an image of their handwritten signature and have the agent strip its near-white background to transparent, crop it tightly to its own bounding box, and store it as a named, reusable signature asset under the requesting agent group's memory — so it can be referenced by name in a later fill request instead of resending the image.
+FR6: A user can ask the agent to stamp a saved signature (optionally together with a text value like a date) into a specific saved document, at the same target a text-only fill would use — for a PDF: an AcroForm field, a text-layer line, or a pixel position on a scanned page. (`.docx` stamping is a separate, later story — see spine AD-14/Constraints for the sequencing decision.)
 
 ### NonFunctional Requirements
 
@@ -49,6 +50,7 @@ NFR7: When the target saved document is ambiguous, the agent presents a numbered
 - **AD-12** Docx fill-in-the-blank text lines (a paragraph with an underscore run or trailing colon/blank, no matching table) get their own targeting mode, distinct from AD-5's table-cell editing — same two-call discovery pattern as AD-4's PDF text-layer branch. Added post-launch: live production use showed real-world forms are built this way far more often than as Word tables.
 - **AD-13** `.doc` support: `word-extractor` (pure-JS, base-image dependency) extracts text for the read path (save/recall) — no LibreOffice needed there. `libreoffice-writer` (apt system dependency, headless) converts `.doc`→`.docx` once for the fill path, after which the existing docx fill pipeline (AD-5/AD-12) runs unchanged. Output is always `.docx`, never a reconstructed `.doc`. User-approved despite the container image size cost; `soffice`-dependent tests must detect its absence and skip gracefully since the host `bun test` sandbox has no LibreOffice installed.
 - **AD-14** New `save_signature` MCP tool: decodes an input PNG (`pngjs`, pure JS), thresholds near-white pixels to `alpha: 0` (fixed luminance cutoff, not configurable), computes the bounding box of remaining non-transparent pixels, crops to it, and writes to `groups/<folder>/memory/signatures/<name>.png` — reuses `documents.ts`'s existing hand-rolled `encodePng` (Story 1.1's scanned-PDF render path) for the write side. Same per-agent-group storage scoping as `memory/documents/` — no cross-group read; a signature usable from more than one group is saved once per group, response text makes this explicit.
+- **AD-15** `fill_document_field` gains an optional `signatureName` argument, PDF-only in this story: resolves `memory/signatures/<name>.png` by exact filename match (directory-listed on a miss, for a usable error), embeds it via `pdf-lib`'s `pdfDoc.embedPng` + `page.drawImage`, and places it at whichever PDF target the call already resolves to (AcroForm field → the field's widget rectangle; text-layer line → same x/y as a text draw would use; scanned-page pixel position → same pixelX/pixelY conversion as a text draw). A fixed max-height (not a new argument) with aspect ratio preserved from the source PNG's natural pixel dimensions. `value` may be given alongside `signatureName` to draw a text value (e.g. a date) immediately beside the image, reusing the existing per-target text-draw logic offset by the image's drawn width. `signatureName` against a `.docx`/`.doc` document declines clearly — that stamping mode is a separate, later story (spine Constraints).
 - New `container/skills/document-memory/SKILL.md` (agent-facing prose, same shape as `audio-report/SKILL.md`) teaches the agent when/how to call the three tools and how to run the numbered-pick-list disambiguation.
 - Deferred (spine-acknowledged, not built now): whether an edit refreshes the stored raw copy and/or stored extracted text (default: neither — a re-save is a separate, unspecified action); OCR fallback if agent-vision reading proves insufficient in practice; multi-file/batch fill operations; version history/undo for edited documents.
 
@@ -65,6 +67,7 @@ N/A — no UX design contract exists and none is needed. This feature has no UI 
 | FR3 | CAP-3 | AD-1, AD-2, AD-3, AD-4, AD-5, AD-7, AD-8, AD-10, AD-12 |
 | FR4 | CAP-4 | AD-1, AD-3, AD-13 |
 | FR5 | CAP-5 | AD-1, AD-14 |
+| FR6 | CAP-6 | AD-1, AD-15 |
 | NFR1, NFR2, NFR3 | CAP-1, CAP-3 | AD-4, AD-5 |
 | NFR4 | CAP-1, CAP-2 | AD-6 |
 | NFR5 | CAP-3 | (existing `send_file`, unchanged) |
@@ -75,7 +78,7 @@ N/A — no UX design contract exists and none is needed. This feature has no UI 
 
 ### Epic 1: Document Memory + Fill-In Editing
 Users can send a Word or PDF file, have the agent remember it (file + extracted content, recallable later), and ask the agent to fill a named row/field/line with a value and get back an updated document — all through one new MCP-tool surface sharing one library stack and one storage shape.
-**FRs covered:** FR1, FR2, FR3, FR4, FR5
+**FRs covered:** FR1, FR2, FR3, FR4, FR5, FR6
 
 ### FR Coverage Map
 
@@ -84,6 +87,7 @@ FR2: Epic 1 - Recall a previously saved document's content, with numbered disamb
 FR3: Epic 1 - Fill a named target in a saved document and return the updated file
 FR4: Epic 1 - Save and fill a legacy `.doc` file via conversion
 FR5: Epic 1 - Save a handwritten signature as a reusable, background-stripped, cropped image asset
+FR6: Epic 1 - Stamp a saved signature (+ optional text) into a saved PDF, at whatever target a text fill would use
 
 ## Epic 1: Document Memory + Fill-In Editing
 
@@ -269,3 +273,35 @@ So that I can reference it by name later to stamp documents without resending th
 **Given** the user wants the same signature usable from more than one agent group (e.g. both a household group and a personal DM group)
 **When** they ask the agent to save it in each
 **Then** the agent saves it separately in each group's own `memory/signatures/`, and its response makes plain that no cross-group sharing occurred (spec non-goal, AD-14)
+
+### Story 1.7: Stamp a Saved Signature into a Saved PDF
+
+As a NanoClaw user,
+I want to tell my agent to sign (and optionally date) a PDF I've already saved, using a signature I saved earlier,
+So that I get back a signed document without printing, signing by hand, and rescanning it.
+
+**Acceptance Criteria:**
+
+**Given** a saved PDF with a matching AcroForm field and a saved signature name
+**When** the user asks to stamp that field with the signature
+**Then** `fill_document_field` embeds the signature image at the field's widget rectangle on the page (aspect ratio preserved, fixed max-height) and returns a new PDF — the field itself is not filled with text (FR6, AD-15)
+
+**Given** a saved PDF with a text-layer line and a saved signature name, no matching AcroForm field
+**When** the user asks to stamp that line with the signature
+**Then** the image is drawn at the same position a text draw would use for that line, and the rest of the page is untouched
+
+**Given** a saved, scanned (no text layer) PDF and a saved signature name with a pixel position
+**When** the user asks to stamp that position with the signature
+**Then** the image is drawn at the pixel-converted PDF position, same conversion a text draw would use
+
+**Given** a signature name and a text `value` (e.g. a date) given together for the same target
+**When** `fill_document_field` runs
+**Then** the image is drawn at the target position and the text is drawn immediately beside it — both in one new PDF, one call
+
+**Given** a `signatureName` that doesn't match any file under `memory/signatures/`
+**When** `fill_document_field` runs
+**Then** it declines clearly, listing the signature names that do exist (or that none are saved yet) — never guesses or silently skips the stamp
+
+**Given** a `signatureName` argument on a `.docx` or `.doc` document
+**When** `fill_document_field` runs
+**Then** it declines clearly that signature stamping into Word documents isn't supported yet (spine Constraints — that's a separate, later story)

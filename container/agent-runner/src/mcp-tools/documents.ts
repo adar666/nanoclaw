@@ -1758,11 +1758,85 @@ async function pdfListLines(rawPath: string): Promise<ReturnType<typeof ok> | Re
   return ok(linesPart + formatFieldNamesNote(fieldNames));
 }
 
+// ---------------------------------------------------------------------------
+// Signature stamping (Story 1.7) — draws a saved signature PNG (from
+// save_signature, Story 1.6) at whichever of the three PDF fill targets
+// below the call already resolves to, via pdf-lib's embedPng/drawImage.
+// PDF-only; a .docx/.doc call with signatureName is rejected earlier by
+// PDF_ONLY_ARGS (fillDocumentFieldImpl), before fillPdf is ever reached.
+// ---------------------------------------------------------------------------
+
+/**
+ * A signature stamped next to a line of ~11pt text shouldn't dominate the
+ * page — roughly 3-4 lines of body text tall (Design Notes' 40-50pt
+ * ballpark). Only used for the two free-form targets (text-layer line,
+ * scanned-page pixel position); the AcroForm target instead fits the image
+ * to its own widget rectangle (see pdfFillAcroForm).
+ */
+const SIGNATURE_MAX_HEIGHT_PT = 45;
+
+/** Horizontal gap (points) between a target's existing content and a stamped image/value — the pre-existing pdfFillLine convention, now shared by all three PDF fill targets. */
+const FILL_GAP_PT = 8;
+
+/**
+ * Resolves `signatureName` to a saved signature's PNG bytes under
+ * `memory/signatures/<name>.png` — exact filename match only, no
+ * fuzzy/topic matching (unlike `document`). A path separator can never
+ * appear in a name save_signature itself produced (slugify() only emits
+ * a-z/0-9/-), so treat one as an automatic miss rather than resolving it
+ * against the filesystem at all — signatureName is model-controlled input,
+ * same class of risk as save_document's `path` argument.
+ */
+function resolveSignaturePng(baseDir: string, name: string): { bytes: Buffer } | { error: string } {
+  const signaturesDir = path.join(baseDir, 'memory', 'signatures');
+
+  const listAvailable = (): string[] => {
+    try {
+      return fs
+        .readdirSync(signaturesDir)
+        .filter((f) => f.toLowerCase().endsWith('.png'))
+        .map((f) => f.slice(0, -4));
+    } catch {
+      return [];
+    }
+  };
+
+  const notFound = (): { error: string } => {
+    const names = listAvailable();
+    return {
+      error:
+        `No saved signature named "${name}". ` +
+        (names.length > 0
+          ? `Saved signatures: ${names.join(', ')}.`
+          : 'No signatures are saved yet — use save_signature first.'),
+    };
+  };
+
+  if (name.includes('/') || name.includes('\\')) return notFound();
+
+  const filePath = path.join(signaturesDir, `${name}.png`);
+  if (!fs.existsSync(filePath)) return notFound();
+
+  try {
+    return { bytes: fs.readFileSync(filePath) };
+  } catch (e) {
+    return { error: `Could not read saved signature "${name}": ${e instanceof Error ? e.message : String(e)}` };
+  }
+}
+
+/** Describes what was stamped, for the ok() confirmation message — "the signature", "the signature and "X"", or just "X". */
+function describeStamp(hasSignature: boolean, value: string | undefined): string {
+  const signaturePart = hasSignature ? 'the signature' : undefined;
+  const valuePart = value !== undefined ? `"${value}"` : undefined;
+  return [signaturePart, valuePart].filter(Boolean).join(' and ');
+}
+
 async function pdfFillLine(
   rawPath: string,
   meta: DocumentMeta,
   lineNumber: number,
-  value: string,
+  value: string | undefined,
+  signaturePng: Buffer | undefined,
   opts: FillOpts,
 ): Promise<ReturnType<typeof ok> | ReturnType<typeof err>> {
   const lines = await pdfExtractLinesAllPages(rawPath);
@@ -1772,23 +1846,43 @@ async function pdfFillLine(
   const { PDFDocument } = await import('pdf-lib');
   const pdfDoc = await PDFDocument.load(fs.readFileSync(rawPath));
   const page = pdfDoc.getPages()[target.pageIndex];
-  const gapPt = 8;
-  const drawX = target.endX + gapPt;
+  const drawX = target.endX + FILL_GAP_PT;
   if (drawX > page.getWidth()) {
     return err(
-      `Line ${lineNumber}'s existing content already reaches the page's right edge — no room to draw "${value}" ` +
-        'after it on the same line.',
+      `Line ${lineNumber}'s existing content already reaches the page's right edge — no room to draw ` +
+        `${describeStamp(signaturePng !== undefined, value)} after it on the same line.`,
     );
   }
 
-  const fonts = await embedTextFonts(pdfDoc, HEBREW_RANGE.test(value));
-  drawUnicodeText(page, value, drawX, target.y, 11, fonts);
+  let cursorX = drawX;
+  if (signaturePng !== undefined) {
+    const image = await pdfDoc.embedPng(signaturePng);
+    const { width, height } = image.scale(SIGNATURE_MAX_HEIGHT_PT / image.height);
+    // The anchor-x check above only validates drawX itself (where the
+    // *text* draw would start) — a wide-aspect signature scaled to a fixed
+    // height can still carry drawX + width past the right edge, or
+    // target.y + height past the top, even when drawX alone was fine. The
+    // image's full bounding box has to fit inside the page's MediaBox on
+    // both axes, or it's declined rather than drawn (partially) off-page.
+    if (drawX + width > page.getWidth() || target.y < 0 || target.y + height > page.getHeight()) {
+      return err(
+        `The signature (${Math.round(width)}x${Math.round(height)}pt) would run off the page's edge if drawn ` +
+          `after line ${lineNumber} — no room to place it there.`,
+      );
+    }
+    page.drawImage(image, { x: drawX, y: target.y, width, height });
+    cursorX = drawX + width + FILL_GAP_PT;
+  }
+  if (value !== undefined) {
+    const fonts = await embedTextFonts(pdfDoc, HEBREW_RANGE.test(value));
+    drawUnicodeText(page, value, cursorX, target.y, 11, fonts);
+  }
 
   const outBytes = Buffer.from(await pdfDoc.save());
   const outPath = writeFillOutput(opts.baseDir, meta.slug, 'pdf', outBytes);
   return ok(
-    `Drew "${value}" right after line ${lineNumber} ("${target.text}") on "${meta.slug}". New file at ${outPath} — ` +
-      'call send_file to deliver it.',
+    `Drew ${describeStamp(signaturePng !== undefined, value)} right after line ${lineNumber} ("${target.text}") on ` +
+      `"${meta.slug}". New file at ${outPath} — call send_file to deliver it.`,
   );
 }
 
@@ -1827,7 +1921,8 @@ async function pdfFillPixel(
   meta: DocumentMeta,
   pixelX: number,
   pixelY: number,
-  value: string,
+  value: string | undefined,
+  signaturePng: Buffer | undefined,
   opts: FillOpts,
 ): Promise<ReturnType<typeof ok> | ReturnType<typeof err>> {
   const { PDFDocument } = await import('pdf-lib');
@@ -1849,22 +1944,44 @@ async function pdfFillPixel(
   const pdfX = (pixelX / imageWidthPx) * pageWidthPts;
   const pdfY = pageHeightPts - (pixelY / imageHeightPx) * pageHeightPts;
 
-  const fonts = await embedTextFonts(pdfDoc, HEBREW_RANGE.test(value));
-  drawUnicodeText(page, value, pdfX, pdfY, 11, fonts);
+  let cursorX = pdfX;
+  if (signaturePng !== undefined) {
+    const image = await pdfDoc.embedPng(signaturePng);
+    const { width, height } = image.scale(SIGNATURE_MAX_HEIGHT_PT / image.height);
+    // Same full-bounding-box check as pdfFillLine — the pixel-position
+    // bounds check above only validated the anchor point itself, not the
+    // sized image's far edges.
+    if (pdfX + width > pageWidthPts || pdfY < 0 || pdfY + height > pageHeightPts) {
+      return err(
+        `The signature (${Math.round(width)}x${Math.round(height)}pt) would run off the page's edge if drawn at ` +
+          'the position you specified — pick a position with more room around it.',
+      );
+    }
+    page.drawImage(image, { x: pdfX, y: pdfY, width, height });
+    cursorX = pdfX + width + FILL_GAP_PT;
+  }
+  if (value !== undefined) {
+    const fonts = await embedTextFonts(pdfDoc, HEBREW_RANGE.test(value));
+    drawUnicodeText(page, value, cursorX, pdfY, 11, fonts);
+  }
 
   const outBytes = Buffer.from(await pdfDoc.save());
   const outPath = writeFillOutput(opts.baseDir, meta.slug, 'pdf', outBytes);
-  return ok(`Drew "${value}" at the position you specified on "${meta.slug}". New file at ${outPath} — call send_file to deliver it.`);
+  return ok(
+    `Drew ${describeStamp(signaturePng !== undefined, value)} at the position you specified on "${meta.slug}". ` +
+      `New file at ${outPath} — call send_file to deliver it.`,
+  );
 }
 
 async function pdfFillAcroForm(
   rawPath: string,
   meta: DocumentMeta,
   fieldName: string,
-  value: string,
+  value: string | undefined,
+  signaturePng: Buffer | undefined,
   opts: FillOpts,
 ): Promise<ReturnType<typeof ok> | ReturnType<typeof err>> {
-  const { PDFDocument } = await import('pdf-lib');
+  const { PDFDocument, PDFDict } = await import('pdf-lib');
   const pdfDoc = await PDFDocument.load(fs.readFileSync(rawPath));
   const form = pdfDoc.getForm();
 
@@ -1876,12 +1993,94 @@ async function pdfFillAcroForm(
     );
   }
 
+  // Shared by both the image and text-value cases: signature stamping
+  // reuses the exact same field-type validation the plain text-fill path
+  // already relied on, rather than accepting any field type (checkbox/
+  // radio/dropdown) and silently picking an arbitrary widget/position off
+  // of it.
   let textField: ReturnType<typeof form.getTextField>;
   try {
     textField = form.getTextField(fieldName);
   } catch (e) {
     return err(`Field "${fieldName}" exists but isn't a fillable text field: ${e instanceof Error ? e.message : String(e)}`);
   }
+
+  if (signaturePng !== undefined) {
+    // Image case: the field's own widget rectangle is used to size/center
+    // the image (scale-to-fit, aspect ratio preserved) — the field's text
+    // is left unset (image and text-fill are mutually exclusive for one
+    // field in one call, per the frozen Boundaries).
+    const widgets = field.acroField.getWidgets();
+    if (widgets.length !== 1) {
+      return err(
+        `Field "${fieldName}" has ${widgets.length} widgets — signature stamping only supports a ` +
+          'single-widget text field currently.',
+      );
+    }
+    const widget = widgets[0];
+    const rect = widget.getRectangle();
+    if (rect.width <= 0 || rect.height <= 0) {
+      return err(
+        `Field "${fieldName}"'s widget has a degenerate rectangle (${rect.width}x${rect.height}pt) — cannot ` +
+          'size an image within it.',
+      );
+    }
+
+    // Resolve which page the widget is on. The widget's own /P entry is
+    // the fast path (populated by pdf-lib itself, and by many PDF
+    // producers); a single-page document short-circuits to its only page
+    // (the overwhelmingly common case for a saved, simple form); otherwise
+    // fall back to scanning each page's /Annots array for a reference that
+    // dereferences to this exact widget dict (some producers legally omit
+    // /P — see Design Notes). A malformed Annots entry (not itself a
+    // dereferenceable dict — legal-but-atypical) is skipped rather than
+    // left to throw and surface as a generic top-level error.
+    const pages = pdfDoc.getPages();
+    let page = pages.find((p) => p.ref === widget.P());
+    if (!page && pages.length === 1) page = pages[0];
+    if (!page) {
+      for (const candidate of pages) {
+        const annots = candidate.node.Annots();
+        if (!annots) continue;
+        for (let i = 0; i < annots.size(); i++) {
+          let candidateDict: unknown;
+          try {
+            candidateDict = annots.lookup(i, PDFDict);
+          } catch {
+            continue;
+          }
+          if (candidateDict === widget.dict) {
+            page = candidate;
+            break;
+          }
+        }
+        if (page) break;
+      }
+    }
+    if (!page) {
+      return err(`Could not determine which page field "${fieldName}"'s widget is on — cannot place an image on it.`);
+    }
+
+    const image = await pdfDoc.embedPng(signaturePng);
+    const { width: imgWidth, height: imgHeight } = image.scaleToFit(rect.width, rect.height);
+    const imgX = rect.x + (rect.width - imgWidth) / 2;
+    const imgY = rect.y + (rect.height - imgHeight) / 2;
+    page.drawImage(image, { x: imgX, y: imgY, width: imgWidth, height: imgHeight });
+
+    if (value !== undefined) {
+      const fonts = await embedTextFonts(pdfDoc, HEBREW_RANGE.test(value));
+      drawUnicodeText(page, value, imgX + imgWidth + FILL_GAP_PT, imgY, 11, fonts);
+    }
+
+    const outBytes = Buffer.from(await pdfDoc.save());
+    const outPath = writeFillOutput(opts.baseDir, meta.slug, 'pdf', outBytes);
+    return ok(
+      `Stamped ${describeStamp(true, value)} into field "${fieldName}" on "${meta.slug}" (field text left unset). ` +
+        `New file at ${outPath} — call send_file to deliver it.`,
+    );
+  }
+
+  if (value === undefined) return err('value or signatureName is required together with fieldName.');
 
   textField.setText(value);
   const fonts = await embedTextFonts(pdfDoc, HEBREW_RANGE.test(value));
@@ -1903,6 +2102,20 @@ async function fillPdf(
   const lineNumber = typeof args.lineNumber === 'number' ? args.lineNumber : undefined;
   const pixelX = typeof args.pixelX === 'number' ? args.pixelX : undefined;
   const pixelY = typeof args.pixelY === 'number' ? args.pixelY : undefined;
+  const signatureNameRaw = typeof args.signatureName === 'string' ? args.signatureName : undefined;
+  const signatureName = signatureNameRaw?.trim();
+  if (signatureNameRaw !== undefined && !signatureName) return err('signatureName cannot be empty.');
+
+  // Resolved once here (Code Map), regardless of which target branch below
+  // ends up being picked — a "no target given" discovery call still gets
+  // this validated up front, but its response is otherwise unmodified (the
+  // resolved bytes are simply unused on that path).
+  let signaturePng: Buffer | undefined;
+  if (signatureName !== undefined) {
+    const resolved = resolveSignaturePng(opts.baseDir, signatureName);
+    if ('error' in resolved) return err(resolved.error);
+    signaturePng = resolved.bytes;
+  }
 
   // Priority 1: AcroForm field — if fieldName is given at all, this is the
   // only path tried; a mismatch is a clear error, never a silent fall
@@ -1911,8 +2124,10 @@ async function fillPdf(
   // they find, so the caller can discover and use this path next time —
   // see getAcroFormTextFieldNames/formatFieldNamesNote.)
   if (fieldName !== undefined) {
-    if (value === undefined) return err('value is required together with fieldName.');
-    return pdfFillAcroForm(rawPath, meta, fieldName, value, opts);
+    if (value === undefined && signaturePng === undefined) {
+      return err('value or signatureName is required together with fieldName.');
+    }
+    return pdfFillAcroForm(rawPath, meta, fieldName, value, signaturePng, opts);
   }
 
   let pdfText: string;
@@ -1925,14 +2140,18 @@ async function fillPdf(
   // Priority 2: text layer with no matching field requested — line overlay.
   if (hasTextLayer(pdfText)) {
     if (lineNumber === undefined) return pdfListLines(rawPath);
-    if (value === undefined) return err('value is required together with lineNumber.');
-    return pdfFillLine(rawPath, meta, lineNumber, value, opts);
+    if (value === undefined && signaturePng === undefined) {
+      return err('value or signatureName is required together with lineNumber.');
+    }
+    return pdfFillLine(rawPath, meta, lineNumber, value, signaturePng, opts);
   }
 
   // Priority 3: no text layer at all — scanned-page pixel overlay.
   if (pixelX === undefined || pixelY === undefined) return pdfRenderForOverlay(rawPath, meta, opts);
-  if (value === undefined) return err('value is required together with pixelX/pixelY.');
-  return pdfFillPixel(rawPath, meta, pixelX, pixelY, value, opts);
+  if (value === undefined && signaturePng === undefined) {
+    return err('value or signatureName is required together with pixelX/pixelY.');
+  }
+  return pdfFillPixel(rawPath, meta, pixelX, pixelY, value, signaturePng, opts);
 }
 
 // ---------------------------------------------------------------------------
@@ -2102,7 +2321,7 @@ async function fillDoc(
 // its pre-existing Story 1.2 use for a .pdf text-layer line) — it belongs in neither
 // file-type-exclusive list below.
 const DOCX_ONLY_ARGS = ['table', 'row', 'column'] as const;
-const PDF_ONLY_ARGS = ['fieldName', 'pixelX', 'pixelY'] as const;
+const PDF_ONLY_ARGS = ['fieldName', 'pixelX', 'pixelY', 'signatureName'] as const;
 
 function presentArgNames(args: Record<string, unknown>, keys: readonly string[]): string[] {
   return keys.filter((k) => args[k] !== undefined);
@@ -2183,7 +2402,11 @@ export const fillDocumentField: McpToolDefinition = {
       'blanks). Never pass row/table together with lineNumber. For a .pdf: targets an AcroForm field (fieldName) ' +
       'if the PDF has one matching, otherwise a text-layer line (a first call with no lineNumber returns the ' +
       'detected lines to choose from) or, for a scanned PDF, a pixel position on a rendered page (a first call ' +
-      'with no pixelX/pixelY renders page 1 and returns its pixel dimensions). For a legacy .doc: converts it to ' +
+      'with no pixelX/pixelY renders page 1 and returns its pixel dimensions). For a .pdf, "signatureName" ' +
+      '(instead of, or together with, "value") stamps a signature already saved via save_signature at that same ' +
+      'target — image only for the AcroForm case (the field\'s text is left unset), image plus text beside it ' +
+      'if "value" is also given for the line/pixel cases. Signature stamping is PDF-only; not yet available for ' +
+      '.docx/.doc. For a legacy .doc: converts it to ' +
       '.docx once (via LibreOffice), then applies the same .docx targeting rules above — the returned file is ' +
       'always .docx, never a reconstructed .doc.',
     inputSchema: {
@@ -2235,6 +2458,14 @@ export const fillDocumentField: McpToolDefinition = {
         pixelY: {
           type: 'number',
           description: '.pdf, scanned only: y pixel position (from top-left) on the rendered page-1 image.',
+        },
+        signatureName: {
+          type: 'string',
+          description:
+            '.pdf only: the exact name of a signature already saved via save_signature (matches ' +
+            'memory/signatures/<name>.png exactly — no fuzzy matching). Stamps that signature image at whichever ' +
+            'of fieldName/lineNumber/pixelX+pixelY the call resolves to. Give "value" alongside it to also draw ' +
+            'text (e.g. a date) right beside the image in the same call. Not supported for .docx/.doc.',
         },
       },
       required: ['document'],
