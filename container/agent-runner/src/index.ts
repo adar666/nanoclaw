@@ -35,12 +35,19 @@ import { MEMORY_SESSION_HOOK } from './memory/session-hook.js';
 import './providers/index.js';
 import { createProvider, type ProviderName } from './providers/factory.js';
 import { runPollLoop } from './poll-loop.js';
+import { applyTlsCertShim } from './tls-shim.js';
 
 function log(msg: string): void {
   console.error(`[agent-runner] ${msg}`);
 }
 
 const CWD = '/workspace/agent';
+
+// AD-15: must run before `createProvider()` below snapshots `process.env` —
+// that snapshot is what ultimately reaches every MCP tool's fetch() call,
+// calendar.ts's included. Module top level runs before `main()` is ever
+// invoked, so this is unconditionally the earliest point in this file.
+applyTlsCertShim();
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -84,11 +91,27 @@ async function main(): Promise<void> {
   const mcpServerPath = path.join(__dirname, 'mcp-tools', 'index.ts');
 
   // Build MCP servers config: nanoclaw built-in + any from container.json
+  //
+  // env MUST be a full process.env inheritance, not {}. The MCP SDK's
+  // StdioClientTransport spawns each server with
+  // `{ ...getDefaultEnvironment(), ...server.env }`, and
+  // getDefaultEnvironment() curates only HOME/LOGNAME/PATH/SHELL/TERM/USER
+  // (see @modelcontextprotocol/sdk's client/stdio.js) — a safe default for
+  // an arbitrary third-party MCP server, but wrong for this one: `nanoclaw`
+  // is this codebase's own first-party server (mcp-tools/index.ts), and an
+  // empty env here silently drops HTTPS_PROXY/SSL_CERT_FILE/
+  // NODE_EXTRA_CA_CERTS from the subprocess that actually runs
+  // calendar.ts's fetch() — the OneCLI gateway is never reached at all, so
+  // every gateway-proxied call fails outright regardless of the AD-15 TLS
+  // shim. `as Record<string, string>`: process.env's index signature
+  // allows `undefined` for keys that were never set, but a spread only
+  // ever copies keys that exist with an actual string value, so the cast
+  // reflects runtime reality, not a suppressed real gap.
   const mcpServers: Record<string, { command: string; args: string[]; env: Record<string, string> }> = {
     nanoclaw: {
       command: 'bun',
       args: ['run', mcpServerPath],
-      env: {},
+      env: { ...process.env } as Record<string, string>,
     },
   };
 
