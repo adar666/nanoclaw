@@ -1,20 +1,21 @@
 ---
 name: document-memory
-description: Save a Word (.docx or legacy .doc) or PDF file the user sends into this agent group's persistent memory, so its content can be recalled in a later, unrelated conversation without resending the file. Also fill a value into a table row, form field, or line of a document already saved this way and send back a new file, or recall/answer questions about what a previously saved document says. Also save a PNG image of a handwritten signature as a reusable, background-removed asset, and stamp a saved signature into a saved PDF, .docx, or .doc. Use when the user sends a Word/PDF attachment and asks to save/remember/keep it, asks to fill in / complete a blank on a document already saved, asks what a saved document says/contains, asks to summarize/recall a document already saved, sends a signature image and asks to save/remember it for reuse, or asks to sign/stamp a saved document with a saved signature.
+description: Save a Word (.docx or legacy .doc), PDF, or image (.jpg/.jpeg/.png) file the user sends into this agent group's persistent memory, so its content can be recalled in a later, unrelated conversation without resending the file. Also fill a value into a table row, form field, or line of a document already saved this way and send back a new file, or recall/answer questions about what a previously saved document says. Also save a PNG image of a handwritten signature as a reusable, background-removed asset, and stamp a saved signature into a saved PDF, .docx, or .doc. Use when the user sends a Word/PDF/image attachment and asks to save/remember/keep it, asks to fill in / complete a blank on a document already saved, asks what a saved document says/contains, asks to summarize/recall a document already saved, sends a signature image and asks to save/remember it for reuse, or asks to sign/stamp a saved document with a saved signature.
 ---
 
 # Saving a document to memory
 
 ## When to use this
 
-The user sends a `.docx`, legacy `.doc`, or `.pdf` file — shown to you as an
-inbox attachment tag like `[document: report.pdf — saved to
-/workspace/inbox/<msgId>/report.pdf]` (the exact type word before the colon
-varies by channel) — and asks something like "remember this", "save this",
-"תשמרי את זה", or otherwise wants it kept for later. This is **not** for a
-short voice note or an audio file (see the `audio-report` skill for those),
-and it only handles Word (.docx/.doc)/PDF — any other file type, say so
-plainly instead of trying to save it.
+The user sends a `.docx`, legacy `.doc`, `.pdf`, or image (`.jpg`/`.jpeg`/
+`.png`) file — shown to you as an inbox attachment tag like `[document:
+report.pdf — saved to /workspace/inbox/<msgId>/report.pdf]` (the exact type
+word before the colon varies by channel) — and asks something like
+"remember this", "save this", "תשמרי את זה", or otherwise wants it kept for
+later. This is **not** for a short voice note or an audio file (see the
+`audio-report` skill for those), and it only handles Word (.docx/.doc)/PDF/
+image files — any other file type, say so plainly instead of trying to save
+it.
 
 ## Workflow
 
@@ -27,18 +28,22 @@ plainly instead of trying to save it.
    - **Saved.** The tool copied the file into memory, extracted its text,
      and recorded it — you're done. Tell the user it's saved and can be
      asked about later without resending it.
-   - **Scanned PDF, needs your own reading.** If the PDF has no text layer
-     (a scan/photo of a document, not a real text layer), the tool renders
-     page 1 to a PNG and tells you its path and pixel dimensions instead of
-     saving anything yet — no memory entry exists at this point. **Read
-     that image yourself** with your own Read tool (you're multimodal —
-     this is not a separate OCR step, it's you looking at the page), then
-     call `save_document` again with the *same* `path` argument plus an
-     `extractedText` argument containing what you read. That second call
-     completes the save. **Only page 1 is ever rendered/read** — for a
-     multi-page scanned PDF, later pages are not captured; if the document
-     is more than one page, say so rather than implying you saved the whole
-     thing.
+   - **Scanned PDF or plain image, needs your own reading.** If the PDF has
+     no text layer (a scan/photo of a document, not a real text layer) or
+     the file is a `.jpg`/`.jpeg`/`.png` image, the tool tells you it needs
+     you to read it yourself instead of saving anything yet — no memory
+     entry exists at this point. For a scanned PDF it renders page 1 to a
+     PNG first and gives you that path; for a plain image, the uploaded
+     file itself is already what to look at, no rendering needed. **Read it
+     yourself** with your own Read tool (you're multimodal — this is not a
+     separate OCR step, it's you looking at the image), then call
+     `save_document` again with the *same* `path` argument plus an
+     `extractedText` argument containing what you read (a description, any
+     readable text, numbers, a barcode, etc.). That second call completes
+     the save. **For a scanned PDF, only page 1 is ever rendered/read** —
+     for a multi-page scanned PDF, later pages are not captured; if the
+     document is more than one page, say so rather than implying you saved
+     the whole thing.
 
 3. **Unsupported file type.** The tool declines cleanly with an error — no
    partial memory entry is ever created for a type it doesn't handle. Relay
@@ -56,12 +61,15 @@ plainly instead of trying to save it.
 
 ## What NOT to do
 
-- Don't call this for `.xlsx`, images, or plain text — only
-  `.docx`/`.doc`/`.pdf` are in scope. Decline those plainly instead of
-  calling the tool.
-- Don't try to OCR a scanned PDF yourself some other way, and don't ask the
-  user to resend it as an image — the render-and-read flow above already
-  handles it.
+- Don't call this for `.xlsx` or plain text — only `.docx`/`.doc`/`.pdf`/
+  images (`.jpg`/`.jpeg`/`.png`) are in scope. Decline those plainly
+  instead of calling the tool.
+- Don't try to OCR a scanned PDF or an image yourself some other way — the
+  render-and-read (PDF) or direct-read (image) flow above already handles
+  it.
+- A saved image cannot be filled/stamped via `fill_document_field` — there's
+  no target to fill on a plain photo. That tool is for `.docx`/`.doc`/`.pdf`
+  only.
 - Don't claim a document is saved before the tool actually confirms it (the
   scanned-PDF first call is *not* a save — only the follow-up call with
   `extractedText` is).

@@ -511,6 +511,57 @@ describe('save_document — unsupported file type', () => {
   });
 });
 
+function buildTinyPng(): Buffer {
+  const png = new PNG({ width: 2, height: 2 });
+  for (let i = 0; i < png.data.length; i += 4) {
+    png.data[i] = 10;
+    png.data[i + 1] = 20;
+    png.data[i + 2] = 30;
+    png.data[i + 3] = 255;
+  }
+  return PNG.sync.write(png);
+}
+
+describe('save_document — image (jpg/png), vision-read two-call pattern', () => {
+  it('first call asks the agent to read the image itself, without saving anything yet', async () => {
+    const filePath = writeInboxFile('receipt.png', buildTinyPng());
+
+    const result = await saveDocumentImpl({ path: filePath }, opts());
+
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('image');
+    expect(result.content[0].text).toContain('save_document again');
+    expect(fs.existsSync(path.join(baseDir, 'memory', 'documents', 'receipt.md'))).toBe(false);
+    expect(fs.existsSync(path.join(baseDir, 'memory', 'documents', 'files', 'receipt.png'))).toBe(false);
+  });
+
+  it('second call, with extractedText, completes the save', async () => {
+    const filePath = writeInboxFile('receipt.jpg', buildTinyPng());
+
+    await saveDocumentImpl({ path: filePath }, opts());
+    const result = await saveDocumentImpl(
+      { path: filePath, extractedText: 'Barcode: 123456789. Voucher for 200 ILS.' },
+      opts(),
+    );
+
+    expect(result.isError).toBeFalsy();
+    const concept = fs.readFileSync(path.join(baseDir, 'memory', 'documents', 'receipt.md'), 'utf-8');
+    expect(concept).toContain('Barcode: 123456789');
+    expect(fs.existsSync(path.join(baseDir, 'memory', 'documents', 'files', 'receipt.jpg'))).toBe(true);
+  });
+
+  it('a saved image cannot be targeted by fill_document_field — declines clearly, does not crash', async () => {
+    const filePath = writeInboxFile('receipt.png', buildTinyPng());
+    await saveDocumentImpl({ path: filePath }, opts());
+    await saveDocumentImpl({ path: filePath, extractedText: 'Barcode 123' }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'receipt', value: 'x' }, opts());
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('saved image');
+  });
+});
+
 describe('save_document — .doc with unreadable content', () => {
   it('still saves the raw file, with an extraction-failed note instead of throwing', async () => {
     // Not a real OLE2/Compound File Binary structure — word-extractor should
