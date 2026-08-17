@@ -30,6 +30,14 @@ A pain to solve: right now a user who sends a Word or PDF file to their agent ge
   - **intent:** A user can save and fill a legacy `.doc` (binary Word 97-2003) file the same way as a `.docx` — save/recall extracts its text directly (no format conversion needed for reading); a fill request converts it to `.docx` first (LibreOffice headless, one-time, at fill time) and then reuses CAP-3's `.docx` targeting (table row or fill-in-the-blank line) against the converted copy.
   - **success:** A `.doc` file saves and answers recall questions exactly like a `.docx` would. A fill request against a saved `.doc` returns a new `.docx` (not `.doc` — the legacy binary format isn't rewritten) containing the value in the right place, with the user told plainly that the returned file is `.docx`.
 
+- **CAP-5**
+  - **intent:** A user can send an image of their handwritten signature and have the agent process it (strip the near-white background to transparent, crop tightly to its own bounding box) and store it as a named, reusable signature asset — so it can be used later to stamp documents without resending the image.
+  - **success:** A signature image saves as a transparent-background, tightly-cropped PNG under a name the user chose or was told; a later fill request naming that signature can reference it by name.
+
+- **CAP-6**
+  - **intent:** A user can ask the agent to stamp a saved signature (and, together with it, a text value like a date) into a specific saved document, at the same target a text-only fill would use (a table cell, a fill-in-the-blank line, a PDF text position, or an AcroForm field) — the agent draws/embeds the image (PDF: `pdf-lib` image draw; `.docx`: an embedded OOXML media part) rather than text, delivered back in chat the same way a text fill is.
+  - **success:** A fill request naming a saved signature returns a new file with the signature image visibly placed at the correct location, everything else in the document unchanged — for both PDF and `.docx`.
+
 ## Constraints
 
 - PDF value-filling must use an overlay/stamp technique — draw the new text on top of the existing page and save as a new PDF. Parsing and reflowing PDF text in place is ruled out entirely (user-mandated, see `row-targeting-matrix.md`).
@@ -42,6 +50,9 @@ A pain to solve: right now a user who sends a Word or PDF file to their agent ge
 - PDF fill values must render correctly for non-Latin-1 scripts (Hebrew, confirmed working) via an embedded Unicode-coverage font, not just the Latin-1-only PDF standard fonts — added during implementation review, not originally planned here; see `architecture-nanoclaw-v2-2026-08-16/ARCHITECTURE-SPINE.md`'s Stack table.
 - `.doc` reading (save/recall) uses a pure-JS extraction library — no system-level conversion dependency for CAP-1/CAP-2. `.doc` filling (CAP-4) is the one path in this whole feature that needs a real document-conversion engine (LibreOffice headless) rather than a parsing library, since no practical way exists to edit the legacy binary format directly — accepted as in-scope, user-approved knowing the container image size cost.
 - A `.doc` fill always returns `.docx`, never reconstructs `.doc` — the conversion is one-directional and disclosed to the user, not silent.
+- Signature assets (CAP-5) live under `memory/signatures/<name>.png`, same per-agent-group scoping as saved documents — there is no cross-group sharing mechanism in NanoClaw's memory model, so a signature usable from more than one agent group is saved separately, once per group, by design (never silently shared across groups, which would be a real access-control surprise for a personal-signature-class asset).
+- Signature background removal is a simple luminance threshold (near-white → transparent), not general-purpose image segmentation — correct for a hand-drawn ink signature on plain paper/canvas, not scoped to handle a busy/photographed background.
+- Image stamping (CAP-6) is built as two separate, sequentially-verified pieces: PDF stamping first (straightforward with `pdf-lib`'s existing `drawImage`), then `.docx` embedding second (materially more involved — a new OOXML media part + relationship, not just a text-node splice) — never combined into one story, so each can be independently reviewed and confirmed working before the next starts.
 
 ## Non-goals
 
@@ -50,6 +61,9 @@ A pain to solve: right now a user who sends a Word or PDF file to their agent ge
 - File types other than Word (`.docx`, and `.doc` via CAP-4) and PDF (`.pdf`) — other formats (xlsx, pptx, images, plain text) are out of scope.
 - Full reflow / re-typeset PDF text editing — explicitly excluded in favor of the overlay approach.
 - Reconstructing an edited document back into the legacy `.doc` binary format — a `.doc` fill always returns `.docx`.
+- Signature verification, authentication, or any legal-validity claim about a stamped signature — this is convenience image-placement, not a digital-signature/e-signing product.
+- General-purpose background removal (photos, busy backgrounds) — CAP-5 is scoped to a simple ink-on-plain-background signature image.
+- Cross-agent-group signature sharing — each group that should be able to stamp with a signature needs it saved there separately.
 
 ## Success signal
 
