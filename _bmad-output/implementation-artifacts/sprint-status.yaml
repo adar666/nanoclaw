@@ -41,7 +41,7 @@ development_status:
   1-3-recall-a-saved-document-s-content: done
   1-4-fill-a-docx-fill-in-the-blank-text-line-no-table: done
   1-5-support-legacy-doc-files-save-recall-and-fill-via-conversion: done
-  1-6-save-a-reusable-signature-asset: in-progress
+  1-6-save-a-reusable-signature-asset: done
   epic-1-retrospective: done
 action_items:
   - id: "epic-1-retro-item-1-add-log-calls-to-list_documents-fill_doc"

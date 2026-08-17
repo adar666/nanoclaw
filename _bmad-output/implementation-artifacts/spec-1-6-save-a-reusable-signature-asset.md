@@ -2,7 +2,7 @@
 title: 'Save a Reusable Signature Asset'
 type: 'feature'
 created: '2026-08-17'
-status: 'in-progress'
+status: 'done'
 review_loop_iteration: 0
 context: []
 baseline_commit: '5f2ac53'
@@ -72,11 +72,11 @@ baseline_commit: '5f2ac53'
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `container/agent-runner/package.json` -- add `pngjs` to `dependencies` (+ types dependency/ambient `.d.ts` if needed)
-- [ ] `container/agent-runner/bun.lock` -- regenerate via `bun install`
-- [ ] `container/agent-runner/src/mcp-tools/documents.ts` -- `saveSignatureImpl` + `saveSignature` tool definition + registration; threshold/crop/encode logic; name-collision suffix handling
-- [ ] `container/agent-runner/src/mcp-tools/documents.test.ts` -- bun:test coverage for the I/O matrix above (build a small real PNG fixture with a known ink-colored region on a white background, verify transparency + crop dimensions + written file)
-- [ ] `container/skills/document-memory/SKILL.md` -- document `save_signature`
+- [x] `container/agent-runner/package.json` -- add `pngjs` to `dependencies` (+ types dependency/ambient `.d.ts` if needed)
+- [x] `container/agent-runner/bun.lock` -- regenerate via `bun install`
+- [x] `container/agent-runner/src/mcp-tools/documents.ts` -- `saveSignatureImpl` + `saveSignature` tool definition + registration; threshold/crop/encode logic; name-collision suffix handling
+- [x] `container/agent-runner/src/mcp-tools/documents.test.ts` -- bun:test coverage for the I/O matrix above (build a small real PNG fixture with a known ink-colored region on a white background, verify transparency + crop dimensions + written file)
+- [x] `container/skills/document-memory/SKILL.md` -- document `save_signature`
 
 **Acceptance Criteria:**
 - Given the story is complete, when `cd container/agent-runner && bun test` runs, then all tests pass, including a real end-to-end decode→threshold→crop→encode→write test against a hand-built PNG fixture (not just a mocked pipeline).
@@ -84,7 +84,9 @@ baseline_commit: '5f2ac53'
 
 ## Spec Change Log
 
-(none yet — record here if implementation surfaces a genuine deviation from the frozen Boundaries above)
+- 2026-08-17 (implementation, mechanism named by the spec's own Boundaries language but not spelled out): the Boundaries text says a name collision doesn't overwrite "unless the caller's request text made an explicit intent to replace" — since an MCP tool only sees args, not raw request text, an optional `replace: boolean` argument (default `false`) was added; the tool description instructs the agent to set it only when it has judged the user's message as an explicit replace/overwrite request. Not a Boundaries deviation — it's the concrete mechanism the frozen text implied but didn't name.
+
+- 2026-08-17 (code review — blind-hunter/edge-case-hunter/verification-gap, 5 patch findings applied, rest deferred): a `name` consisting entirely of characters `slugify()` strips (Hebrew-only, emoji-only, punctuation-only) previously fell through silently onto `slugify`'s generic `"document"` fallback — a real violation of the frozen Boundaries' "no silent default" line, since a name genuinely was supplied but got discarded. Now declines with a clear error unless the trimmed input was literally the word "document" (control-tested so a real signature named "document" still saves normally). `replace: true`'s overwrite path now `lstatSync`-checks the destination first and refuses if it's a symlink, rather than following it and truncating whatever it points to (narrow but real gap — nothing in this tool's own arguments can currently plant such a symlink, but the write path shouldn't trust the filesystem state blindly either). A non-string `name` argument now gets its own explicit "name must be a string" message instead of being silently coerced into the generic "name is required" text. Two tests originally named `describe('save_signature — concurrent saves, same group')` were found (by the verification-gap lens) to not actually race — `saveSignatureImpl` has no internal `await`, so `Promise.all` calls run fully sequentially under Bun/Node's event loop, never interleaving — the tests were renamed to describe what they actually prove (sequential idempotent calls), and a new test genuinely forces the `writeSignaturePng` EEXIST-retry branch via a monkey-patched `fs.writeFileSync` on one specific candidate path, asserting the catch-and-retry logic actually ran. Added decode-failure and zero-byte-`.png` test coverage (code path was already correct, just untested). **Deferred, not fixed** (logged to `ARCHITECTURE-SPINE.md`'s Deferred section): no size/dimension bound on the synchronous threshold/crop loop for a large/hostile input PNG; no OKF concept file or `memory/index.md` entry for a saved signature (by design per this story's frozen storage shape — whether a future stamping story needs a lookup/listing mechanism is that story's open question, not this one's). **Verified independently**, not just self-reported: re-ran `cd container/agent-runner && bun test` (275 pass, 7 skip [pre-existing, unrelated soffice-gated tests], 0 fail) and `pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit` (clean) myself after the patch round, before accepting the implementer's report.
 
 ## Design Notes
 
@@ -103,4 +105,17 @@ Test fixture: build a small real PNG in the test file (a handful of ink-colored 
 
 ## Suggested Review Order
 
-(filled in at story completion, once real line numbers exist)
+- Start here -- entry point, validation, name-collapse decline, threshold/crop/write orchestration.
+  [`documents.ts:798`](../../container/agent-runner/src/mcp-tools/documents.ts#L798)
+- Threshold + bounding-box crop -- the core pixel logic.
+  [`documents.ts:705`](../../container/agent-runner/src/mcp-tools/documents.ts#L705)
+- Collision-suffix write, symlink-refusal on replace, EEXIST retry.
+  [`documents.ts:754`](../../container/agent-runner/src/mcp-tools/documents.ts#L754)
+- Generalized collision-suffix helper (also used by `uniqueSlug`).
+  [`documents.ts:156`](../../container/agent-runner/src/mcp-tools/documents.ts#L156)
+- Tool definition + registration.
+  [`documents.ts:884`](../../container/agent-runner/src/mcp-tools/documents.ts#L884)
+- Test suite -- start with the name-collapse-decline and EEXIST-forced-retry blocks, the two review-round additions worth the closest look.
+  [`documents.test.ts:2117`](../../container/agent-runner/src/mcp-tools/documents.test.ts#L2117), [`documents.test.ts:2339`](../../container/agent-runner/src/mcp-tools/documents.test.ts#L2339)
+- Agent-facing usage guide.
+  [`SKILL.md`](../../container/skills/document-memory/SKILL.md)

@@ -19,12 +19,14 @@
     "jszip": "3.10.1",
     "pdf-lib": "1.17.1",
     "pdfjs-dist": "6.2.108",
+    "pngjs": "7.0.0",
     "word-extractor": "1.0.4",
     "zod": "^4.0.0"
   },
   "devDependencies": {
     "@types/bun": "^1.1.0",
     "@types/node": "^22.10.7",
+    "@types/pngjs": "6.0.5",
     "typescript": "^5.7.3"
   }
 }

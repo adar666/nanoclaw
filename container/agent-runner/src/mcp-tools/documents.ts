@@ -60,6 +60,8 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import zlib from 'zlib';
 
+import { PNG } from 'pngjs';
+
 import type { PDFDocument as PDFDocumentType, PDFFont, PDFPage, PDFTextField as PDFTextFieldType } from 'pdf-lib';
 import type JSZipType from 'jszip';
 
@@ -143,15 +145,26 @@ export function slugify(filename: string): string {
   return slug || 'document';
 }
 
-export function uniqueSlug(documentsDir: string, filename: string): string {
-  const base = slugify(filename);
+/**
+ * Generalized collision-suffix loop: the first candidate name (under `dir`,
+ * with extension `ext`) not already on disk — `base`, then `base-2`,
+ * `base-3`, ... `uniqueSlug` below is this file's original, `.md`-in-
+ * `memory/documents/`-specific caller; `save_signature` is a second,
+ * `.png`-in-`memory/signatures/` caller — both go through this one loop
+ * rather than each hand-rolling their own.
+ */
+function uniqueName(dir: string, base: string, ext: string): string {
   let candidate = base;
   let n = 2;
-  while (fs.existsSync(path.join(documentsDir, `${candidate}.md`))) {
+  while (fs.existsSync(path.join(dir, `${candidate}.${ext}`))) {
     candidate = `${base}-${n}`;
     n += 1;
   }
   return candidate;
+}
+
+export function uniqueSlug(documentsDir: string, filename: string): string {
+  return uniqueName(documentsDir, slugify(filename), 'md');
 }
 
 // ---------------------------------------------------------------------------
@@ -667,6 +680,246 @@ export async function saveDocumentImpl(
     return err(`save_document failed: ${e instanceof Error ? e.message : String(e)}`);
   }
 }
+
+// ---------------------------------------------------------------------------
+// save_signature (Story 1.6)
+//
+// Turns a photographed/drawn signature PNG into a clean, reusable asset:
+// decode via pngjs, threshold near-white pixels to fully transparent (fixed
+// luminance cutoff, not user-configurable), crop to the bounding box of what
+// survives, and write via the existing encodePng/pngChunk/crc32 helpers
+// (Story 1.1's scanned-PDF-render path) — no second PNG writer. Save-only:
+// this never stamps a signature into any document (CAP-6, future stories).
+// ---------------------------------------------------------------------------
+
+/** Fixed per-pixel luminance cutoff for background removal — not read from args (spec Boundaries). */
+const WHITE_THRESHOLD = 240;
+
+/**
+ * Thresholds near-white pixels to alpha 0 (mutates `data` in place — the
+ * caller's decoded buffer is not reused afterward), then crops to the
+ * bounding box of every pixel with alpha > 0. Returns undefined when that
+ * set is empty (nothing survived thresholding, e.g. an all-white input) —
+ * the caller declines cleanly rather than writing a zero-dimension file.
+ */
+function thresholdAndCropPng(
+  width: number,
+  height: number,
+  data: Buffer,
+): { data: Buffer; width: number; height: number } | undefined {
+  let minX = width;
+  let minY = height;
+  let maxX = -1;
+  let maxY = -1;
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = (y * width + x) * 4;
+      if (data[i] >= WHITE_THRESHOLD && data[i + 1] >= WHITE_THRESHOLD && data[i + 2] >= WHITE_THRESHOLD) {
+        data[i + 3] = 0;
+      }
+      if (data[i + 3] > 0) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+
+  if (maxX < minX || maxY < minY) return undefined;
+
+  const cropWidth = maxX - minX + 1;
+  const cropHeight = maxY - minY + 1;
+  const cropped = Buffer.alloc(cropWidth * cropHeight * 4);
+  for (let y = 0; y < cropHeight; y++) {
+    const srcStart = ((minY + y) * width + minX) * 4;
+    data.copy(cropped, y * cropWidth * 4, srcStart, srcStart + cropWidth * 4);
+  }
+
+  return { data: cropped, width: cropWidth, height: cropHeight };
+}
+
+/**
+ * Writes the cropped/encoded PNG under `signaturesDir` as `<baseSlug>.png`,
+ * or the next free `<baseSlug>-2.png`/`-3.png`/... on a name collision
+ * (unless `replace` is true, in which case any existing file at the base
+ * name is overwritten deliberately). The candidate check (uniqueName) and
+ * this write are not atomic together, so two concurrent same-name saves
+ * could both pick the same free candidate; on that race (EEXIST) this
+ * retries with the next candidate rather than one call silently clobbering
+ * the other's file — no crash and no silent overwrite either way (spec I/O
+ * matrix: concurrent same-group saves).
+ */
+function writeSignaturePng(signaturesDir: string, baseSlug: string, encoded: Buffer, replace: boolean): string {
+  if (replace) {
+    const destPath = path.join(signaturesDir, `${baseSlug}.png`);
+
+    // `replace: true` is a deliberate overwrite of a *known, existing regular
+    // file* at this exact name — not license to write through a symlink an
+    // attacker (or a stray prior operation) planted at that path, which
+    // would silently truncate whatever it points to instead. lstat (not
+    // stat) inspects the directory entry itself without following it; ENOENT
+    // just means this is a fresh name, not yet a collision at all.
+    let existingIsSymlink = false;
+    try {
+      existingIsSymlink = fs.lstatSync(destPath).isSymbolicLink();
+    } catch (e) {
+      if (errnoCode(e) !== 'ENOENT') throw e;
+    }
+    if (existingIsSymlink) {
+      throw new Error(`Refusing to overwrite "${baseSlug}.png" — it is a symlink, not a regular signature file.`);
+    }
+
+    fs.writeFileSync(destPath, encoded);
+    return baseSlug;
+  }
+
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const candidate = uniqueName(signaturesDir, baseSlug, 'png');
+    try {
+      fs.writeFileSync(path.join(signaturesDir, `${candidate}.png`), encoded, { flag: 'wx' });
+      return candidate;
+    } catch (e) {
+      if (errnoCode(e) !== 'EEXIST') throw e;
+      // Another concurrent save just took this candidate — loop and pick the next one.
+    }
+  }
+  throw new Error('Could not find a free signature filename after multiple attempts.');
+}
+
+interface SaveSignatureOpts {
+  /** `/workspace/agent` in production; a temp dir in tests. */
+  baseDir: string;
+  /** `/workspace` in production; a temp dir in tests. Also the base for the inbox containment check. */
+  workspaceRoot?: string;
+}
+
+export async function saveSignatureImpl(
+  args: Record<string, unknown>,
+  opts: SaveSignatureOpts,
+): Promise<ReturnType<typeof ok> | ReturnType<typeof err>> {
+  try {
+    const filePath = typeof args.path === 'string' ? args.path : undefined;
+    if (!filePath) return err('path is required');
+
+    if (args.name !== undefined && typeof args.name !== 'string') {
+      return err('name must be a string');
+    }
+    const name = typeof args.name === 'string' ? args.name.trim() : '';
+    if (!name) {
+      return err('name is required — ask the user what to call this signature (e.g. their own name) before saving it.');
+    }
+
+    // slugify() falls back to the literal "document" when nothing in `name`
+    // survives its a-z/0-9 filter (e.g. a Hebrew-only name, emoji-only, pure
+    // punctuation) — a real, distinct signature name in that case would
+    // silently collapse onto (and collide with) a generic "document" slug,
+    // which is exactly the invented/unstated name the spec's Boundaries rule
+    // out ("no silent default ... a signature name is a value the user
+    // chose"). Only decline when the fallback actually fired — a user who
+    // literally typed "document" is not misled by this check.
+    const baseSlug = slugify(name);
+    if (baseSlug === 'document' && name.toLowerCase() !== 'document') {
+      return err(
+        'That name has no Latin letters or digits I can turn into a filename — ask the user for a name that ' +
+          'includes at least one (e.g. a transliteration), rather than saving it under a generic name.',
+      );
+    }
+
+    if (args.replace !== undefined && typeof args.replace !== 'boolean') {
+      return err('replace must be a boolean');
+    }
+    const replace = args.replace === true;
+
+    const workspaceRoot = opts.workspaceRoot ?? '/workspace';
+    const resolution = resolveInboxPath(filePath, workspaceRoot);
+    if ('error' in resolution) return err(resolution.error);
+    const resolvedPath = resolution.path;
+
+    const originalFilename = path.basename(resolvedPath);
+    const ext = path.extname(originalFilename).slice(1).toLowerCase();
+    if (ext !== 'png') {
+      return err(
+        `Unsupported file type "${ext ? `.${ext}` : '(none)'}" — save_signature only handles PNG (.png) images.`,
+      );
+    }
+
+    let decoded: { width: number; height: number; data: Buffer };
+    try {
+      const buffer = fs.readFileSync(resolvedPath);
+      decoded = PNG.sync.read(buffer);
+    } catch (e) {
+      return err(`Could not decode PNG: ${e instanceof Error ? e.message : String(e)}`);
+    }
+
+    const cropped = thresholdAndCropPng(decoded.width, decoded.height, decoded.data);
+    if (!cropped) {
+      return err(
+        'Nothing survived background removal — every pixel was near-white, so there is no ink to crop to. ' +
+          'Declining rather than saving an empty image.',
+      );
+    }
+
+    const signaturesDir = path.join(opts.baseDir, 'memory', 'signatures');
+    fs.mkdirSync(signaturesDir, { recursive: true });
+
+    const encoded = encodePng(cropped.data, cropped.width, cropped.height);
+    const finalSlug = writeSignaturePng(signaturesDir, baseSlug, encoded, replace);
+
+    log(
+      `save_signature: saved "${name}" as "${finalSlug}" (${cropped.width}x${cropped.height}px` +
+        `${replace ? ', replace' : ''})`,
+    );
+    return ok(
+      `Saved signature "${finalSlug}" to this agent group's memory (memory/signatures/${finalSlug}.png, ` +
+        `${cropped.width}x${cropped.height}px, background removed and cropped to the ink). This signature is ` +
+        'only available in this group — it is not shared with any other agent group.',
+    );
+  } catch (e) {
+    return err(`save_signature failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+export const saveSignature: McpToolDefinition = {
+  tool: {
+    name: 'save_signature',
+    description:
+      "Save a PNG image of a handwritten signature to this agent group's persistent memory, so it can be " +
+      'reused later without resending the image. Removes a near-white background (fixed threshold, not ' +
+      'configurable) and crops tightly to the remaining ink. Save-only — this tool never places a signature ' +
+      'into any document; it only saves the asset itself. Declines cleanly for a non-PNG file, or for an image ' +
+      'with no ink left after background removal (e.g. a blank/all-white page).',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        path: {
+          type: 'string',
+          description:
+            'Path to the PNG image, as shown in the [<type>: name — saved to /workspace/inbox/...] line. Give ' +
+            'the part after /workspace/, e.g. "inbox/<msgId>/name.png" (an absolute path also works, but must ' +
+            'resolve inside /workspace/inbox).',
+        },
+        name: {
+          type: 'string',
+          description:
+            'What to call this signature (e.g. the person\'s name, "uriel"). Required — never invent one; if ' +
+            'the user did not give a name, ask for it before calling this tool.',
+        },
+        replace: {
+          type: 'boolean',
+          description:
+            'Only set true if the user explicitly asked to replace/overwrite an existing signature saved under ' +
+            'this same name. Default false: a name collision saves alongside the existing one with a numeric ' +
+            'suffix (e.g. "uriel-2") instead of overwriting it. When it is unclear whether the user wants to ' +
+            'replace the old one, ask them rather than guessing.',
+        },
+      },
+      required: ['path', 'name'],
+    },
+  },
+  handler: (args) => saveSignatureImpl(args, { baseDir: '/workspace/agent', workspaceRoot: '/workspace' }),
+};
 
 // ---------------------------------------------------------------------------
 // list_documents / fill_document_field (Story 1.2)
@@ -2020,4 +2273,4 @@ export const saveDocument: McpToolDefinition = {
   handler: (args) => saveDocumentImpl(args, { baseDir: '/workspace/agent', workspaceRoot: '/workspace' }),
 };
 
-registerTools([saveDocument, listDocuments, fillDocumentField]);
+registerTools([saveDocument, listDocuments, fillDocumentField, saveSignature]);
