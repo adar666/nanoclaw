@@ -3,8 +3,11 @@ import { execFileSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import zlib from 'zlib';
 
 import { PNG } from 'pngjs';
+
+import type JSZipType from 'jszip';
 
 import {
   slugify,
@@ -187,6 +190,46 @@ function buildSignaturePng(opts: {
     }
   }
   return PNG.sync.write(png);
+}
+
+function pngChunkForTest(type: string, data: Buffer): Buffer {
+  const typeBuf = Buffer.from(type, 'ascii');
+  const lenBuf = Buffer.alloc(4);
+  lenBuf.writeUInt32BE(data.length, 0);
+  const crcBuf = Buffer.alloc(4);
+  crcBuf.writeUInt32BE(crc32(Buffer.concat([typeBuf, data])), 0);
+  return Buffer.concat([lenBuf, typeBuf, data, crcBuf]);
+}
+
+/**
+ * A PNG with a degenerate IHDR width (0px) — not producible via pngjs' own
+ * encoder (buildSignaturePng above), which never emits a zero dimension,
+ * but a byte-valid-enough stream for pngjs' *decoder* to accept (verified:
+ * width 0 with any height > 0 decodes cleanly; a 0 *height* instead trips
+ * pngjs' own inflate-size validation before ever reaching our own guard, so
+ * this only exercises the width axis — sufficient to reach and confirm the
+ * production `dims.width <= 0 || dims.height <= 0` check, since either half
+ * of that OR is equally reachable from a real-world degenerate/corrupted
+ * source). Mirrors the hand-rolled PNG chunk writer `encodePng` in the
+ * production file, needed here since buildSignaturePng can't produce this
+ * shape at all.
+ */
+function buildDegeneratePng(width: number, height: number): Buffer {
+  const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  const ihdrData = Buffer.alloc(13);
+  ihdrData.writeUInt32BE(width, 0);
+  ihdrData.writeUInt32BE(height, 4);
+  ihdrData[8] = 8; // bit depth
+  ihdrData[9] = 6; // color type: RGBA
+  ihdrData[10] = 0; // compression method
+  ihdrData[11] = 0; // filter method
+  ihdrData[12] = 0; // interlace method
+  const ihdr = pngChunkForTest('IHDR', ihdrData);
+  const stride = width * 4;
+  const raw = Buffer.alloc((stride + 1) * height);
+  const idat = pngChunkForTest('IDAT', zlib.deflateSync(raw));
+  const iend = pngChunkForTest('IEND', Buffer.alloc(0));
+  return Buffer.concat([signature, ihdr, idat, iend]);
 }
 
 // ---------------------------------------------------------------------------
@@ -750,6 +793,152 @@ async function readDocxXml(buf: Buffer): Promise<string> {
   return file.async('string');
 }
 
+/** Loads a produced .docx's raw JSZip instance, for inspecting whichever parts (rels, content-types, media) a test needs beyond word/document.xml. */
+async function loadDocxZip(buf: Buffer): Promise<JSZipType> {
+  const JSZip = (await import('jszip')).default;
+  return JSZip.loadAsync(buf);
+}
+
+/**
+ * A minimal .docx whose word/media/ already has an image1.png and whose
+ * word/_rels/document.xml.rels already has a matching rId1 image
+ * relationship (plus a [Content_Types].xml that already declares the PNG
+ * default) — used to confirm a new signature stamp picks the next free
+ * filename/rId/content-type state without colliding with or duplicating
+ * any of this pre-existing entry.
+ */
+function buildDocxWithExistingImage(tables: string[][][]): Buffer {
+  const body = tables.map(tableXml).join('');
+  const documentXml =
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' +
+    '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">' +
+    `<w:body>${body}<w:p><w:r><w:drawing>` +
+    '<wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">' +
+    '<wp:docPr id="1" name="Picture 1"/>' +
+    '</wp:inline></w:drawing></w:r></w:p></w:body></w:document>';
+  const relsXml =
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' +
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+    '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" ' +
+    'Target="media/image1.png"/></Relationships>';
+  const contentTypesXml =
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' +
+    '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">' +
+    '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>' +
+    '<Default Extension="xml" ContentType="application/xml"/>' +
+    '<Default Extension="png" ContentType="image/png"/></Types>';
+  const existingImage = buildSignaturePng({ width: 10, height: 10, ink: { x: 0, y: 0, w: 5, h: 5 } });
+  return buildStoredZip([
+    { name: 'word/document.xml', data: Buffer.from(documentXml, 'utf-8') },
+    { name: 'word/_rels/document.xml.rels', data: Buffer.from(relsXml, 'utf-8') },
+    { name: '[Content_Types].xml', data: Buffer.from(contentTypesXml, 'utf-8') },
+    { name: 'word/media/image1.png', data: existingImage },
+  ]);
+}
+
+/**
+ * A .docx whose [Content_Types].xml has a PNG `Override` scoped to one
+ * specific, unrelated part's PartName — but no extension-wide `Default` for
+ * `.png` — used to confirm ensurePngContentType doesn't mistake an
+ * Override's narrow scope for extension-wide PNG coverage (OPC content-type
+ * resolution: an Override only applies to its own exact PartName).
+ */
+function buildDocxWithScopedPngOverride(tables: string[][][]): Buffer {
+  const body = tables.map(tableXml).join('');
+  const documentXml =
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' +
+    '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">' +
+    `<w:body>${body}</w:body></w:document>`;
+  const contentTypesXml =
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' +
+    '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">' +
+    '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>' +
+    '<Default Extension="xml" ContentType="application/xml"/>' +
+    '<Override PartName="/word/media/image1.png" ContentType="image/png"/></Types>';
+  return buildStoredZip([
+    { name: 'word/document.xml', data: Buffer.from(documentXml, 'utf-8') },
+    { name: '[Content_Types].xml', data: Buffer.from(contentTypesXml, 'utf-8') },
+  ]);
+}
+
+/**
+ * A .docx whose existing relationship, docPr id, and Content-Types PNG
+ * Default all use single-quoted XML attribute values (spec-legal — XML
+ * allows either quote style) — used to confirm the next-free-id scans and
+ * the Default-detection regex aren't fooled by that, blind to a real
+ * collision/duplication risk a double-quote-only regex would create.
+ */
+function buildDocxWithSingleQuotedParts(tables: string[][][]): Buffer {
+  const body = tables.map(tableXml).join('');
+  const documentXml =
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' +
+    '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">' +
+    `<w:body>${body}<w:p><w:r><w:drawing>` +
+    "<wp:inline xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\">" +
+    "<wp:docPr id='7' name='Picture 7'/>" +
+    '</wp:inline></w:drawing></w:r></w:p></w:body></w:document>';
+  const relsXml =
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' +
+    "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" +
+    "<Relationship Id='rId5' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/image' " +
+    "Target='media/image5.png'/></Relationships>";
+  const contentTypesXml =
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' +
+    "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">" +
+    "<Default Extension='png' ContentType='image/png'/></Types>";
+  const existingImage = buildSignaturePng({ width: 10, height: 10, ink: { x: 0, y: 0, w: 5, h: 5 } });
+  return buildStoredZip([
+    { name: 'word/document.xml', data: Buffer.from(documentXml, 'utf-8') },
+    { name: 'word/_rels/document.xml.rels', data: Buffer.from(relsXml, 'utf-8') },
+    { name: '[Content_Types].xml', data: Buffer.from(contentTypesXml, 'utf-8') },
+    { name: 'word/media/image5.png', data: existingImage },
+  ]);
+}
+
+/**
+ * A .docx with a single table row whose *last* cell already contains a
+ * (fake but well-formed) inline image referencing rId1/image1.png — as
+ * opposed to buildDocxWithExistingImage's image, which lives in a separate
+ * paragraph outside the table entirely. Used to confirm a signature stamp
+ * targeting that exact cell appends alongside the existing image rather
+ * than corrupting or displacing it.
+ */
+function buildDocxWithImageInTargetCell(): Buffer {
+  const existingDrawingXml =
+    '<w:r><w:drawing>' +
+    '<wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">' +
+    '<wp:docPr id="1" name="Picture 1"/>' +
+    '<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">' +
+    '<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">' +
+    '<pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">' +
+    '<pic:blipFill><a:blip r:embed="rId1" ' +
+    'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"/></pic:blipFill>' +
+    '</pic:pic></a:graphicData></a:graphic>' +
+    '</wp:inline></w:drawing></w:r>';
+  const cellWithImage = `<w:tc><w:p>${existingDrawingXml}</w:p></w:tc>`;
+  const tableInner = `<w:tr>${cellXml('label')}${cellWithImage}</w:tr>`;
+  const documentXml =
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' +
+    '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">' +
+    `<w:body><w:tbl><w:tblPr/>${tableInner}</w:tbl></w:body></w:document>`;
+  const relsXml =
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' +
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+    '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" ' +
+    'Target="media/image1.png"/></Relationships>';
+  const contentTypesXml =
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' +
+    '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">' +
+    '<Default Extension="png" ContentType="image/png"/></Types>';
+  const existingImage = buildSignaturePng({ width: 10, height: 10, ink: { x: 0, y: 0, w: 5, h: 5 } });
+  return buildStoredZip([
+    { name: 'word/document.xml', data: Buffer.from(documentXml, 'utf-8') },
+    { name: 'word/_rels/document.xml.rels', data: Buffer.from(relsXml, 'utf-8') },
+    { name: '[Content_Types].xml', data: Buffer.from(contentTypesXml, 'utf-8') },
+    { name: 'word/media/image1.png', data: existingImage },
+  ]);
+}
+
 /** Returns the single contiguous region where `original` and `modified` differ. */
 function diffMiddle(original: string, modified: string): { before: string; after: string } {
   let prefix = 0;
@@ -1244,13 +1433,13 @@ describe('fill_document_field — docx, table only, bare discovery', () => {
 });
 
 describe('fill_document_field — docx text-line, lineNumber given with no value', () => {
-  it('returns the specific "value is required together with lineNumber" error', async () => {
+  it('returns the specific "value or signatureName is required together with lineNumber" error', async () => {
     const filePath = writeInboxFile('intake.docx', buildDocx(['שם: ___________']));
     await saveDocumentImpl({ path: filePath }, opts());
 
     const result = await fillDocumentFieldImpl({ document: 'intake', lineNumber: 1 }, opts());
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain('value is required together with lineNumber');
+    expect(result.content[0].text).toContain('value or signatureName is required together with lineNumber');
   });
 });
 
@@ -2980,17 +3169,325 @@ describe('fill_document_field — PDF, unknown signature name', () => {
   });
 });
 
-describe('fill_document_field — signatureName against a .docx document', () => {
-  it('declines clearly instead of attempting Word signature stamping or silently ignoring signatureName', async () => {
+// ---------------------------------------------------------------------------
+// fill_document_field — .docx/.doc signature stamping (Story 1.8)
+// ---------------------------------------------------------------------------
+
+describe('fill_document_field — .docx signature stamping, table cell target', () => {
+  it('inserts an image run into the target cell, leaves existing text untouched, and writes well-formed new zip parts', async () => {
+    const original = buildDocxWithTables([[['Name', 'John Doe']]]);
+    const filePath = writeInboxFile('report.docx', original);
+    await saveDocumentImpl({ path: filePath }, opts());
+    writeSavedSignature('uriel', buildSignaturePng({ width: 100, height: 50, ink: { x: 10, y: 10, w: 80, h: 30 } }));
+
+    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, column: 2, signatureName: 'uriel' }, opts());
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('New file at ');
+    expect(result.content[0].text).toContain('table 1, row 1, column 2');
+
+    const outPath = extractOutPath(result.content[0].text);
+    const zip = await loadDocxZip(fs.readFileSync(outPath));
+
+    const docXml = await zip.file('word/document.xml')!.async('string');
+    expect(docXml).toContain('<w:drawing>');
+    expect(docXml).toContain('<wp:inline');
+    expect(docXml).toContain('<pic:pic');
+    // Existing cell text (both cells) is untouched — an inserted run, never a replacement.
+    expect(docxXmlToText(docXml)).toContain('Name');
+    expect(docxXmlToText(docXml)).toContain('John Doe');
+
+    const relsXml = await zip.file('word/_rels/document.xml.rels')!.async('string');
+    const relMatch = /<Relationship Id="rId(\d+)" Type="[^"]*\/relationships\/image" Target="media\/(image\d+\.png)"\/>/.exec(
+      relsXml,
+    );
+    expect(relMatch).not.toBeNull();
+    const [, relId, mediaTarget] = relMatch!;
+    expect(docXml).toContain(`r:embed="rId${relId}"`);
+
+    const mediaFile = zip.file(`word/media/${mediaTarget}`);
+    expect(mediaFile).not.toBeNull();
+    const mediaBytes = await mediaFile!.async('nodebuffer');
+    expect(mediaBytes.length).toBeGreaterThan(0);
+    // Decodes as a real PNG (pngjs round-trip), not just "some bytes were written".
+    expect(() => PNG.sync.read(mediaBytes)).not.toThrow();
+
+    const contentTypesXml = await zip.file('[Content_Types].xml')!.async('string');
+    expect(contentTypesXml).toContain('<Default Extension="png" ContentType="image/png"/>');
+  });
+});
+
+describe('fill_document_field — .docx signature stamping, fill-in-the-blank line target', () => {
+  it('appends the image run right after the target paragraph, leaving the label/blank text untouched', async () => {
+    const filePath = writeInboxFile('form.docx', buildDocx(['Name: ______', 'Date: ______']));
+    await saveDocumentImpl({ path: filePath }, opts());
+    writeSavedSignature('uriel', buildSignaturePng({ width: 100, height: 50, ink: { x: 10, y: 10, w: 80, h: 30 } }));
+
+    const result = await fillDocumentFieldImpl({ document: 'form', lineNumber: 1, signatureName: 'uriel' }, opts());
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('New file at ');
+    expect(result.content[0].text).toContain('line 1');
+
+    const outPath = extractOutPath(result.content[0].text);
+    const newXml = await readDocxXml(fs.readFileSync(outPath));
+    expect(newXml).toContain('<w:drawing>');
+    // The blank itself (and the untargeted second line) are untouched.
+    expect(docxXmlToText(newXml)).toContain('Name: ______');
+    expect(docxXmlToText(newXml)).toContain('Date: ______');
+  });
+});
+
+describe('fill_document_field — .docx signature stamping, signature + value together (line target)', () => {
+  it('inserts the text run immediately after the image run, same paragraph', async () => {
+    const filePath = writeInboxFile('form.docx', buildDocx(['Date: ______']));
+    await saveDocumentImpl({ path: filePath }, opts());
+    writeSavedSignature('uriel', buildSignaturePng({ width: 100, height: 50, ink: { x: 10, y: 10, w: 80, h: 30 } }));
+
+    const result = await fillDocumentFieldImpl(
+      { document: 'form', lineNumber: 1, signatureName: 'uriel', value: '2026-08-17' },
+      opts(),
+    );
+    expect(result.isError).toBeFalsy();
+
+    const outPath = extractOutPath(result.content[0].text);
+    const newXml = await readDocxXml(fs.readFileSync(outPath));
+    const drawingIndex = newXml.indexOf('<w:drawing>');
+    const valueIndex = newXml.indexOf('2026-08-17');
+    expect(drawingIndex).toBeGreaterThan(-1);
+    expect(valueIndex).toBeGreaterThan(drawingIndex); // text run comes after the image run
+    expect(docxXmlToText(newXml)).toContain('2026-08-17');
+  });
+});
+
+describe('fill_document_field — .docx signature stamping, signature + value together (table-cell target)', () => {
+  it('inserts the text run immediately after the image run inside the target cell too', async () => {
+    const filePath = writeInboxFile('report.docx', buildDocxWithTables([[['Name', 'John Doe']]]));
+    await saveDocumentImpl({ path: filePath }, opts());
+    writeSavedSignature('uriel', buildSignaturePng({ width: 100, height: 50, ink: { x: 10, y: 10, w: 80, h: 30 } }));
+
+    const result = await fillDocumentFieldImpl(
+      { document: 'report', row: 1, column: 2, signatureName: 'uriel', value: '2026-08-17' },
+      opts(),
+    );
+    expect(result.isError).toBeFalsy();
+
+    const outPath = extractOutPath(result.content[0].text);
+    const newXml = await readDocxXml(fs.readFileSync(outPath));
+    const drawingIndex = newXml.indexOf('<w:drawing>');
+    const valueIndex = newXml.indexOf('2026-08-17');
+    expect(drawingIndex).toBeGreaterThan(-1);
+    expect(valueIndex).toBeGreaterThan(drawingIndex); // text run comes after the image run
+    // Existing cell text (both cells) is still untouched — same "additional run, never a replacement" rule.
+    expect(docxXmlToText(newXml)).toContain('Name');
+    expect(docxXmlToText(newXml)).toContain('John Doe');
+    expect(docxXmlToText(newXml)).toContain('2026-08-17');
+  });
+});
+
+describe('fill_document_field — .docx signature stamping, pre-existing image in the source document', () => {
+  it('gets a non-colliding filename/rId; the pre-existing image and its own rel/content-type entries are untouched', async () => {
+    const original = buildDocxWithExistingImage([[['a1', 'b1']]]);
+    const filePath = writeInboxFile('report.docx', original);
+    await saveDocumentImpl({ path: filePath }, opts());
+    writeSavedSignature('uriel', buildSignaturePng({ width: 100, height: 50, ink: { x: 10, y: 10, w: 80, h: 30 } }));
+
+    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, signatureName: 'uriel' }, opts());
+    expect(result.isError).toBeFalsy();
+
+    const outPath = extractOutPath(result.content[0].text);
+    const zip = await loadDocxZip(fs.readFileSync(outPath));
+
+    // The pre-existing image1.png is untouched, and a new image2.png was added alongside it.
+    expect(zip.file('word/media/image1.png')).not.toBeNull();
+    const newMediaFile = zip.file('word/media/image2.png');
+    expect(newMediaFile).not.toBeNull();
+    const originalImage1 = (await loadDocxZip(original)).file('word/media/image1.png');
+    const originalBytes = await originalImage1!.async('nodebuffer');
+    const roundTrippedBytes = await zip.file('word/media/image1.png')!.async('nodebuffer');
+    expect(roundTrippedBytes.equals(originalBytes)).toBe(true);
+
+    const relsXml = await zip.file('word/_rels/document.xml.rels')!.async('string');
+    expect(relsXml).toContain('Id="rId1"'); // pre-existing relationship untouched
+    expect(relsXml).toContain('Target="media/image1.png"');
+    expect(relsXml).toContain('Id="rId2"'); // new relationship picked the next free id
+    expect(relsXml).toContain('Target="media/image2.png"');
+
+    // The pre-existing PNG content-type default is not duplicated.
+    const contentTypesXml = await zip.file('[Content_Types].xml')!.async('string');
+    const pngDefaultCount = (contentTypesXml.match(/<Default Extension="png"/g) || []).length;
+    expect(pngDefaultCount).toBe(1);
+
+    const docXml = await zip.file('word/document.xml')!.async('string');
+    expect(docXml).toContain('r:embed="rId2"'); // the new run references the new relationship, not the old one
+  });
+});
+
+describe('fill_document_field — .docx signature stamping, target cell already contains an image', () => {
+  it('appends the new image run alongside the existing one without corrupting it', async () => {
+    const original = buildDocxWithImageInTargetCell();
+    const filePath = writeInboxFile('report.docx', original);
+    await saveDocumentImpl({ path: filePath }, opts());
+    writeSavedSignature('uriel', buildSignaturePng({ width: 100, height: 50, ink: { x: 10, y: 10, w: 80, h: 30 } }));
+
+    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, column: 2, signatureName: 'uriel' }, opts());
+    expect(result.isError).toBeFalsy();
+
+    const outPath = extractOutPath(result.content[0].text);
+    const zip = await loadDocxZip(fs.readFileSync(outPath));
+    const docXml = await zip.file('word/document.xml')!.async('string');
+
+    // Both drawings present — the pre-existing one and the newly stamped one.
+    const drawingCount = (docXml.match(/<w:drawing>/g) || []).length;
+    expect(drawingCount).toBe(2);
+    expect(docXml).toContain('r:embed="rId1"'); // pre-existing image's own reference untouched
+    expect(docXml).toContain('r:embed="rId2"'); // new image's reference, next free id
+
+    // The pre-existing media file is untouched, and a new one was added alongside it.
+    const originalImage1 = (await loadDocxZip(original)).file('word/media/image1.png');
+    const originalBytes = await originalImage1!.async('nodebuffer');
+    const roundTrippedBytes = await zip.file('word/media/image1.png')!.async('nodebuffer');
+    expect(roundTrippedBytes.equals(originalBytes)).toBe(true);
+    expect(zip.file('word/media/image2.png')).not.toBeNull();
+  });
+});
+
+describe('fill_document_field — .docx signature stamping, unknown signature name', () => {
+  it('declines and lists actual saved signature names, no file written', async () => {
     const filePath = writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]]));
     await saveDocumentImpl({ path: filePath }, opts());
     writeSavedSignature('uriel', buildSignaturePng({ width: 40, height: 20, ink: { x: 5, y: 5, w: 20, h: 10 } }));
 
-    const result = await fillDocumentFieldImpl({ document: 'report', signatureName: 'uriel' }, opts());
+    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, signatureName: 'bob' }, opts());
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain('.docx');
-    expect(result.content[0].text).toContain('signatureName');
+    expect(result.content[0].text).toContain('uriel');
     expect(fs.existsSync(path.join(baseDir, '.document-fills'))).toBe(false);
+  });
+});
+
+describe('fill_document_field — .docx signature stamping, Content-Types Override does not falsely satisfy PNG coverage', () => {
+  it('adds a Default entry even when a PNG Override exists for a different, unrelated part', async () => {
+    const original = buildDocxWithScopedPngOverride([[['a1', 'b1']]]);
+    const filePath = writeInboxFile('report.docx', original);
+    await saveDocumentImpl({ path: filePath }, opts());
+    writeSavedSignature('uriel', buildSignaturePng({ width: 40, height: 20, ink: { x: 5, y: 5, w: 20, h: 10 } }));
+
+    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, signatureName: 'uriel' }, opts());
+    expect(result.isError).toBeFalsy();
+
+    const outPath = extractOutPath(result.content[0].text);
+    const zip = await loadDocxZip(fs.readFileSync(outPath));
+    const contentTypesXml = await zip.file('[Content_Types].xml')!.async('string');
+
+    // The pre-existing, unrelated Override is untouched...
+    expect(contentTypesXml).toContain('PartName="/word/media/image1.png"');
+    // ...but a Default was still added — the Override alone doesn't cover the *new* part.
+    expect(contentTypesXml).toContain('<Default Extension="png" ContentType="image/png"/>');
+  });
+});
+
+describe('fill_document_field — .docx signature stamping, single-quoted existing XML attributes', () => {
+  it('does not collide the next rId/docPr id, and does not duplicate a single-quoted PNG Default', async () => {
+    const original = buildDocxWithSingleQuotedParts([[['a1', 'b1']]]);
+    const filePath = writeInboxFile('report.docx', original);
+    await saveDocumentImpl({ path: filePath }, opts());
+    writeSavedSignature('uriel', buildSignaturePng({ width: 40, height: 20, ink: { x: 5, y: 5, w: 20, h: 10 } }));
+
+    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, signatureName: 'uriel' }, opts());
+    expect(result.isError).toBeFalsy();
+
+    const outPath = extractOutPath(result.content[0].text);
+    const zip = await loadDocxZip(fs.readFileSync(outPath));
+
+    const relsXml = await zip.file('word/_rels/document.xml.rels')!.async('string');
+    expect(relsXml).toContain("Id='rId5'"); // pre-existing (single-quoted) relationship untouched
+    expect(relsXml).toContain('Id="rId6"'); // next free id, correctly not colliding with rId5
+
+    const docXml = await zip.file('word/document.xml')!.async('string');
+    expect(docXml).toContain('r:embed="rId6"');
+    expect(docXml).toContain('<wp:docPr id="8"'); // next free docPr id, not colliding with the existing id='7'
+
+    const contentTypesXml = await zip.file('[Content_Types].xml')!.async('string');
+    const pngDefaultCount = (contentTypesXml.match(/<Default Extension=["']png["']/g) || []).length;
+    expect(pngDefaultCount).toBe(1); // the single-quoted Default was recognized — no duplicate double-quoted one added
+  });
+});
+
+describe('fill_document_field — .docx signature stamping, degenerate signature PNG dimensions', () => {
+  it('declines cleanly instead of emitting Infinity/NaN into the drawing XML', async () => {
+    const filePath = writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]]));
+    await saveDocumentImpl({ path: filePath }, opts());
+    // Hand-placed under memory/signatures/, bypassing save_signature's own empty-bbox guard —
+    // e.g. a corrupted file, or one dropped in some other way than save_signature itself.
+    writeSavedSignature('broken', buildDegeneratePng(0, 10));
+
+    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, signatureName: 'broken' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('degenerate dimensions');
+    expect(fs.existsSync(path.join(baseDir, '.document-fills'))).toBe(false);
+  });
+});
+
+describe('fill_document_field — .docx signature stamping, existing decline conditions still apply', () => {
+  it('declines a gridSpan row exactly as it would for a plain value fill, before any image branch is reached', async () => {
+    const filePath = writeInboxFile('report.docx', buildDocxWithRawTable(gridSpanRowXml()));
+    await saveDocumentImpl({ path: filePath }, opts());
+    writeSavedSignature('uriel', buildSignaturePng({ width: 40, height: 20, ink: { x: 5, y: 5, w: 20, h: 10 } }));
+
+    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, signatureName: 'uriel' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('gridSpan');
+    expect(fs.existsSync(path.join(baseDir, '.document-fills'))).toBe(false);
+  });
+
+  it('rejects row/table together with lineNumber even when signatureName is also given', async () => {
+    const filePath = writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]]));
+    await saveDocumentImpl({ path: filePath }, opts());
+    writeSavedSignature('uriel', buildSignaturePng({ width: 40, height: 20, ink: { x: 5, y: 5, w: 20, h: 10 } }));
+
+    const result = await fillDocumentFieldImpl(
+      { document: 'report', row: 1, lineNumber: 1, signatureName: 'uriel' },
+      opts(),
+    );
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('not both');
+  });
+});
+
+describe('fill_document_field — .docx signature stamping, stored canonical copy never modified', () => {
+  it('leaves the stored .docx untouched', async () => {
+    const filePath = writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]]));
+    await saveDocumentImpl({ path: filePath }, opts());
+    writeSavedSignature('uriel', buildSignaturePng({ width: 40, height: 20, ink: { x: 5, y: 5, w: 20, h: 10 } }));
+
+    const rawPath = path.join(baseDir, 'memory', 'documents', 'files', 'report.docx');
+    const rawBefore = fs.readFileSync(rawPath);
+
+    await fillDocumentFieldImpl({ document: 'report', row: 1, signatureName: 'uriel' }, opts());
+
+    expect(fs.readFileSync(rawPath).equals(rawBefore)).toBe(true);
+  });
+});
+
+describe.skipIf(!SOFFICE_AVAILABLE)('fill_document_field — .doc signature stamping (via the unmodified conversion delegation)', () => {
+  it('stamps the signature into the converted .docx and discloses the .doc-origin note', async () => {
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'doc-signature-test-'));
+    try {
+      const docBuf = buildDocViaSoffice(work, ['Name: ______']);
+      const filePath = writeInboxFile('form.doc', docBuf);
+      await saveDocumentImpl({ path: filePath }, opts());
+      writeSavedSignature('uriel', buildSignaturePng({ width: 100, height: 50, ink: { x: 10, y: 10, w: 80, h: 30 } }));
+
+      const result = await fillDocumentFieldImpl({ document: 'form', lineNumber: 1, signatureName: 'uriel' }, opts());
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toContain('legacy .doc file');
+      expect(result.content[0].text).toContain('.docx, not a');
+
+      const outPath = extractOutPath(result.content[0].text);
+      expect(outPath.endsWith('.docx')).toBe(true);
+      const newXml = await readDocxXml(fs.readFileSync(outPath));
+      expect(newXml).toContain('<w:drawing>');
+    } finally {
+      fs.rmSync(work, { recursive: true, force: true });
+    }
   });
 });
 

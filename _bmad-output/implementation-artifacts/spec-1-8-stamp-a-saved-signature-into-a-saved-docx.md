@@ -2,7 +2,7 @@
 title: 'Stamp a Saved Signature into a Saved .docx'
 type: 'feature'
 created: '2026-08-17'
-status: 'in-progress'
+status: 'done'
 review_loop_iteration: 0
 context: []
 baseline_commit: 'd4427e4'
@@ -75,9 +75,9 @@ baseline_commit: 'd4427e4'
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `container/agent-runner/src/mcp-tools/documents.ts` -- remove stale `PDF_ONLY_ARGS` entry; new zip-part helpers; image-insertion branches in `fillDocx`/`fillDocxTextLine`
-- [ ] `container/agent-runner/src/mcp-tools/documents.test.ts` -- bun:test coverage for the I/O matrix above (real `.docx`/`.doc` fixtures + a real saved-signature PNG fixture, real zip round-trip inspection — not a mocked pipeline)
-- [ ] `container/skills/document-memory/SKILL.md` -- document `.docx`/`.doc` signature stamping
+- [x] `container/agent-runner/src/mcp-tools/documents.ts` -- remove stale `PDF_ONLY_ARGS` entry; new zip-part helpers; image-insertion branches in `fillDocx`/`fillDocxTextLine`
+- [x] `container/agent-runner/src/mcp-tools/documents.test.ts` -- bun:test coverage for the I/O matrix above (real `.docx`/`.doc` fixtures + a real saved-signature PNG fixture, real zip round-trip inspection — not a mocked pipeline)
+- [x] `container/skills/document-memory/SKILL.md` -- document `.docx`/`.doc` signature stamping
 
 **Acceptance Criteria:**
 - Given the story is complete, when `cd container/agent-runner && bun test` runs, then all tests pass, including a real produced `.docx` that's unzipped and inspected (media part present, relationship present and correctly targeted, content-type default present, `word/document.xml` contains the new drawing run) — not just "the call returned ok()".
@@ -85,7 +85,9 @@ baseline_commit: 'd4427e4'
 
 ## Spec Change Log
 
-(none yet — record here if implementation surfaces a genuine deviation from the frozen Boundaries above)
+- 2026-08-17 (implementation, unstated-but-implied behavior, not a deviation): a bare-discovery `fillDocx` call (no row/table/lineNumber) that also passes `signatureName` still resolves/validates the signature up front (consistent with `fillPdf`'s identical Story 1.7 behavior) but returns the same discovery response either way — the spec's I/O matrix doesn't name this combination explicitly, so the existing PDF precedent was mirrored rather than inventing new behavior.
+
+- 2026-08-17 (code review — blind-hunter/edge-case-hunter/verification-gap, 5 patch findings applied, rest deferred): `ensurePngContentType` previously treated ANY `<Override ContentType="image/png">` anywhere in `[Content_Types].xml` as proof PNG was already covered for the new media part — a real bug, since an `Override` is scoped to its own exact `PartName` under OPC content-type resolution and doesn't establish a default for other `.png` parts; a source `.docx` with only a scoped Override and no `Default` would have shipped the new signature image with no applicable content-type mapping at all (an invalid OOXML package). Fixed by dropping the Override check and unconditionally adding the `Default` when none exists — a redundant Default alongside an unrelated Override is harmless and still spec-legal. Three id/attribute scans (`nextRelationshipId`, `nextDocPrId`, the content-type Default-detection regex) previously assumed double-quoted XML attributes only — a legal single-quoted attribute (`Id='rId3'`) was invisible to the max-scan, a real collision risk directly against the frozen Boundaries' "never reuses an existing rId" promise; now quote-agnostic. The EMU width computation divided by the signature PNG's natural height with no zero-guard — a degenerate (0-width or 0-height) signature file, reachable if hand-placed under `memory/signatures/` bypassing `save_signature`'s own guard, produced `Infinity`/`NaN` and an invalid `cx` attribute in the emitted drawing XML; now declines clearly before computing. Added coverage for the table-cell target combined with both `signatureName` and `value` together (previously only tested via the line target) and for a pre-existing image inside the *target* cell itself (distinct from the earlier "elsewhere in the document" fixture). **Deferred, not fixed** (logged to `ARCHITECTURE-SPINE.md`'s Deferred section): no pixel-content byte comparison of the embedded image against its source (decode-validity only, same posture as Story 1.7's PDF-side deferral); no atomicity/failure-injection test for the three-part zip write (a code-structure guarantee, not adversarially tested); `nextDocPrId` only scans `word/document.xml`, not headers/footers; inserted runs carry no `<w:rPr>`/bidi hint (pre-existing convention, doubled surface in this story); no page-width-equivalent clamp on EMU width for an extreme-aspect-ratio signature (no absolute-position concept to clamp against for `.docx` inline content); the new `appendRunXmlIntoCell`/`appendRunXmlAfterParagraph` helpers duplicate the shape of the pre-existing `insertRunIntoCell`/`insertRunAfterParagraph` rather than sharing code. **Verified independently**, not just self-reported: re-ran `cd container/agent-runner && bun test` three times (310 pass, 8 skip, 0 fail each run) and `pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit` (clean) myself after the patch round, before accepting the implementer's report.
 
 ## Design Notes
 
@@ -143,4 +145,17 @@ Test fixtures: extend this file's existing `.docx` zip-based fixture builders (u
 
 ## Suggested Review Order
 
-(filled in at story completion, once real line numbers exist)
+- Start here -- `fillDocx`'s dispatch, where `signatureName` is resolved and threaded into the table-row and text-line branches.
+  [`documents.ts:1786`](../../container/agent-runner/src/mcp-tools/documents.ts#L1786)
+- The three-zip-part write, id-collision avoidance, and the degenerate-dimensions guard (the trickiest part of this story).
+  [`documents.ts:1277`](../../container/agent-runner/src/mcp-tools/documents.ts#L1277), [`documents.ts:1455`](../../container/agent-runner/src/mcp-tools/documents.ts#L1455), [`documents.ts:1494`](../../container/agent-runner/src/mcp-tools/documents.ts#L1494)
+- The inline-drawing XML shape itself.
+  [`documents.ts:1363`](../../container/agent-runner/src/mcp-tools/documents.ts#L1363)
+- Insertion points -- table cell and fill-in-the-blank line.
+  [`documents.ts:1403`](../../container/agent-runner/src/mcp-tools/documents.ts#L1403), [`documents.ts:1417`](../../container/agent-runner/src/mcp-tools/documents.ts#L1417)
+- Test suite -- start with the three review-round bug-fix blocks (Override-scope, single-quote, degenerate PNG) and the pre-existing-image/target-cell fixtures.
+  [`documents.test.ts:3366`](../../container/agent-runner/src/mcp-tools/documents.test.ts#L3366), [`documents.test.ts:3387`](../../container/agent-runner/src/mcp-tools/documents.test.ts#L3387), [`documents.test.ts:3414`](../../container/agent-runner/src/mcp-tools/documents.test.ts#L3414), [`documents.test.ts:3324`](../../container/agent-runner/src/mcp-tools/documents.test.ts#L3324)
+- `.doc`-via-conversion end-to-end (soffice-gated).
+  [`documents.test.ts:3522`](../../container/agent-runner/src/mcp-tools/documents.test.ts#L3522)
+- Agent-facing usage guide.
+  [`SKILL.md`](../../container/skills/document-memory/SKILL.md)
