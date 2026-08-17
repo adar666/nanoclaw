@@ -29,7 +29,7 @@ A pain to solve: right now, scheduling a household event means leaving the chat 
 ## Constraints
 
 - Google Calendar only — not Outlook or any other provider (user-confirmed).
-- Two named calendars only: Uriel's and Devorah's. Each authenticates with its own independent OAuth grant through the OneCLI Agent Vault — Devorah connects her own; there is no shared/delegated access through Uriel's grant (user-confirmed).
+- Two named calendars only: Uriel's and Devorah's — two separate, independently-owned Google Calendars, each addressed explicitly by name. (How access to each is authenticated is an implementation/architecture-stage detail, not a spec-level constraint — see the architecture spine's AD-2/AD-3.)
 - Credentials never pass through chat, code, or env vars — routed exclusively through the OneCLI Gateway proxy, the same pattern every other credentialed action in this codebase already uses.
 - If a request targets a calendar whose OAuth isn't connected yet (most likely Devorah's, initially), the tool declines clearly with instructions to connect it — never silently falls back to the other calendar or fails with an opaque error.
 - The target calendar (Uriel's vs Devorah's) is always an explicit selection — never inferred/guessed when a request is ambiguous about whose calendar it means; the agent asks.
