@@ -33,11 +33,66 @@ function stubFetchThrows() {
 }
 
 describe('create_calendar_event MCP tool', () => {
-  it('declares title/start/end as required', () => {
+  it('declares calendar/title/start/end as required', () => {
     expect(createCalendarEvent.tool.name).toBe('create_calendar_event');
     expect(createCalendarEvent.tool.inputSchema).toMatchObject({
-      required: ['title', 'start', 'end'],
+      required: ['calendar', 'title', 'start', 'end'],
     });
+  });
+
+  it('declines a missing calendar argument', async () => {
+    const result = await createCalendarEvent.handler({
+      title: 'x',
+      start: '2026-08-20T15:00:00',
+      end: '2026-08-20T16:00:00',
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('calendar is required');
+  });
+
+  it('declines an unknown calendar value', async () => {
+    const result = await createCalendarEvent.handler({
+      calendar: 'devora', // typo — not in CALENDAR_IDS
+      title: 'x',
+      start: '2026-08-20T15:00:00',
+      end: '2026-08-20T16:00:00',
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('Unknown calendar');
+  });
+
+  it('routes calendar: "devorah" to her calendar ID in the request URL', async () => {
+    const { calls } = stubFetch(200, {
+      summary: 'Her event',
+      start: { dateTime: '2026-08-20T12:00:00.000Z', timeZone: TIMEZONE },
+      end: { dateTime: '2026-08-20T13:00:00.000Z', timeZone: TIMEZONE },
+    });
+
+    await createCalendarEvent.handler({
+      calendar: 'devorah',
+      title: 'Her event',
+      start: '2026-08-20T15:00:00',
+      end: '2026-08-20T16:00:00',
+    });
+
+    expect(calls[0].url).toContain(encodeURIComponent('adardevora@gmail.com'));
+  });
+
+  it('routes calendar: "uriel" to /calendars/primary/ in the request URL', async () => {
+    const { calls } = stubFetch(200, {
+      summary: 'His event',
+      start: { dateTime: '2026-08-20T12:00:00.000Z', timeZone: TIMEZONE },
+      end: { dateTime: '2026-08-20T13:00:00.000Z', timeZone: TIMEZONE },
+    });
+
+    await createCalendarEvent.handler({
+      calendar: 'uriel',
+      title: 'His event',
+      start: '2026-08-20T15:00:00',
+      end: '2026-08-20T16:00:00',
+    });
+
+    expect(calls[0].url).toContain('/calendars/primary/events');
   });
 
   it('creates an event with full details and confirms with htmlLink', async () => {
@@ -53,7 +108,7 @@ describe('create_calendar_event MCP tool', () => {
       htmlLink: 'https://calendar.google.com/event?eid=abc123',
     });
 
-    const result = await createCalendarEvent.handler({
+    const result = await createCalendarEvent.handler({ calendar: 'uriel',
       title: 'Team sync',
       start,
       end,
@@ -92,7 +147,7 @@ describe('create_calendar_event MCP tool', () => {
       htmlLink: 'https://calendar.google.com/event?eid=def456',
     });
 
-    const result = await createCalendarEvent.handler({
+    const result = await createCalendarEvent.handler({ calendar: 'uriel',
       title: 'Quick call',
       start: '2026-08-20T15:00:00',
       end: '2026-08-20T16:00:00',
@@ -116,7 +171,7 @@ describe('create_calendar_event MCP tool', () => {
       htmlLink: 'https://calendar.google.com/event?eid=tz1',
     });
 
-    await createCalendarEvent.handler({ title: 'Tz check', start, end });
+    await createCalendarEvent.handler({ calendar: 'uriel', title: 'Tz check', start, end });
 
     const sentBody = JSON.parse(calls[0].init!.body as string);
     // Same conversion the tool must reuse unmodified (AD-13 / Design Notes):
@@ -138,7 +193,7 @@ describe('create_calendar_event MCP tool', () => {
     const end = '2026-08-20T19:00:00+02:00'; // 17:00 UTC — after start
     const { calls } = stubFetch(200, { summary: 'Offset check', htmlLink: 'https://calendar.google.com/event?eid=off1' });
 
-    const result = await createCalendarEvent.handler({ title: 'Offset check', start, end });
+    const result = await createCalendarEvent.handler({ calendar: 'uriel', title: 'Offset check', start, end });
 
     expect(result.isError).toBeFalsy();
     const sentBody = JSON.parse(calls[0].init!.body as string);
@@ -154,7 +209,7 @@ describe('create_calendar_event MCP tool', () => {
       connect_url: 'https://gateway.local/connect/google-calendar?agent=household',
     });
 
-    const result = await createCalendarEvent.handler({
+    const result = await createCalendarEvent.handler({ calendar: 'uriel',
       title: 'Team sync',
       start: '2026-08-20T15:00:00',
       end: '2026-08-20T16:00:00',
@@ -171,7 +226,7 @@ describe('create_calendar_event MCP tool', () => {
       manage_url: 'https://gateway.local/manage/google-calendar',
     });
 
-    const result = await createCalendarEvent.handler({
+    const result = await createCalendarEvent.handler({ calendar: 'uriel',
       title: 'Team sync',
       start: '2026-08-20T15:00:00',
       end: '2026-08-20T16:00:00',
@@ -190,7 +245,7 @@ describe('create_calendar_event MCP tool', () => {
     // connection.
     stubFetch(403, { error: { code: 403, message: 'Insufficient permission for this calendar' } });
 
-    const result = await createCalendarEvent.handler({
+    const result = await createCalendarEvent.handler({ calendar: 'uriel',
       title: 'Team sync',
       start: '2026-08-20T15:00:00',
       end: '2026-08-20T16:00:00',
@@ -206,7 +261,7 @@ describe('create_calendar_event MCP tool', () => {
   it('returns an MCP error (not a crash) for a non-2xx response with no setup URL', async () => {
     stubFetch(400, { error: { code: 400, message: 'Invalid request' } });
 
-    const result = await createCalendarEvent.handler({
+    const result = await createCalendarEvent.handler({ calendar: 'uriel',
       title: 'Bad event',
       start: '2026-08-20T15:00:00',
       end: '2026-08-20T16:00:00',
@@ -220,7 +275,7 @@ describe('create_calendar_event MCP tool', () => {
   it('declines a missing title with no partial API call attempted', async () => {
     const fn = stubFetchThrows();
 
-    const result = await createCalendarEvent.handler({
+    const result = await createCalendarEvent.handler({ calendar: 'uriel',
       start: '2026-08-20T15:00:00',
       end: '2026-08-20T16:00:00',
     });
@@ -232,7 +287,7 @@ describe('create_calendar_event MCP tool', () => {
   it('declines an empty-string title the same as a missing one', async () => {
     const fn = stubFetchThrows();
 
-    const result = await createCalendarEvent.handler({
+    const result = await createCalendarEvent.handler({ calendar: 'uriel',
       title: '',
       start: '2026-08-20T15:00:00',
       end: '2026-08-20T16:00:00',
@@ -245,7 +300,7 @@ describe('create_calendar_event MCP tool', () => {
   it('declines a missing start with no partial API call attempted', async () => {
     const fn = stubFetchThrows();
 
-    const result = await createCalendarEvent.handler({
+    const result = await createCalendarEvent.handler({ calendar: 'uriel',
       title: 'Team sync',
       end: '2026-08-20T16:00:00',
     });
@@ -257,7 +312,7 @@ describe('create_calendar_event MCP tool', () => {
   it('declines a missing end with no partial API call attempted', async () => {
     const fn = stubFetchThrows();
 
-    const result = await createCalendarEvent.handler({
+    const result = await createCalendarEvent.handler({ calendar: 'uriel',
       title: 'Team sync',
       start: '2026-08-20T15:00:00',
     });
@@ -269,7 +324,7 @@ describe('create_calendar_event MCP tool', () => {
   it('declines end == start (zero duration) with no partial API call attempted', async () => {
     const fn = stubFetchThrows();
 
-    const result = await createCalendarEvent.handler({
+    const result = await createCalendarEvent.handler({ calendar: 'uriel',
       title: 'Team sync',
       start: '2026-08-20T15:00:00',
       end: '2026-08-20T15:00:00',
@@ -282,7 +337,7 @@ describe('create_calendar_event MCP tool', () => {
   it('declines end before start with no partial API call attempted', async () => {
     const fn = stubFetchThrows();
 
-    const result = await createCalendarEvent.handler({
+    const result = await createCalendarEvent.handler({ calendar: 'uriel',
       title: 'Team sync',
       start: '2026-08-20T16:00:00',
       end: '2026-08-20T15:00:00',
@@ -295,7 +350,7 @@ describe('create_calendar_event MCP tool', () => {
   it('declines a malformed guests argument (not an array) with no partial API call attempted', async () => {
     const fn = stubFetchThrows();
 
-    const result = await createCalendarEvent.handler({
+    const result = await createCalendarEvent.handler({ calendar: 'uriel',
       title: 'Team sync',
       start: '2026-08-20T15:00:00',
       end: '2026-08-20T16:00:00',
@@ -309,7 +364,7 @@ describe('create_calendar_event MCP tool', () => {
   it('declines a guests array containing a non-string element with no partial API call attempted', async () => {
     const fn = stubFetchThrows();
 
-    const result = await createCalendarEvent.handler({
+    const result = await createCalendarEvent.handler({ calendar: 'uriel',
       title: 'Team sync',
       start: '2026-08-20T15:00:00',
       end: '2026-08-20T16:00:00',
@@ -323,7 +378,7 @@ describe('create_calendar_event MCP tool', () => {
   it('declines a guests array containing a malformed email string with no partial API call attempted', async () => {
     const fn = stubFetchThrows();
 
-    const result = await createCalendarEvent.handler({
+    const result = await createCalendarEvent.handler({ calendar: 'uriel',
       title: 'Team sync',
       start: '2026-08-20T15:00:00',
       end: '2026-08-20T16:00:00',
@@ -340,7 +395,7 @@ describe('create_calendar_event MCP tool', () => {
       htmlLink: 'https://calendar.google.com/event?eid=empty-guests',
     });
 
-    const result = await createCalendarEvent.handler({
+    const result = await createCalendarEvent.handler({ calendar: 'uriel',
       title: 'Quick call',
       start: '2026-08-20T15:00:00',
       end: '2026-08-20T16:00:00',
@@ -356,7 +411,7 @@ describe('create_calendar_event MCP tool', () => {
   it('declines an unparseable start with no partial API call attempted', async () => {
     const fn = stubFetchThrows();
 
-    const result = await createCalendarEvent.handler({
+    const result = await createCalendarEvent.handler({ calendar: 'uriel',
       title: 'Team sync',
       start: 'not-a-real-date',
       end: '2026-08-20T16:00:00',
@@ -371,7 +426,7 @@ describe('create_calendar_event MCP tool', () => {
       throw new Error('network unreachable');
     }) as unknown as typeof fetch;
 
-    const result = await createCalendarEvent.handler({
+    const result = await createCalendarEvent.handler({ calendar: 'uriel',
       title: 'Team sync',
       start: '2026-08-20T15:00:00',
       end: '2026-08-20T16:00:00',
@@ -388,7 +443,7 @@ describe('create_calendar_event MCP tool', () => {
       throw e;
     }) as unknown as typeof fetch;
 
-    const result = await createCalendarEvent.handler({
+    const result = await createCalendarEvent.handler({ calendar: 'uriel',
       title: 'Team sync',
       start: '2026-08-20T15:00:00',
       end: '2026-08-20T16:00:00',
@@ -408,7 +463,7 @@ describe('create_calendar_event MCP tool', () => {
       htmlLink: 'https://calendar.google.com/event?eid=partial-guests',
     });
 
-    const result = await createCalendarEvent.handler({
+    const result = await createCalendarEvent.handler({ calendar: 'uriel',
       title: 'Team sync',
       start: '2026-08-20T15:00:00',
       end: '2026-08-20T16:00:00',
@@ -424,7 +479,7 @@ describe('create_calendar_event MCP tool', () => {
   it('produces a sensible confirmation when the 2xx response omits htmlLink', async () => {
     stubFetch(200, { summary: 'Team sync' });
 
-    const result = await createCalendarEvent.handler({
+    const result = await createCalendarEvent.handler({ calendar: 'uriel',
       title: 'Team sync',
       start: '2026-08-20T15:00:00',
       end: '2026-08-20T16:00:00',

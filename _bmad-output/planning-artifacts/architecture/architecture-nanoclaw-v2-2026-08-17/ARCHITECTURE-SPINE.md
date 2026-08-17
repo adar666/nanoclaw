@@ -3,8 +3,8 @@ name: 'Google Calendar Read/Write'
 type: architecture-spine
 purpose: build-substrate
 altitude: feature
-paradigm: 'single-owner-per-calendar with conversational relay'
-scope: 'MCP tools for reading and writing Google Calendar events, and the cross-agent routing that lets any of three chat surfaces reach either of two independently-authenticated calendars'
+paradigm: 'single connection, Google-native calendar sharing'
+scope: 'MCP tools for reading and writing Google Calendar events, on either of two calendars reachable through one connected Google account'
 status: final
 created: '2026-08-17'
 updated: '2026-08-17'
@@ -17,25 +17,17 @@ companions: []
 
 ## Design Paradigm
 
-**Single-owner-per-calendar with conversational relay.** Each Google Calendar is connected to exactly one OneCLI agent identity (one Google OAuth grant per identity, verified as the platform's real limit — see AD-2). A calendar MCP tool call is always scoped to "the one calendar this container's identity owns" — it never selects between calendars. Reaching the *other* calendar from a different chat surface is not a tool capability at all; it's an existing conversational primitive (`send_message`, agent-to-agent) carrying a natural-language request to the surface that does own it. The tool layer stays dumb and single-purpose; routing judgment lives in personas, exactly this codebase's existing division of labor between MCP tools and agent behavior.
+**Single connection, Google-native calendar sharing.** [PIVOT, 2026-08-17 — see AD-2/AD-3] Google Calendar OAuth in OneCLI is one connection per *project*, not per agent identity (live-verified: `onecli apps get --provider google-calendar` returns a global `connection.status`, with no `--agent` scoping anywhere in the CLI surface). One Google account is connected (Uriel's, already done). Its granted `calendar.events` scope covers editing events on **any** calendar that account has access to — not just its own — so Devorah shares her calendar with Uriel's connected account (a one-time action in her own Google Calendar app, no OneCLI/OAuth involvement on her side at all). A calendar MCP tool call takes an explicit `calendar` argument (`uriel` | `devorah`) resolving to a `calendarId` (`primary`, or Devorah's own email) — the tool is a thin, stateless parameter mapping, not a routing decision. Any of the three chat surfaces can call it directly through the one connected identity; no cross-agent relay is needed anywhere in this design.
 
 ## Invariants & Rules
 
 ```mermaid
 graph LR
-    subgraph household [household — owns Uriel's calendar]
-        H[calendar.ts tools] -->|fetch, HTTPS_PROXY| GCU[Google Calendar<br/>Uriel]
+    subgraph any [any chat surface — household, dm-with-uriel, or dm-with-partner]
+        C[calendar.ts tools]
     end
-    subgraph partner [dm-with-partner — owns Devorah's calendar]
-        T[calendar.ts tools] -->|fetch, HTTPS_PROXY| GCD[Google Calendar<br/>Devorah]
-    end
-    subgraph uriel_dm [dm-with-uriel — owns neither]
-        Y[calendar.ts tools]
-    end
-    Y -.send_message, relay.-> H
-    Y -.send_message, relay.-> T
-    H -.send_message, relay.-> T
-    T -.send_message, relay.-> H
+    C -->|fetch, HTTPS_PROXY, calendarId=primary| GCU[Google Calendar — Uriel<br/>owned by the connected account]
+    C -->|fetch, HTTPS_PROXY, calendarId=devorah's email| GCD[Google Calendar — Devorah<br/>shared with the connected account]
 ```
 
 ### AD-1 — Calendar access via the existing OneCLI Gateway proxy
@@ -44,41 +36,41 @@ graph LR
 - **Prevents:** Inventing new credential plumbing (env vars, a new secret-injection path) when this codebase's established mechanism — the `onecli-gateway` container skill's transparent HTTPS proxy, already listing Google Calendar as a supported app — already covers exactly this.
 - **Rule:** Every calendar MCP tool call is a direct `fetch()` to the real Google Calendar REST API v3 URL from inside the container. No credential ever appears in tool code, chat, or an env var the agent can read — the proxy injects it at the network boundary.
 
-### AD-2 — One calendar per OneCLI identity; the tool never selects between calendars [ADOPTED, SDK-verified]
+### AD-2 — One Google connection; a `calendar` argument selects `calendarId`, never the calling identity [REVISED, 2026-08-17 pivot]
 
 - **Binds:** CAP-1, CAP-2, CAP-3
-- **Prevents:** Building multi-account/calendar-selection logic into the tool that the platform doesn't actually support — confirmed by reading `@onecli-sh/sdk@2.2.1`'s type definitions and its real call site in `src/container-runner.ts:627-629`: `applyContainerConfig(args, { agent })` binds a container's *entire* outbound network to one identity (`agentIdentifier = agentGroup.id`) for its whole process lifetime; there is no per-request agent-switching mechanism.
-- **Rule:** Every calendar MCP tool call operates on `calendarId=primary` under whichever OneCLI identity the calling container is bound to. No `calendarOwner`/`calendarId` argument exists on the tool schema — "which calendar" is answered entirely by which container the call is running in, never by an argument. (Whether OneCLI's OAuth-connect flow itself is one-grant-per-app-per-agent wasn't independently confirmed beyond the SDK/call-site evidence above — the container-binding rule is what matters here and is fully verified regardless.)
+- **Prevents:** Assuming OneCLI supports one OAuth grant per agent identity — it doesn't. Live-verified: `onecli apps get --provider google-calendar` (run with no agent-scoping, since none exists in the CLI) returns a single, project-wide `connection.status: "connected"`. `applyContainerConfig(args, { agent })`'s per-container network binding (confirmed against `@onecli-sh/sdk@2.2.1` and `src/container-runner.ts:627-629`) is still real, but moot here: every container's `HTTPS_PROXY` reaches the *same* gateway with the *same* single underlying Google account, regardless of which OneCLI identity the container is bound to.
+- **Rule:** Every calendar MCP tool call takes an explicit `calendar` argument (`uriel` | `devorah`), resolved to a `calendarId` (`primary` for Uriel's own; Devorah's own email address, `adardevora@gmail.com` per `groups/household/memory/household/people.md`, for hers — reachable because she shares her calendar with the connected account, AD-3). Which container/identity happens to be calling is irrelevant — the argument is what selects the calendar, not the caller.
 
-### AD-3 — Calendar ownership assignment and cross-person relay [user-confirmed]
+### AD-3 — Devorah's calendar is reached via Google-native sharing, not a second OAuth connection [REVISED, 2026-08-17 pivot; supersedes the original cross-agent-relay design]
 
 - **Binds:** CAP-1, CAP-2, CAP-3
-- **Prevents:** Inventing a new host-mediated multi-identity bridge (a new RPC channel) for one narrow use case, when two already-existing primitives — per-agent-group OneCLI identity (AD-2) and agent-to-agent `send_message` — compose to solve it with zero new host-side plumbing.
-- **Rule:** Uriel's Google Calendar connects under household's own OneCLI identity (the family scheduling hub). Devorah's Google Calendar connects under her own `dm-with-partner` identity ("Tina") — her own OAuth grant, never shared or delegated through Uriel's. A chat surface that is not the target calendar's owner (`dm-with-uriel` or `dm-with-partner` asking for Uriel's calendar; `household` or `dm-with-uriel` asking for Devorah's calendar) does not call a calendar tool at all — it calls the existing `send_message` tool, in natural language, to the owning agent's wired destination. The owning agent performs the real calendar action and replies via its own `send_message`.
+- **Prevents:** Building a cross-agent relay bridge (the original AD-3/AD-4/AD-9/AD-10/AD-11 design) for a problem Google Calendar's own sharing model already solves at zero engineering cost. The already-granted `calendar.events` OAuth scope (confirmed in the live connection's scope list) covers "edit events on any calendar the connected account has access to" — not scope-limited to the account's own primary calendar.
+- **Rule:** Devorah shares her Google Calendar with Uriel's connected account (Google Calendar's own Settings → "Share with specific people" → grant "Make changes to events") — a one-time action she performs herself in her own Google account, no OneCLI dashboard, no second OAuth flow, no agent involvement. Once shared, any chat surface's `calendar.ts` call can target her calendar directly (AD-2's `calendar` argument) through the one already-connected identity. **No cross-agent relay exists anywhere in this design** — AD-4/AD-9/AD-10/AD-11 below are retired, not superseded by a replacement mechanism, because the problem they solved (routing a request to the identity that owns the target calendar) no longer exists.
 
-### AD-4 — Cross-person relay is asynchronous, never same-turn
+### AD-4 — [RETIRED, 2026-08-17 pivot] Cross-person relay latency
 
-- **Binds:** CAP-1, CAP-3 (writes; reads relayed the same way inherit this too)
-- **Prevents:** Inconsistent latency assumptions across the three personas — one instructed to imply instant completion, another correctly warning the user, producing an inconsistent experience depending on which chat surface handled the request.
-- **Rule:** A relayed cross-person calendar action (AD-3) is fire-and-forget over `send_message` — the target agent's container wakes on its own poll cycle, not synchronously within the relaying agent's turn. Every persona touching this sets that expectation up front ("I'll pass this to Devorah's agent, one sec") rather than implying same-turn completion, and the confirmation arrives as a follow-up message from the owning agent.
+- **Binds:** (none — retired)
+- **Prevents:** N/A. Retired along with the relay design AD-3 originally specified (see AD-3's revision).
+- **Rule:** No replacement rule — every calendar call is now synchronous, same-turn, same-container, like any other MCP tool call in this codebase. Id kept, not reused, per this project's memlog convention.
 
-### AD-5 — Sender identity resolves an unqualified "my calendar" [tightened, reviewer gate]
+### AD-5 — Sender identity resolves an unqualified "my calendar" [tightened, reviewer gate; repurposed, 2026-08-17 pivot]
 
 - **Binds:** CAP-1, CAP-2, CAP-3 — specifically in `household`, the one surface more than one real person shares
 - **Prevents:** `household`'s agent silently treating every ambiguous "my calendar"/"my schedule" request as Uriel's, even when Devorah is the one actually asking — and two independently-built stories each inventing a different, possibly-wrong sender→person heuristic, since the only signal at the tool/persona layer is a free-text display name (`sender`/`senderId` in the rendered message tag), not a stable person mapping.
-- **Rule:** Sender-to-person resolution reads from the group's own existing OKF memory (e.g. `groups/household/memory/household/people.md`, which already records Uriel's and Devora's names/identifiers) — never a hardcoded name string in tool or skill code. An unmatched or ambiguous sender is asked which calendar they mean, never guessed — same "ask, don't guess" discipline as any other ambiguity in this spine.
+- **Rule:** Sender-to-person resolution reads from the group's own existing OKF memory (e.g. `groups/household/memory/household/people.md`, which already records Uriel's and Devora's names/identifiers) — never a hardcoded name string in tool or skill code. An unmatched or ambiguous sender is asked which calendar they mean, never guessed. **Post-pivot:** this resolution now picks the `calendar` argument value (AD-2) directly — it no longer picks which agent to relay to, since there is no relay.
 
 ### AD-6 — New MCP tools, no new dependency
 
 - **Binds:** CAP-1 (`create_calendar_event`), CAP-2 (`list_calendar_events`), CAP-3 (`update_calendar_event`)
 - **Prevents:** A second, inconsistent tool-registration pattern alongside `documents.ts`'s established one; an unnecessary new dependency for a REST surface simple enough for raw `fetch()`.
-- **Rule:** `create_calendar_event` / `list_calendar_events` / `update_calendar_event` live in a new `container/agent-runner/src/mcp-tools/calendar.ts`, registered via the existing `McpToolDefinition` + `registerTools()` convention. Each is a direct `fetch()` against Google Calendar REST API v3 (`POST`/`GET`/`PATCH` `https://www.googleapis.com/calendar/v3/calendars/primary/events[/eventId]`, confirmed current — see Stack) through the container's already-injected `HTTPS_PROXY`. No Google API client library. `[ASSUMPTION]` — revisit at build time only if raw-fetch request/response shape safety proves genuinely unwieldy; default is no new dependency.
+- **Rule:** `create_calendar_event` / `list_calendar_events` / `update_calendar_event` live in a new `container/agent-runner/src/mcp-tools/calendar.ts`, registered via the existing `McpToolDefinition` + `registerTools()` convention. Each is a direct `fetch()` against Google Calendar REST API v3 (`POST`/`GET`/`PATCH` `https://www.googleapis.com/calendar/v3/calendars/{calendarId}/events[/eventId]`, `calendarId` resolved per AD-2, confirmed current — see Stack) through the container's already-injected `HTTPS_PROXY`. No Google API client library. `[ASSUMPTION]` — revisit at build time only if raw-fetch request/response shape safety proves genuinely unwieldy; default is no new dependency.
 
-### AD-7 — Ambiguous event reference: numbered list, never guess [tightened, reviewer gate]
+### AD-7 — Ambiguous event reference: numbered list, never guess [tightened, reviewer gate; simplified, 2026-08-17 pivot]
 
 - **Binds:** CAP-2, CAP-3
-- **Prevents:** `update_calendar_event`/`list_calendar_events` silently acting on the wrong event when a natural-language reference matches more than one — and, for a cross-person request, silently guessing because the requester's own container has no network path (AD-2) to build or receive a candidate list itself.
-- **Rule:** Same disambiguation precedent as `spec-document-memory`'s CAP-2/CAP-3 — when a reference matches more than one real event, present a numbered candidate list and wait for a pick, never guess (e.g. "most recent"). For a **same-owner** request this is unchanged: same-turn, same-container. For a **cross-person** request (AD-3), the *owning* agent builds the candidate list and relays it back (AD-9-marked) via `send_message` to the original requester's destination; the pick flows back the same way — one more relay hop, still async per AD-4.
+- **Prevents:** `update_calendar_event`/`list_calendar_events` silently acting on the wrong event when a natural-language reference matches more than one.
+- **Rule:** Same disambiguation precedent as `spec-document-memory`'s CAP-2/CAP-3 — when a reference matches more than one real event, present a numbered candidate list and wait for a pick, never guess (e.g. "most recent"). **Post-pivot:** always same-turn, same-container — the cross-person relay-and-pick-back variant this AD originally described no longer applies (no relay, AD-3).
 
 ### AD-8 — Not-connected-yet is the gateway's own contract, not new code
 
@@ -86,23 +78,23 @@ graph LR
 - **Prevents:** A second, parallel "is this calendar connected" check duplicating what the gateway already reports.
 - **Rule:** A `401`/`403`/`app_not_connected` response from the gateway (carrying a `connect_url`) is surfaced back to the agent as-is. The agent already knows how to present that link to the user — the `onecli-gateway` skill's existing instructions cover this; no new connection-status code is written.
 
-### AD-9 — Relay messages are marked request vs. result, never re-relayed
+### AD-9 — [RETIRED, 2026-08-17 pivot] Relay request/result marking
 
-- **Binds:** CAP-1, CAP-3's relay path (AD-3/AD-4)
-- **Prevents:** Two AD-3-compliant agents bouncing a confirmation back and forth as if each were a fresh request — `send_message`'s payload is plain, unstructured text with no built-in marker distinguishing "please do X" from "X is done."
-- **Rule:** Every relay send carries a fixed, parseable prefix identifying its kind — e.g. `[calendar-relay-request]` vs. `[calendar-relay-result]` — in the `send_message` text. A result-marked message is always terminal: the receiving persona is instructed to never re-relay or re-act on it as a new request.
+- **Binds:** (none — retired)
+- **Prevents:** N/A. Retired along with the relay design (AD-3's revision).
+- **Rule:** No replacement rule — no relay exists to mark. Id kept, not reused.
 
-### AD-10 — Relay requests are field-complete prose, never verbatim-forwarded
+### AD-10 — [RETIRED, 2026-08-17 pivot] Field-complete relay composition
 
-- **Binds:** CAP-1, CAP-3's relay path
-- **Prevents:** A lossy or ambiguous verbatim-forward of the user's raw phrasing reaching the calendar-owning agent and producing a wrong write — "natural language, not JSON" is satisfied equally by a careful restatement or a lossy paraphrase, and only the former is safe for a write.
-- **Rule:** Before relaying a create/update, the relaying agent resolves and restates every field it has — title, start, end, timezone, location, attendees, and who's asking (per AD-5) — as explicit prose in the relay message. It never forwards the user's raw request text unresolved.
+- **Binds:** (none — retired)
+- **Prevents:** N/A. Retired along with the relay design (AD-3's revision).
+- **Rule:** No replacement rule — no relay exists to compose a message for. Id kept, not reused.
 
 ### AD-11 — One tool call per named calendar, never a combined call
 
 - **Binds:** CAP-2 primarily; CAP-1/CAP-3 wherever a compound request is possible
-- **Prevents:** A single request naming both calendars ("check mine and Devorah's") silently resolving to only the first-named one, since nothing in AD-1–AD-8 says a request can't name more than one target.
-- **Rule:** The agent issues one calendar tool call (direct or relayed, per AD-3) per calendar the user actually named — never a single combined-calendar call, and never silently drops the second-named calendar.
+- **Prevents:** A single request naming both calendars ("check mine and Devorah's") silently resolving to only the first-named one.
+- **Rule:** The agent issues one calendar tool call — same `calendar` argument mechanism (AD-2), just called twice — per calendar the user actually named, never a single combined-calendar call, and never silently drops the second-named calendar.
 
 ### AD-13 — Event `dateTime`/`timeZone` uses the existing timezone convention, never a second one
 
@@ -128,7 +120,7 @@ graph LR
 | --- | --- |
 | Naming | `create_calendar_event` / `list_calendar_events` / `update_calendar_event` — verb_calendar_noun, mirroring `save_document` / `list_documents` / `fill_document_field`'s naming shape |
 | Error shape | This codebase's existing `err()`/`ok()` MCP content shape (`{ content: [...], isError? }`), same as every other tool in `mcp-tools/` |
-| Cross-agent relay text | Natural language via `send_message`, not a structured/JSON payload — `send_message`'s own schema is plain `to`/`text`; no new structured envelope invented for this |
+| Calendar selection | A `calendar` argument (`uriel` \| `devorah`) on every tool call, resolved internally to a `calendarId` (AD-2) — never inferred from which container/identity is calling |
 
 ## Stack
 
@@ -145,19 +137,19 @@ container/agent-runner/src/mcp-tools/
   calendar.ts            # create_calendar_event, list_calendar_events, update_calendar_event
   calendar.test.ts        # bun:test coverage
 container/skills/
-  calendar/               # NEW container skill: when/how to use the tools, AD-3's relay rule, AD-5's sender-identity rule
+  calendar/               # NEW container skill: when/how to use the tools, the `calendar` argument, AD-5's sender-identity rule
     SKILL.md
 ```
 
-Setup prerequisite (operational, not code — the build's first task, not a code AD): every pair among `household` / `dm-with-uriel` / `dm-with-partner` needs a bidirectional agent-type destination wired via `ncl destinations add` before AD-3's relay can work. None exist today — `ncl destinations list` currently shows only `channel`-type destinations (each agent's own wired Telegram chat) for all three groups.
+Operational prerequisite (not code, and — post-pivot — not blocking): Devorah shares her Google Calendar with the connected account (AD-3) before her calendar is reachable. The 6 cross-agent `agent`-type destinations wired for the original relay design (`household`/`dm-with-uriel`/`dm-with-partner`, via `ncl destinations add`) are harmless leftover infrastructure — `send_message` remains generally useful for unrelated purposes — but are no longer required for calendar access specifically.
 
 ## Capability → Architecture Map
 
 | Capability | Lives in | Governed by |
 | --- | --- | --- |
-| CAP-1 (create) | `calendar.ts`'s `create_calendar_event` | AD-1, AD-2, AD-3, AD-4, AD-5, AD-6, AD-8, AD-9, AD-10, AD-11, AD-13, AD-14, AD-15 |
+| CAP-1 (create) | `calendar.ts`'s `create_calendar_event` | AD-1, AD-2, AD-3, AD-5, AD-6, AD-8, AD-11, AD-13, AD-14, AD-15 |
 | CAP-2 (read/query) | `calendar.ts`'s `list_calendar_events` | AD-1, AD-2, AD-3, AD-6, AD-7, AD-8, AD-11, AD-14, AD-15 |
-| CAP-3 (update) | `calendar.ts`'s `update_calendar_event` | AD-1, AD-2, AD-3, AD-4, AD-5, AD-6, AD-7, AD-8, AD-9, AD-10, AD-11, AD-13, AD-14, AD-15 |
+| CAP-3 (update) | `calendar.ts`'s `update_calendar_event` | AD-1, AD-2, AD-3, AD-5, AD-6, AD-7, AD-8, AD-11, AD-13, AD-14, AD-15 |
 
 ## Deferred
 

@@ -1,12 +1,13 @@
 ---
 name: calendar
 description: >-
-  Create a real event on this agent's own Google Calendar via the
+  Create a real event on Uriel's or Devora's Google Calendar via the
   create_calendar_event tool. Use whenever asked to schedule, book, put
   something on the calendar, or set up a meeting/appointment at a specific
-  date/time. Also covers the OneCLI connect-link flow for a not-yet-connected
-  calendar, and the deliberate distinction from second-brain's own,
-  unrelated Google OAuth (never disclose that one).
+  date/time — for either person, not just this agent's own identity. Also
+  covers the OneCLI connect-link flow for a not-yet-connected calendar, and
+  the deliberate distinction from second-brain's own, unrelated Google
+  OAuth (never disclose that one).
 metadata:
   author: nanoclaw
   version: "1.0.0"
@@ -14,14 +15,22 @@ metadata:
 
 # Calendar
 
-`create_calendar_event` creates a real event on **this agent's own** Google
-Calendar (`calendarId=primary`, under whichever Google identity is connected
-to this agent group). Use it whenever asked to schedule, book, or add
-something to "the calendar," "my calendar," or a meeting/appointment for a
-specific date and time.
+`create_calendar_event` creates a real event on **Uriel's or Devora's**
+Google Calendar. Both are reachable through the one Google account this
+system has connected — Devora's calendar isn't a separate connection, she
+shares it with the connected account (Google Calendar's own sharing
+feature), so the tool reaches it the same way it reaches Uriel's own. Use
+it whenever asked to schedule, book, or add something to "the calendar,"
+"my calendar," or a meeting/appointment for a specific date and time.
 
 ## Arguments
 
+- `calendar` (required) — `"uriel"` or `"devorah"`. Pick based on who the
+  event is actually for, not who's asking — an unqualified "my calendar" in
+  the shared household chat must be resolved against the real sender's
+  identity (see `groups/household/memory/household/people.md`), never
+  defaulted to Uriel. If it's genuinely unclear whose calendar is meant,
+  ask — don't guess.
 - `title` (required) — event title.
 - `start` / `end` (required) — naive local wall-clock time, no offset or
   `Z`, e.g. `"2026-08-20T15:00:00"`. This is interpreted in this group's own
@@ -35,14 +44,13 @@ A successful call returns the real event's details plus its Google-assigned
 user — never invent or describe a confirmation of your own; the tool's
 response is the only source of truth for what was actually created.
 
-## Only your own calendar (for now)
+## Two calendars, either one, from any chat
 
-This tool always targets `calendarId=primary` for whichever Google account
-this agent group's OneCLI agent is connected to — it has no notion of
-"someone else's calendar." If asked to put something on a *different*
-person's calendar, say plainly that you can only create events on this
-identity's own calendar right now; don't attempt a workaround or guess at
-who else might be reachable.
+This is reachable from household, dm-with-uriel, or dm-with-partner alike —
+there's no "wrong" chat to ask from, and no need to relay/forward a request
+anywhere. If a request names both people ("check mine and Devora's" /
+"put it on both calendars"), call the tool once per calendar named — never
+a single combined call, and never silently drop the second one.
 
 ## Two different Google connections — do not conflate them
 
@@ -73,8 +81,7 @@ for any not-connected app:
 
 Then let the user know you'll retry once they've connected.
 
-## Not yet supported
-
-Creating an event on someone else's calendar (cross-agent relay) isn't
-built yet. Recognize a request like that and say so rather than guessing at
-a workaround — a later capability will handle it.
+If a call targeting Devora's calendar specifically fails with an access
+error (not a "not connected" link, but a real permission error), the most
+likely cause is she hasn't shared her calendar with the connected account
+yet — say that plainly rather than implying the whole tool is broken.

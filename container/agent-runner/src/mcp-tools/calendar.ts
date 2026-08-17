@@ -1,14 +1,21 @@
 /**
- * create_calendar_event — creates a real event on this agent's own Google
- * Calendar (`calendarId=primary`, whichever Google identity is connected to
- * this agent group's OneCLI agent) via a single direct `fetch()` call routed
- * through the container's already-injected `HTTPS_PROXY` — no Google API
- * client library (AD-6).
+ * create_calendar_event — creates a real event on one of two Google
+ * Calendars via a single direct `fetch()` call routed through the
+ * container's already-injected `HTTPS_PROXY` — no Google API client
+ * library (AD-6).
  *
- * This tool has no notion of "someone else's calendar" — it always targets
- * `calendarId=primary` under this container's own identity. Recognizing a
- * request for a calendar this container doesn't own, and relaying it, is
- * Story 1.4's job, not this one's.
+ * [2026-08-17 pivot — see ARCHITECTURE-SPINE.md AD-2/AD-3] Google Calendar
+ * OAuth in OneCLI is one connection per *project*, not per agent identity —
+ * live-verified via `onecli apps get --provider google-calendar` (no
+ * per-agent scoping exists in the CLI at all). So there is exactly one
+ * connected Google account, and which calendar a call targets is picked by
+ * the `calendar` argument (`"uriel"` | `"devorah"`), resolved to a
+ * `calendarId` here — never by which container/identity happens to be
+ * calling. Devorah's calendar is reachable because she shares it with the
+ * connected account (Google Calendar's own sharing, not a second OAuth
+ * grant) — the already-granted `calendar.events` scope covers editing
+ * events on any calendar the connected account can access, not just its
+ * own `primary`.
  *
  * TLS trust: the gateway's CA cert reaches this container only through
  * `SSL_CERT_FILE`; Bun's `fetch()` reads `NODE_EXTRA_CA_CERTS` instead. The
@@ -18,6 +25,18 @@
 import { TIMEZONE, parseZonedToUtc } from '../timezone.js';
 import type { McpToolDefinition } from './types.js';
 import { registerTools } from './server.js';
+
+/**
+ * The only two calendars in scope (spec non-goal: no others). "uriel" maps
+ * to the connected account's own calendar; "devorah" to her calendar,
+ * reachable because she shares it with the connected account (AD-3) — not
+ * a second OAuth connection. Matches `groups/household/memory/household/
+ * people.md`'s recorded email for Devora.
+ */
+const CALENDAR_IDS: Record<string, string> = {
+  uriel: 'primary',
+  devorah: 'adardevora@gmail.com',
+};
 
 function log(msg: string): void {
   console.error(`[mcp-tools] ${msg}`);
@@ -31,7 +50,9 @@ function err(text: string) {
   return { content: [{ type: 'text' as const, text: `Error: ${text}` }], isError: true };
 }
 
-const EVENTS_URL = 'https://www.googleapis.com/calendar/v3/calendars/primary/events';
+function eventsUrl(calendarId: string): string {
+  return `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events`;
+}
 
 interface GatewayErrorBody {
   connect_url?: string;
@@ -102,11 +123,16 @@ export const createCalendarEvent: McpToolDefinition = {
   tool: {
     name: 'create_calendar_event',
     description:
-      "Create a real event on this agent's own Google Calendar (calendarId=primary). " +
-      'Cannot create events on someone else\'s calendar.',
+      'Create a real event on Uriel\'s or Devora\'s Google Calendar (both reachable through one connected ' +
+      'account — Devora\'s via calendar sharing, not a separate connection).',
     inputSchema: {
       type: 'object' as const,
       properties: {
+        calendar: {
+          type: 'string',
+          enum: ['uriel', 'devorah'],
+          description: 'Which calendar to create the event on.',
+        },
         title: { type: 'string', description: 'Event title/summary.' },
         start: {
           type: 'string',
@@ -126,10 +152,11 @@ export const createCalendarEvent: McpToolDefinition = {
           description: 'Optional list of guest email addresses to invite.',
         },
       },
-      required: ['title', 'start', 'end'],
+      required: ['calendar', 'title', 'start', 'end'],
     },
   },
   async handler(args) {
+    const calendar = args.calendar as string | undefined;
     const title = args.title as string | undefined;
     const start = args.start as string | undefined;
     const end = args.end as string | undefined;
@@ -137,6 +164,11 @@ export const createCalendarEvent: McpToolDefinition = {
     const location = args.location as string | undefined;
     const guests = args.guests as unknown;
 
+    if (!calendar) return err(`calendar is required — one of: ${Object.keys(CALENDAR_IDS).join(', ')}`);
+    const calendarId = CALENDAR_IDS[calendar];
+    if (!calendarId) {
+      return err(`Unknown calendar "${calendar}" — must be one of: ${Object.keys(CALENDAR_IDS).join(', ')}`);
+    }
     if (!title) return err('title is required');
     if (!start) return err('start is required');
     if (!end) return err('end is required');
@@ -172,7 +204,7 @@ export const createCalendarEvent: McpToolDefinition = {
 
     let response: Response;
     try {
-      response = await fetch(EVENTS_URL, {
+      response = await fetch(eventsUrl(calendarId), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(eventBody),
@@ -229,7 +261,7 @@ export const createCalendarEvent: McpToolDefinition = {
     if (confirmedEmails && confirmedEmails.length > 0) lines.push(`Guests: ${confirmedEmails.join(', ')}`);
     if (event.htmlLink) lines.push(`Link: ${event.htmlLink}`);
 
-    log(`create_calendar_event: created "${title}"`);
+    log(`create_calendar_event: created "${title}" on ${calendar}'s calendar`);
     return ok(lines.join('\n'));
   },
 };
