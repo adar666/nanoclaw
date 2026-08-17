@@ -2,7 +2,7 @@
 title: 'Stamp a Saved Signature into a Saved PDF'
 type: 'feature'
 created: '2026-08-17'
-status: 'in-progress'
+status: 'done'
 review_loop_iteration: 0
 context: []
 baseline_commit: '5bc347e'
@@ -69,9 +69,9 @@ baseline_commit: '5bc347e'
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `container/agent-runner/src/mcp-tools/documents.ts` -- `resolveSignaturePng` helper; image-draw branches in `pdfFillAcroForm`/`pdfFillLine`/`pdfFillPixel`; `signatureName` added to `PDF_ONLY_ARGS` and the tool's `inputSchema`
-- [ ] `container/agent-runner/src/mcp-tools/documents.test.ts` -- bun:test coverage for the I/O matrix above (real PDF fixtures + a real saved-signature PNG fixture, real `pdf-lib` embed/draw, decoded/inspected output — not a mocked pipeline)
-- [ ] `container/skills/document-memory/SKILL.md` -- document signature stamping for PDFs, explicit that `.docx` isn't supported yet
+- [x] `container/agent-runner/src/mcp-tools/documents.ts` -- `resolveSignaturePng` helper; image-draw branches in `pdfFillAcroForm`/`pdfFillLine`/`pdfFillPixel`; `signatureName` added to `PDF_ONLY_ARGS` and the tool's `inputSchema`
+- [x] `container/agent-runner/src/mcp-tools/documents.test.ts` -- bun:test coverage for the I/O matrix above (real PDF fixtures + a real saved-signature PNG fixture, real `pdf-lib` embed/draw, decoded/inspected output — not a mocked pipeline)
+- [x] `container/skills/document-memory/SKILL.md` -- document signature stamping for PDFs, explicit that `.docx` isn't supported yet
 
 **Acceptance Criteria:**
 - Given the story is complete, when `cd container/agent-runner && bun test` runs, then all tests pass, including real embed-and-draw round-trips for all three target kinds plus the image+text-together case.
@@ -79,7 +79,9 @@ baseline_commit: '5bc347e'
 
 ## Spec Change Log
 
-(none yet — record here if implementation surfaces a genuine deviation from the frozen Boundaries above)
+- 2026-08-17 (implementation, unstated-but-implied behavior, not a deviation): for the AcroForm target, `value` given alongside `signatureName` draws the text directly on the page beside the image (offset by `FILL_GAP_PT`), since the field's own text is explicitly off-limits when stamping an image — consistent with the I/O matrix's "any PDF target + signatureName + value" row and the general Boundary, just not spelled out for this specific target. No Change Log entry needed for the substance; noted here for the record per standing instruction to flag resolved ambiguities.
+
+- 2026-08-17 (code review — blind-hunter/edge-case-hunter/verification-gap, 5 patch findings applied, rest deferred): the AcroForm image branch's widget→page resolution fallback (`/P` ref match → single-page shortcut → `/Annots`-array scan) was the "genuinely tricky" area the spec's own Design Notes flagged, and shipped with zero real coverage in the first round — every fixture was single-page, so only the trivial shortcut ever ran. Added a real 2-page fixture with the target field's widget on page 2, exercised both the `/P`-ref fast path and (by stripping `/P` post-construction) the `/Annots`-scan fallback — both now assert the image lands on page 2, not page 1. `pdfFillLine`/`pdfFillPixel`'s image branches previously scaled to a fixed height with **unbounded derived width** and only checked the anchor x-position against the page edge, not the drawn image's actual bounding box — a wide-aspect signature near an edge could draw partially/fully off-page with no error; now checks both axes of the scaled image against the page's real bounds before drawing, declining clearly otherwise (this also surfaced that several of the first round's own tests were themselves silently drawing off the top of their fixture page — fixed by adjusting those anchors, not a production bug). `pdfFillAcroForm`'s image branch previously operated on `field.acroField.getWidgets()[0]` for *any* field type with no widget-count check — a checkbox/radio/dropdown field, or a text field with more than one widget (legal per spec), silently picked an arbitrary position; now shares the pre-existing `form.getTextField(fieldName)` type validation with the text-fill path and additionally requires exactly one widget, declining clearly for either violation. A degenerate (`zero-area or corner-reversed`) widget `/Rect` previously produced an invisible or mirrored draw while still reporting success; now declines before drawing. The `/Annots`-array scan's `annots.lookup(i, PDFDict)` call previously threw uncaught on a non-dereferenceable entry (a legal-but-atypical malformed PDF), surfacing as a generic top-level error instead of the intended clean message — now wrapped, skips a bad entry and falls through to the existing decline if nothing else matches. **Deferred, not fixed** (logged to `ARCHITECTURE-SPINE.md`'s Deferred section): page rotation (`/Rotate`) is never consulted by the image draw (pre-existing limitation shared with text fills, not new to this story); no test decodes the embedded image's actual pixel content (placement/non-distortion is verified via content-stream geometry, not pixel fidelity of the embed round-trip — `pdf-lib`'s `embedPng` is low-risk enough not to warrant it now); cosmetic success-message wording differs across the three PDF targets; `signatureName` combined with both `fieldName` and `lineNumber` in one call is untested but behaves per the pre-existing (already-silent) priority order, not a new gap. **Verified independently**, not just self-reported: re-ran `cd container/agent-runner && bun test` (298 pass, 7 skip, 0 fail) and `pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit` (clean) myself after the patch round, before accepting the implementer's report.
 
 ## Design Notes
 
@@ -98,4 +100,17 @@ Test fixtures: for the AcroForm case, extend this file's existing `buildPdfWithF
 
 ## Suggested Review Order
 
-(filled in at story completion, once real line numbers exist)
+- Start here -- dispatch, resolves `signatureName` once for whichever target the existing priority order picks.
+  [`documents.ts:2094`](../../container/agent-runner/src/mcp-tools/documents.ts#L2094)
+- Signature PNG resolution -- exact-match lookup, path-safety.
+  [`documents.ts:1790`](../../container/agent-runner/src/mcp-tools/documents.ts#L1790)
+- AcroForm target -- widget/page resolution (the trickiest part), field-type/widget-count validation, degenerate-rect guard.
+  [`documents.ts:1976`](../../container/agent-runner/src/mcp-tools/documents.ts#L1976)
+- Text-layer line target -- off-page bounding-box check.
+  [`documents.ts:1834`](../../container/agent-runner/src/mcp-tools/documents.ts#L1834)
+- Scanned-page pixel target -- same off-page check.
+  [`documents.ts:1919`](../../container/agent-runner/src/mcp-tools/documents.ts#L1919)
+- Test suite -- start with the multi-page widget resolution and off-page-edge blocks, the two review-round additions worth the closest look.
+  [`documents.test.ts:2745`](../../container/agent-runner/src/mcp-tools/documents.test.ts#L2745), [`documents.test.ts:2638`](../../container/agent-runner/src/mcp-tools/documents.test.ts#L2638)
+- Agent-facing usage guide.
+  [`SKILL.md`](../../container/skills/document-memory/SKILL.md)

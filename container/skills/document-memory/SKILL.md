@@ -1,6 +1,6 @@
 ---
 name: document-memory
-description: Save a Word (.docx or legacy .doc) or PDF file the user sends into this agent group's persistent memory, so its content can be recalled in a later, unrelated conversation without resending the file. Also fill a value into a table row, form field, or line of a document already saved this way and send back a new file, or recall/answer questions about what a previously saved document says. Also save a PNG image of a handwritten signature as a reusable, background-removed asset. Use when the user sends a Word/PDF attachment and asks to save/remember/keep it, asks to fill in / complete a blank on a document already saved, asks what a saved document says/contains, asks to summarize/recall a document already saved, or sends a signature image and asks to save/remember it for reuse.
+description: Save a Word (.docx or legacy .doc) or PDF file the user sends into this agent group's persistent memory, so its content can be recalled in a later, unrelated conversation without resending the file. Also fill a value into a table row, form field, or line of a document already saved this way and send back a new file, or recall/answer questions about what a previously saved document says. Also save a PNG image of a handwritten signature as a reusable, background-removed asset, and stamp a saved signature into a saved PDF (not yet available for .docx/.doc). Use when the user sends a Word/PDF attachment and asks to save/remember/keep it, asks to fill in / complete a blank on a document already saved, asks what a saved document says/contains, asks to summarize/recall a document already saved, sends a signature image and asks to save/remember it for reuse, or asks to sign/stamp a saved PDF with a saved signature.
 ---
 
 # Saving a document to memory
@@ -199,6 +199,36 @@ Three mechanisms, auto-detected — you never pick a mode explicitly:
    - Second call: `fill_document_field({ document, pixelX, pixelY, value })`
      — draws the value there.
 
+## Stamping a saved signature into a saved PDF
+
+**PDF only** — a `.docx`/`.doc` document with `signatureName` is declined
+clearly, not silently ignored; signature stamping into Word documents isn't
+built yet. See "Saving a reusable signature" below for how a signature gets
+saved in the first place — that has to happen before this can work.
+
+Add `signatureName` (the exact name it was saved under — no fuzzy matching,
+unlike `document`) to any of the three `fill_document_field` PDF calls
+above, in place of or alongside `value`:
+
+- **AcroForm field**: `fill_document_field({ document, fieldName, signatureName })`
+  — draws the signature image scaled to fit and centered within the
+  field's own widget rectangle, aspect ratio preserved (never
+  stretched/distorted). **The field's text is left unset** — stamping an
+  image into a field and filling its text value are mutually exclusive in
+  one call.
+- **Text-layer line**: `fill_document_field({ document, lineNumber, signatureName })`
+  — draws the image at the same spot a text value would have gone.
+- **Scanned/pixel position**: `fill_document_field({ document, pixelX, pixelY, signatureName })`
+  — same idea, at the pixel position you already picked.
+
+**Give `value` alongside `signatureName`** (any of the three calls above)
+to draw both the signature image and a text value — e.g. a date — right
+next to each other in the same call, same call's single new file.
+
+If `signatureName` doesn't match any saved signature exactly, the tool
+declines and lists the signature names actually saved (or says none are
+saved yet) — relay that rather than guessing a different name.
+
 ## After a successful fill
 
 The tool never sends anything itself — it writes a new file (the saved
@@ -285,11 +315,11 @@ The user sends a `.png` image of a handwritten signature — a photo of ink
 on paper, or a drawn signature — shown to you as an inbox attachment tag
 like `[image: sig.png — saved to /workspace/inbox/<msgId>/sig.png]`, and
 asks to save/remember it for reuse (e.g. "save my signature", "remember
-this signature as Uriel"). This is **save-only**: `save_signature` does
-not stamp a signature into any document — that capability doesn't exist
-yet. If the user's actual goal is to sign a specific document right now,
-say plainly that saving the signature is the only part currently
-supported.
+this signature as Uriel"). `save_signature` itself is **save-only** — it
+never places the signature into any document itself. To actually stamp a
+saved signature into a document, see "Stamping a saved signature into a
+saved PDF" above — **PDF only**; a Word document (`.docx`/`.doc`) can't be
+signed this way yet, say so plainly if that's what the user wants.
 
 ## Workflow
 
@@ -325,6 +355,8 @@ supported.
 - Don't assume `replace: true` — a plain "save my signature again" with no
   explicit replace/overwrite language is a new, separate save, not a
   replacement.
-- Don't imply a signature is now usable in a document, or shared with any
-  other agent group — it's saved only for this group, and nothing in this
-  story places it into a document yet.
+- Don't imply a saved signature is shared with any other agent group — it's
+  saved only for this group.
+- Don't attempt to stamp a signature into a `.docx`/`.doc` document — say
+  plainly that's not supported yet, rather than falling back to a
+  text-only fill or trying some other workaround.

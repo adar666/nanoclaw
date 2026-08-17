@@ -1567,10 +1567,144 @@ async function buildAcroFormCheckboxPdf(fieldName: string): Promise<Buffer> {
   return Buffer.from(await pdfDoc.save());
 }
 
+/** A text field with two widgets (e.g. the same field repeated on two pages) — legal, but ambiguous for image placement. */
+async function buildAcroFormPdfWithTwoWidgets(fieldName: string): Promise<Buffer> {
+  const { PDFDocument } = await import('pdf-lib');
+  const pdfDoc = await PDFDocument.create();
+  const page1 = pdfDoc.addPage([200, 200]);
+  const page2 = pdfDoc.addPage([200, 200]);
+  const form = pdfDoc.getForm();
+  const textField = form.createTextField(fieldName);
+  textField.addToPage(page1, { x: 20, y: 100, width: 150, height: 20 });
+  textField.addToPage(page2, { x: 20, y: 100, width: 150, height: 20 });
+  return Buffer.from(await pdfDoc.save());
+}
+
+/** A degenerate (zero-area) widget rectangle — legal per the PDF spec, but nothing to size an image against. */
+/**
+ * A degenerate widget rectangle. addToPage's own { width: 0, height: 0 }
+ * isn't enough on its own — pdf-lib's createWidget() inflates the
+ * requested rect by its default border width (see the AcroForm signature
+ * test's own comment on this same quirk), so a real, atypical-but-legal
+ * `/Rect` has to be forced directly via the widget's own setRectangle()
+ * after normal construction, bypassing that inflation entirely.
+ */
+async function buildAcroFormPdfWithZeroRect(fieldName: string): Promise<Buffer> {
+  const { PDFDocument } = await import('pdf-lib');
+  const pdfDoc = await PDFDocument.create();
+  const page = pdfDoc.addPage([200, 200]);
+  const form = pdfDoc.getForm();
+  const textField = form.createTextField(fieldName);
+  textField.addToPage(page, { x: 20, y: 100, width: 150, height: 20 });
+  const widget = textField.acroField.getWidgets()[0];
+  widget.setRectangle({ x: 20, y: 100, width: 0, height: 0 });
+  return Buffer.from(await pdfDoc.save());
+}
+
+/**
+ * A real multi-page PDF whose target field's widget lives on page 2, not
+ * page 1 — the only fixture in this suite that actually exercises the
+ * widget->page resolution beyond the trivial single-page shortcut.
+ * `stripP`, when true, deletes the widget's own /P entry after
+ * construction (a legal-but-atypical PDF producer omission), forcing
+ * pdfFillAcroForm's fallback (scanning each page's /Annots for a matching
+ * dict) rather than the fast /P-ref match.
+ *
+ * Deliberately carries no page content text (mirrors buildAcroFormPdf's
+ * shape) — save_document's own text-layer detection would otherwise treat
+ * a first save_document call as already-complete, and a second call on
+ * the same source path would land as a genuinely separate save (a real
+ * slug collision) rather than the scanned-PDF two-call continuation these
+ * tests intend.
+ */
+async function buildMultiPageAcroFormPdf(fieldName: string, opts: { stripP?: boolean } = {}): Promise<Buffer> {
+  const { PDFDocument, PDFName } = await import('pdf-lib');
+  const pdfDoc = await PDFDocument.create();
+  pdfDoc.addPage([200, 200]); // page 1 — deliberately blank, no field, no text
+  const page2 = pdfDoc.addPage([200, 200]);
+  const form = pdfDoc.getForm();
+  const textField = form.createTextField(fieldName);
+  textField.addToPage(page2, { x: 20, y: 100, width: 150, height: 20 });
+
+  if (opts.stripP) {
+    const widget = form.getTextField(fieldName).acroField.getWidgets()[0];
+    widget.dict.delete(PDFName.of('P'));
+  }
+
+  return Buffer.from(await pdfDoc.save());
+}
+
 function extractRenderPath(text: string): string {
   const m = /to (\S+\.png)\./.exec(text);
   if (!m) throw new Error(`No render path found in response: ${text}`);
   return m[1];
+}
+
+// ---------------------------------------------------------------------------
+// Signature stamping (Story 1.7) test helpers.
+//
+// pdf-lib's own drawImage()/drawText() emit deterministic, unrotated
+// operator sequences (verified against node_modules/pdf-lib/src/api/
+// operations.ts) — a `cm ... cm ... cm ... cm Do` block per drawImage call
+// (translate, identity-rotate, scale, identity-skew, in that fixed order)
+// and a `Tm` per drawText call. Decoding the real, saved-and-reloaded PDF's
+// content stream (FlateDecode by default) and reading those operators back
+// out is a genuine, non-mocked check that the production code passed the
+// right x/y/width/height into drawImage/drawText — not just that some
+// bytes changed.
+// ---------------------------------------------------------------------------
+
+/** mirrors documents.ts's FILL_GAP_PT (not exported — a literal here is fine, this is the one value this suite pins down independently of the implementation). */
+const GAP_PT = 8;
+/** mirrors documents.ts's SIGNATURE_MAX_HEIGHT_PT. */
+const SIGNATURE_MAX_HEIGHT_PT = 45;
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function getPageContentsText(page: any): Promise<string> {
+  const { PDFArray, PDFRawStream, decodePDFRawStream } = await import('pdf-lib');
+  const contents = page.node.Contents();
+  if (!contents) return '';
+  const streams = contents instanceof PDFArray
+    ? // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (Array.from({ length: contents.size() }, (_, i) => contents.lookup(i, PDFRawStream)) as any[])
+    : [contents];
+  return streams
+    .map((s) => Buffer.from(decodePDFRawStream(s).decode()).toString('latin1'))
+    .join('\n');
+}
+
+function extractCmMatrices(text: string): number[][] {
+  const re = /^(\S+) (\S+) (\S+) (\S+) (\S+) (\S+) cm$/gm;
+  const out: number[][] = [];
+  let m: RegExpExecArray | null;
+  // eslint-disable-next-line no-cond-assign
+  while ((m = re.exec(text))) out.push(m.slice(1, 7).map(Number));
+  return out;
+}
+
+function extractTmPositions(text: string): Array<{ x: number; y: number }> {
+  const re = /^(\S+) (\S+) (\S+) (\S+) (\S+) (\S+) Tm$/gm;
+  const out: Array<{ x: number; y: number }> = [];
+  let m: RegExpExecArray | null;
+  // eslint-disable-next-line no-cond-assign
+  while ((m = re.exec(text))) out.push({ x: Number(m[5]), y: Number(m[6]) });
+  return out;
+}
+
+/** A drawImage() call emits exactly 4 `cm` ops (translate, rotate, scale, skew) — [0] is the translate (x,y in e,f), [2] is the scale (width,height in a,d). */
+function extractImageDraw(text: string): { x: number; y: number; width: number; height: number } {
+  const matrices = extractCmMatrices(text);
+  if (matrices.length < 3) {
+    throw new Error(`Expected a drawImage()'s cm operators (4), found ${matrices.length} in:\n${text}`);
+  }
+  const [translate, , scaleM] = matrices;
+  return { x: translate[4], y: translate[5], width: scaleM[0], height: scaleM[3] };
+}
+
+function writeSavedSignature(name: string, data: Buffer): void {
+  const dir = path.join(baseDir, 'memory', 'signatures');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `${name}.png`), data);
 }
 
 // --- 1. AcroForm auto-discovery ---------------------------------------------
@@ -2399,5 +2533,528 @@ describe('save_signature — path outside inbox', () => {
 
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain('inbox');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// fill_document_field — signature stamping (Story 1.7)
+// ---------------------------------------------------------------------------
+
+describe('fill_document_field — PDF, signature stamped into AcroForm field', () => {
+  it('embeds the image at the widget rect, scaled/centered, aspect-preserved, and leaves the field text unset', async () => {
+    const pdfBytes = await buildAcroFormPdf('Signature');
+    const filePath = writeInboxFile('form.pdf', pdfBytes);
+    await saveDocumentImpl({ path: filePath }, opts());
+    await saveDocumentImpl({ path: filePath, extractedText: 'A form with a Signature field.' }, opts());
+
+    // 2:1 aspect ratio source image.
+    writeSavedSignature('uriel', buildSignaturePng({ width: 100, height: 50, ink: { x: 10, y: 10, w: 80, h: 30 } }));
+
+    const result = await fillDocumentFieldImpl({ document: 'form', fieldName: 'Signature', signatureName: 'uriel' }, opts());
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('field text left unset');
+
+    const outPath = extractOutPath(result.content[0].text);
+    const { PDFDocument } = await import('pdf-lib');
+    const filledDoc = await PDFDocument.load(fs.readFileSync(outPath));
+    expect(filledDoc.getForm().getTextField('Signature').getText() || '').toBe('');
+
+    const page = filledDoc.getPages()[0];
+    const contentsText = await getPageContentsText(page);
+    const draw = extractImageDraw(contentsText);
+
+    // pdf-lib's own createWidget() inflates the { x:20,y:100,w:150,h:20 }
+    // requested at addToPage() time by its default border width — read the
+    // widget's *actual* on-page rectangle back from the original PDF
+    // (exactly what the production code itself reads) rather than
+    // hardcoding the requested numbers, so this test verifies our
+    // scale-to-fit + centering math against the real rect, not a stale
+    // assumption about pdf-lib's own rendering.
+    const { PDFDocument: PDFDocumentForRect } = await import('pdf-lib');
+    const originalDoc = await PDFDocumentForRect.load(pdfBytes);
+    const originalField = originalDoc.getForm().getFieldMaybe('Signature')!;
+    const rect = originalField.acroField.getWidgets()[0].getRectangle();
+    const expectedImage = await originalDoc.embedPng(
+      buildSignaturePng({ width: 100, height: 50, ink: { x: 10, y: 10, w: 80, h: 30 } }),
+    );
+    const { width: expectedWidth, height: expectedHeight } = expectedImage.scaleToFit(rect.width, rect.height);
+    const expectedX = rect.x + (rect.width - expectedWidth) / 2;
+    const expectedY = rect.y + (rect.height - expectedHeight) / 2;
+
+    expect(draw.width).toBeCloseTo(expectedWidth, 0);
+    expect(draw.height).toBeCloseTo(expectedHeight, 0);
+    expect(draw.x).toBeCloseTo(expectedX, 0);
+    expect(draw.y).toBeCloseTo(expectedY, 0);
+    // Aspect ratio preserved (never stretched/distorted).
+    expect(draw.width / draw.height).toBeCloseTo(100 / 50, 1);
+    // And it actually fits within the widget's own rectangle (never overflows it).
+    expect(draw.width).toBeLessThanOrEqual(rect.width + 0.01);
+    expect(draw.height).toBeLessThanOrEqual(rect.height + 0.01);
+  });
+
+  it('draws text beside the image, at the image\'s own bottom, when value is also given', async () => {
+    const pdfBytes = await buildAcroFormPdf('Signature');
+    const filePath = writeInboxFile('form.pdf', pdfBytes);
+    await saveDocumentImpl({ path: filePath }, opts());
+    await saveDocumentImpl({ path: filePath, extractedText: 'A form with a Signature field.' }, opts());
+    writeSavedSignature('uriel', buildSignaturePng({ width: 100, height: 50, ink: { x: 10, y: 10, w: 80, h: 30 } }));
+
+    const result = await fillDocumentFieldImpl(
+      { document: 'form', fieldName: 'Signature', signatureName: 'uriel', value: '2026-08-17' },
+      opts(),
+    );
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('the signature and "2026-08-17"');
+    expect(result.content[0].text).toContain('field text left unset');
+
+    const outPath = extractOutPath(result.content[0].text);
+    const { PDFDocument } = await import('pdf-lib');
+    const filledDoc = await PDFDocument.load(fs.readFileSync(outPath));
+    // The field's own value is still untouched — value only went onto the page.
+    expect(filledDoc.getForm().getTextField('Signature').getText() || '').toBe('');
+
+    const page = filledDoc.getPages()[0];
+    const contentsText = await getPageContentsText(page);
+    const draw = extractImageDraw(contentsText);
+    const tmPositions = extractTmPositions(contentsText);
+    expect(tmPositions.length).toBeGreaterThan(0);
+    expect(tmPositions[0].x).toBeCloseTo(draw.x + draw.width + GAP_PT, 0);
+    expect(tmPositions[0].y).toBeCloseTo(draw.y, 0);
+
+    const text = await extractAllPdfText(outPath);
+    expect(text).toContain('2026-08-17');
+  });
+});
+
+// --- Code-review patches (post-implementation) -------------------------------
+//  1. Off-page bounding-box check for the line/pixel image targets
+//  2. Degenerate (zero/negative-area) widget rectangle declines cleanly
+//  3. Non-text / multi-widget AcroForm fields decline cleanly (no arbitrary pick)
+//  4. Multi-page widget->page resolution, both the /P fast path and the
+//     /Annots-scan fallback (with /P deliberately stripped)
+//  5. A malformed /Annots entry is skipped, not left to throw uncaught
+// ------------------------------------------------------------------------------
+
+describe('fill_document_field — PDF, signature would run off the page edge', () => {
+  it('declines on the text-layer line target instead of drawing off-page', async () => {
+    // 300x40 (wide, short) source image scaled to SIGNATURE_MAX_HEIGHT_PT
+    // (45pt, always — scaling is by height) comes out ~337pt wide, already
+    // wider than the page itself (buildMultilineTextPdf's MediaBox is
+    // 300pt) — a pure x-axis overflow. A spacer first line puts the target
+    // line (line 2, y=140) well clear of the y-axis check (60pt of
+    // headroom, more than the 45pt the image needs), isolating the case to
+    // "the derived width alone runs off the right edge."
+    const filePath = writeInboxFile('letter.pdf', buildMultilineTextPdf(['Spacer', 'x'.repeat(30)]));
+    await saveDocumentImpl({ path: filePath }, opts());
+    writeSavedSignature('wide', buildSignaturePng({ width: 300, height: 40, ink: { x: 10, y: 5, w: 280, h: 30 } }));
+
+    const result = await fillDocumentFieldImpl({ document: 'letter', lineNumber: 2, signatureName: 'wide' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text.toLowerCase()).toContain('edge');
+    expect(fs.existsSync(path.join(baseDir, '.document-fills'))).toBe(false);
+  });
+
+  it('declines on the scanned pixel target instead of drawing off-page', async () => {
+    const filePath = writeInboxFile('scan.pdf', buildMinimalPdf(null));
+    await saveDocumentImpl({ path: filePath }, opts());
+    await saveDocumentImpl({ path: filePath, extractedText: 'A scanned page.' }, opts());
+    writeSavedSignature('wide', buildSignaturePng({ width: 300, height: 40, ink: { x: 10, y: 5, w: 280, h: 30 } }));
+
+    // buildMinimalPdf's MediaBox is 200x200. pixelY=140 -> pdfY=130, 70pt
+    // of headroom (more than the 45pt the image needs) — isolates this to
+    // a pure x-axis overflow: the ~337pt-wide scaled image alone runs off
+    // the right edge from pdfX=20.
+    const result = await fillDocumentFieldImpl(
+      { document: 'scan', pixelX: 40, pixelY: 140, signatureName: 'wide' },
+      opts(),
+    );
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text.toLowerCase()).toContain('edge');
+  });
+
+  it('declines when the vertical extent alone would overrun the top of the page', async () => {
+    // A tall-aspect (narrow, tall) signature anchored near the top of the
+    // page overruns on the y axis even though x has plenty of room.
+    const filePath = writeInboxFile('scan.pdf', buildMinimalPdf(null));
+    await saveDocumentImpl({ path: filePath }, opts());
+    await saveDocumentImpl({ path: filePath, extractedText: 'A scanned page.' }, opts());
+    writeSavedSignature('tall', buildSignaturePng({ width: 20, height: 300, ink: { x: 2, y: 5, w: 16, h: 280 } }));
+
+    // pixelY near 0 -> pdfY near the page's top edge (200pt); any
+    // meaningful height pushes pdfY + height past 200.
+    const result = await fillDocumentFieldImpl(
+      { document: 'scan', pixelX: 40, pixelY: 2, signatureName: 'tall' },
+      opts(),
+    );
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text.toLowerCase()).toContain('edge');
+  });
+});
+
+describe('fill_document_field — PDF, degenerate AcroForm widget rectangle', () => {
+  it('declines instead of returning a false success for a zero-area rect', async () => {
+    const pdfBytes = await buildAcroFormPdfWithZeroRect('Signature');
+    const filePath = writeInboxFile('form.pdf', pdfBytes);
+    await saveDocumentImpl({ path: filePath }, opts());
+    await saveDocumentImpl({ path: filePath, extractedText: 'A form with a zero-rect field.' }, opts());
+    writeSavedSignature('uriel', buildSignaturePng({ width: 40, height: 20, ink: { x: 5, y: 5, w: 20, h: 10 } }));
+
+    const result = await fillDocumentFieldImpl(
+      { document: 'form', fieldName: 'Signature', signatureName: 'uriel' },
+      opts(),
+    );
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text.toLowerCase()).toContain('degenerate');
+    expect(fs.existsSync(path.join(baseDir, '.document-fills'))).toBe(false);
+  });
+});
+
+describe('fill_document_field — PDF, AcroForm signature stamp against a non-text/multi-widget field', () => {
+  it('declines cleanly for a checkbox field rather than picking an arbitrary widget', async () => {
+    const pdfBytes = await buildAcroFormCheckboxPdf('Agree');
+    const filePath = writeInboxFile('form.pdf', pdfBytes);
+    await saveDocumentImpl({ path: filePath }, opts());
+    await saveDocumentImpl({ path: filePath, extractedText: 'A form with a checkbox.' }, opts());
+    writeSavedSignature('uriel', buildSignaturePng({ width: 40, height: 20, ink: { x: 5, y: 5, w: 20, h: 10 } }));
+
+    const result = await fillDocumentFieldImpl({ document: 'form', fieldName: 'Agree', signatureName: 'uriel' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('Agree');
+    expect(result.content[0].text).toContain("isn't a fillable text field");
+    expect(fs.existsSync(path.join(baseDir, '.document-fills'))).toBe(false);
+  });
+
+  it('declines cleanly for a text field with more than one widget', async () => {
+    const pdfBytes = await buildAcroFormPdfWithTwoWidgets('Signature');
+    const filePath = writeInboxFile('form.pdf', pdfBytes);
+    await saveDocumentImpl({ path: filePath }, opts());
+    await saveDocumentImpl({ path: filePath, extractedText: 'A form with a two-widget field.' }, opts());
+    writeSavedSignature('uriel', buildSignaturePng({ width: 40, height: 20, ink: { x: 5, y: 5, w: 20, h: 10 } }));
+
+    const result = await fillDocumentFieldImpl(
+      { document: 'form', fieldName: 'Signature', signatureName: 'uriel' },
+      opts(),
+    );
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('Signature');
+    expect(result.content[0].text).toContain('2 widgets');
+    expect(fs.existsSync(path.join(baseDir, '.document-fills'))).toBe(false);
+  });
+});
+
+describe('fill_document_field — PDF, AcroForm signature stamp, multi-page widget->page resolution', () => {
+  it('stamps on the page the widget is actually on (page 2), via the /P fast path', async () => {
+    const pdfBytes = await buildMultiPageAcroFormPdf('Signature');
+    const filePath = writeInboxFile('form.pdf', pdfBytes);
+    await saveDocumentImpl({ path: filePath }, opts());
+    await saveDocumentImpl({ path: filePath, extractedText: 'A two-page form, field on page 2.' }, opts());
+    writeSavedSignature('uriel', buildSignaturePng({ width: 100, height: 50, ink: { x: 10, y: 10, w: 80, h: 30 } }));
+
+    const result = await fillDocumentFieldImpl(
+      { document: 'form', fieldName: 'Signature', signatureName: 'uriel' },
+      opts(),
+    );
+    expect(result.isError).toBeFalsy();
+
+    const outPath = extractOutPath(result.content[0].text);
+    const { PDFDocument } = await import('pdf-lib');
+    const filledDoc = await PDFDocument.load(fs.readFileSync(outPath));
+    const [page1, page2] = filledDoc.getPages();
+
+    const page1Text = await getPageContentsText(page1);
+    expect(() => extractImageDraw(page1Text)).toThrow(); // nothing drawn on page 1
+
+    const page2Text = await getPageContentsText(page2);
+    const draw = extractImageDraw(page2Text); // does not throw — image is here
+    expect(draw.width).toBeGreaterThan(0);
+    expect(draw.height).toBeGreaterThan(0);
+  });
+
+  it('stamps on the correct page via the /Annots-scan fallback when /P is stripped', async () => {
+    const pdfBytes = await buildMultiPageAcroFormPdf('Signature', { stripP: true });
+    const filePath = writeInboxFile('form.pdf', pdfBytes);
+    await saveDocumentImpl({ path: filePath }, opts());
+    await saveDocumentImpl({ path: filePath, extractedText: 'A two-page form, field on page 2, /P stripped.' }, opts());
+    writeSavedSignature('uriel', buildSignaturePng({ width: 100, height: 50, ink: { x: 10, y: 10, w: 80, h: 30 } }));
+
+    const result = await fillDocumentFieldImpl(
+      { document: 'form', fieldName: 'Signature', signatureName: 'uriel' },
+      opts(),
+    );
+    expect(result.isError).toBeFalsy();
+
+    const outPath = extractOutPath(result.content[0].text);
+    const { PDFDocument } = await import('pdf-lib');
+    const filledDoc = await PDFDocument.load(fs.readFileSync(outPath));
+    const [page1, page2] = filledDoc.getPages();
+
+    const page1Text = await getPageContentsText(page1);
+    expect(() => extractImageDraw(page1Text)).toThrow();
+
+    const page2Text = await getPageContentsText(page2);
+    const draw = extractImageDraw(page2Text);
+    expect(draw.width).toBeGreaterThan(0);
+    expect(draw.height).toBeGreaterThan(0);
+  });
+});
+
+describe('fill_document_field — PDF, AcroForm signature stamp, malformed /Annots entry', () => {
+  it('skips a non-dict Annots entry during the fallback scan instead of throwing uncaught', async () => {
+    // /P stripped forces the fallback scan; a bogus (non-dict) entry is
+    // spliced into page 2's own /Annots array ahead of the real widget ref
+    // so the scan has to survive it and keep going.
+    const { PDFDocument, PDFName } = await import('pdf-lib');
+    const pdfDoc = await PDFDocument.create();
+    const page1 = pdfDoc.addPage([200, 200]);
+    const page2 = pdfDoc.addPage([200, 200]);
+    const form = pdfDoc.getForm();
+    const textField = form.createTextField('Signature');
+    textField.addToPage(page2, { x: 20, y: 100, width: 150, height: 20 });
+
+    const widget = form.getTextField('Signature').acroField.getWidgets()[0];
+    widget.dict.delete(PDFName.of('P'));
+
+    // A bare PDFNumber pushed directly (not as a ref) into /Annots — dereferencing
+    // it with .lookup(i, PDFDict) throws UnexpectedObjectTypeError in production
+    // pdf-lib, exactly the malformed-entry case this patch guards against.
+    const annots = page2.node.Annots();
+    if (!annots) throw new Error('expected page 2 to already have an /Annots array from addToPage');
+    annots.push(pdfDoc.context.obj(42));
+
+    const pdfBytes = Buffer.from(await pdfDoc.save());
+    const filePath = writeInboxFile('form.pdf', pdfBytes);
+    await saveDocumentImpl({ path: filePath }, opts());
+    await saveDocumentImpl({ path: filePath, extractedText: 'A two-page form with a malformed Annots entry.' }, opts());
+    writeSavedSignature('uriel', buildSignaturePng({ width: 100, height: 50, ink: { x: 10, y: 10, w: 80, h: 30 } }));
+
+    const result = await fillDocumentFieldImpl(
+      { document: 'form', fieldName: 'Signature', signatureName: 'uriel' },
+      opts(),
+    );
+    // Must not surface as the generic top-level "fill_document_field failed: ..." catch.
+    expect(result.content[0].text).not.toContain('fill_document_field failed');
+    expect(result.isError).toBeFalsy();
+
+    const outPath = extractOutPath(result.content[0].text);
+    const filledDoc = await PDFDocument.load(fs.readFileSync(outPath));
+    const page2Text = await getPageContentsText(filledDoc.getPages()[1]);
+    const draw = extractImageDraw(page2Text);
+    expect(draw.width).toBeGreaterThan(0);
+  });
+});
+
+describe('fill_document_field — PDF text-layer line, signature stamp', () => {
+  it('draws the image at the same anchor a text draw would use, max-height-constrained, aspect-preserved', async () => {
+    // A spacer first line pushes the target line ("Date: ______", line 2)
+    // down to y=140 — line 1's own y=160 only leaves 40pt of headroom above
+    // it on this fixture's 200pt-tall page, less than SIGNATURE_MAX_HEIGHT_PT
+    // (45), which the new off-page bounding-box check (rightly) declines.
+    const filePath = writeInboxFile('letter.pdf', buildMultilineTextPdf(['Name: ______', 'Date: ______']));
+    await saveDocumentImpl({ path: filePath }, opts());
+    writeSavedSignature('uriel', buildSignaturePng({ width: 100, height: 50, ink: { x: 10, y: 10, w: 80, h: 30 } }));
+
+    const result = await fillDocumentFieldImpl({ document: 'letter', lineNumber: 2, signatureName: 'uriel' }, opts());
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('the signature');
+    expect(result.content[0].text).not.toContain('undefined');
+
+    const outPath = extractOutPath(result.content[0].text);
+    const { PDFDocument } = await import('pdf-lib');
+    const filledDoc = await PDFDocument.load(fs.readFileSync(outPath));
+    const page = filledDoc.getPages()[0];
+    const contentsText = await getPageContentsText(page);
+    const draw = extractImageDraw(contentsText);
+
+    // buildMultilineTextPdf's line 2 is drawn at y=140.
+    expect(draw.y).toBeCloseTo(140, 0);
+    expect(draw.height).toBeCloseTo(SIGNATURE_MAX_HEIGHT_PT, 0);
+    expect(draw.width).toBeCloseTo(SIGNATURE_MAX_HEIGHT_PT * (100 / 50), 0);
+    expect(draw.x).toBeGreaterThan(20); // right of the line's own text start
+  });
+});
+
+describe('fill_document_field — PDF scanned pixel, signature stamp', () => {
+  it('draws the image at the pixel-converted position, max-height-constrained', async () => {
+    const filePath = writeInboxFile('scan.pdf', buildMinimalPdf(null));
+    await saveDocumentImpl({ path: filePath }, opts());
+    await saveDocumentImpl({ path: filePath, extractedText: 'A scanned page.' }, opts());
+    writeSavedSignature('uriel', buildSignaturePng({ width: 100, height: 50, ink: { x: 10, y: 10, w: 80, h: 30 } }));
+
+    // pixelY=60 -> pdfY=170, only 30pt of headroom above it on this 200pt
+    // page — less than SIGNATURE_MAX_HEIGHT_PT (45), which the off-page
+    // bounding-box check (rightly) declines. pixelY=140 -> pdfY=130, 70pt
+    // of headroom, comfortably fits.
+    const result = await fillDocumentFieldImpl({ document: 'scan', pixelX: 40, pixelY: 140, signatureName: 'uriel' }, opts());
+    expect(result.isError).toBeFalsy();
+
+    const outPath = extractOutPath(result.content[0].text);
+    const { PDFDocument } = await import('pdf-lib');
+    const filledDoc = await PDFDocument.load(fs.readFileSync(outPath));
+    const page = filledDoc.getPages()[0];
+    const contentsText = await getPageContentsText(page);
+    const draw = extractImageDraw(contentsText);
+
+    // buildMinimalPdf's MediaBox is 200x200; RENDER_SCALE=2 -> rendered
+    // image is 400x400px. pdfX = (40/400)*200 = 20; pdfY = 200 - (140/400)*200 = 130.
+    expect(draw.x).toBeCloseTo(20, 0);
+    expect(draw.y).toBeCloseTo(130, 0);
+    expect(draw.height).toBeCloseTo(SIGNATURE_MAX_HEIGHT_PT, 0);
+    expect(draw.width).toBeCloseTo(SIGNATURE_MAX_HEIGHT_PT * (100 / 50), 0);
+  });
+});
+
+describe('fill_document_field — PDF, signature + value together (line target)', () => {
+  it('draws both the image and text beside it, same call, same baseline', async () => {
+    // Spacer first line — see the previous describe block's comment: line
+    // 1 alone doesn't leave enough headroom above it for a 45pt-tall image
+    // on this fixture's 200pt page.
+    const filePath = writeInboxFile('letter.pdf', buildMultilineTextPdf(['Spacer', 'Name: ______']));
+    await saveDocumentImpl({ path: filePath }, opts());
+    writeSavedSignature('uriel', buildSignaturePng({ width: 100, height: 50, ink: { x: 10, y: 10, w: 80, h: 30 } }));
+
+    const result = await fillDocumentFieldImpl(
+      { document: 'letter', lineNumber: 2, signatureName: 'uriel', value: '2026-08-17' },
+      opts(),
+    );
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('the signature and "2026-08-17"');
+
+    const outPath = extractOutPath(result.content[0].text);
+    const text = await extractAllPdfText(outPath);
+    expect(text).toContain('2026-08-17');
+    expect(text).toContain('Name:');
+
+    const { PDFDocument } = await import('pdf-lib');
+    const filledDoc = await PDFDocument.load(fs.readFileSync(outPath));
+    const page = filledDoc.getPages()[0];
+    const contentsText = await getPageContentsText(page);
+    const draw = extractImageDraw(contentsText);
+    const tmPositions = extractTmPositions(contentsText);
+    expect(tmPositions.length).toBeGreaterThan(0);
+    expect(tmPositions[0].x).toBeCloseTo(draw.x + draw.width + GAP_PT, 0);
+    expect(tmPositions[0].y).toBeCloseTo(draw.y, 0);
+  });
+});
+
+describe('fill_document_field — PDF, unknown signature name', () => {
+  it('declines and lists the saved signature names actually present', async () => {
+    const filePath = writeInboxFile('letter.pdf', buildMultilineTextPdf(['Name: ______']));
+    await saveDocumentImpl({ path: filePath }, opts());
+    writeSavedSignature('uriel', buildSignaturePng({ width: 40, height: 20, ink: { x: 5, y: 5, w: 20, h: 10 } }));
+
+    const result = await fillDocumentFieldImpl({ document: 'letter', lineNumber: 1, signatureName: 'bob' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('bob');
+    expect(result.content[0].text).toContain('uriel');
+  });
+
+  it('says none saved yet when memory/signatures has nothing saved', async () => {
+    const filePath = writeInboxFile('letter.pdf', buildMultilineTextPdf(['Name: ______']));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'letter', lineNumber: 1, signatureName: 'bob' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text.toLowerCase()).toContain('no signatures are saved yet');
+  });
+
+  it('errors immediately on a bad signatureName even with no target given — never silently reaches discovery', async () => {
+    const filePath = writeInboxFile('letter.pdf', buildMultilineTextPdf(['Name: ______']));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'letter', signatureName: 'nope' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('nope');
+  });
+
+  it('treats a signatureName containing a path separator as a miss rather than resolving it against the filesystem', async () => {
+    const filePath = writeInboxFile('letter.pdf', buildMultilineTextPdf(['Name: ______']));
+    await saveDocumentImpl({ path: filePath }, opts());
+    writeSavedSignature('uriel', buildSignaturePng({ width: 40, height: 20, ink: { x: 5, y: 5, w: 20, h: 10 } }));
+
+    const result = await fillDocumentFieldImpl(
+      { document: 'letter', lineNumber: 1, signatureName: '../uriel' },
+      opts(),
+    );
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('../uriel');
+  });
+});
+
+describe('fill_document_field — signatureName against a .docx document', () => {
+  it('declines clearly instead of attempting Word signature stamping or silently ignoring signatureName', async () => {
+    const filePath = writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]]));
+    await saveDocumentImpl({ path: filePath }, opts());
+    writeSavedSignature('uriel', buildSignaturePng({ width: 40, height: 20, ink: { x: 5, y: 5, w: 20, h: 10 } }));
+
+    const result = await fillDocumentFieldImpl({ document: 'report', signatureName: 'uriel' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('.docx');
+    expect(result.content[0].text).toContain('signatureName');
+    expect(fs.existsSync(path.join(baseDir, '.document-fills'))).toBe(false);
+  });
+});
+
+describe('fill_document_field — PDF, no target given, signatureName present', () => {
+  it('returns the identical discovery response the text-only path already returns', async () => {
+    const filePath = writeInboxFile('letter.pdf', buildMultilineTextPdf(['Name: ______', 'Date: ______']));
+    await saveDocumentImpl({ path: filePath }, opts());
+    writeSavedSignature('uriel', buildSignaturePng({ width: 40, height: 20, ink: { x: 5, y: 5, w: 20, h: 10 } }));
+
+    const withoutSignature = await fillDocumentFieldImpl({ document: 'letter' }, opts());
+    const withSignature = await fillDocumentFieldImpl({ document: 'letter', signatureName: 'uriel' }, opts());
+
+    expect(withSignature.isError).toBeFalsy();
+    expect(withSignature.content[0].text).toBe(withoutSignature.content[0].text);
+    expect(fs.existsSync(path.join(baseDir, '.document-fills'))).toBe(false);
+  });
+
+  it('same equivalence on the AcroForm auto-discovery response', async () => {
+    const pdfBytes = await buildTextPdfWithAcroForm('Name: ______', 'Name');
+    const filePath = writeInboxFile('form.pdf', pdfBytes);
+    await saveDocumentImpl({ path: filePath }, opts());
+    writeSavedSignature('uriel', buildSignaturePng({ width: 40, height: 20, ink: { x: 5, y: 5, w: 20, h: 10 } }));
+
+    const withoutSignature = await fillDocumentFieldImpl({ document: 'form' }, opts());
+    const withSignature = await fillDocumentFieldImpl({ document: 'form', signatureName: 'uriel' }, opts());
+
+    expect(withSignature.isError).toBeFalsy();
+    expect(withSignature.content[0].text).toBe(withoutSignature.content[0].text);
+  });
+});
+
+describe('fill_document_field — signature stamping, end-to-end with save_signature', () => {
+  it('stamps a signature actually produced by save_signature (cropped/thresholded), not a hand-built fixture', async () => {
+    // Spacer first line, same reasoning as above.
+    const filePath = writeInboxFile('letter.pdf', buildMultilineTextPdf(['Spacer', 'Name: ______']));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const sigPath = writeInboxFile(
+      'sig.png',
+      buildSignaturePng({ width: 100, height: 50, ink: { x: 10, y: 10, w: 80, h: 30 } }),
+    );
+    const saveResult = await saveSignatureImpl({ path: sigPath, name: 'uriel' }, opts());
+    expect(saveResult.isError).toBeFalsy();
+
+    const result = await fillDocumentFieldImpl({ document: 'letter', lineNumber: 2, signatureName: 'uriel' }, opts());
+    expect(result.isError).toBeFalsy();
+    const outPath = extractOutPath(result.content[0].text);
+    expect(fs.existsSync(outPath)).toBe(true);
+    const bytes = fs.readFileSync(outPath);
+    expect(bytes.subarray(0, 5).toString('latin1')).toBe('%PDF-');
+  });
+});
+
+describe('fill_document_field — signature stamping, stored canonical copy never modified', () => {
+  it('leaves the stored .pdf untouched', async () => {
+    const filePath = writeInboxFile('letter.pdf', buildMultilineTextPdf(['Name: ______']));
+    await saveDocumentImpl({ path: filePath }, opts());
+    writeSavedSignature('uriel', buildSignaturePng({ width: 40, height: 20, ink: { x: 5, y: 5, w: 20, h: 10 } }));
+
+    const rawPath = path.join(baseDir, 'memory', 'documents', 'files', 'letter.pdf');
+    const rawBefore = fs.readFileSync(rawPath);
+
+    await fillDocumentFieldImpl({ document: 'letter', lineNumber: 1, signatureName: 'uriel' }, opts());
+
+    expect(fs.readFileSync(rawPath).equals(rawBefore)).toBe(true);
   });
 });
