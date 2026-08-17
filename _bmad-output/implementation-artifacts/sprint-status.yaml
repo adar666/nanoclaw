@@ -43,7 +43,7 @@ development_status:
   1-5-support-legacy-doc-files-save-recall-and-fill-via-conversion: done
   1-6-save-a-reusable-signature-asset: done
   1-7-stamp-a-saved-signature-into-a-saved-pdf: done
-  1-8-stamp-a-saved-signature-into-a-saved-docx: backlog
+  1-8-stamp-a-saved-signature-into-a-saved-docx: in-progress
   epic-1-retrospective: done
 action_items:
   - id: "epic-1-retro-item-1-add-log-calls-to-list_documents-fill_doc"
