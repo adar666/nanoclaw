@@ -51,6 +51,7 @@ NFR7: When the target saved document is ambiguous, the agent presents a numbered
 - **AD-13** `.doc` support: `word-extractor` (pure-JS, base-image dependency) extracts text for the read path (save/recall) — no LibreOffice needed there. `libreoffice-writer` (apt system dependency, headless) converts `.doc`→`.docx` once for the fill path, after which the existing docx fill pipeline (AD-5/AD-12) runs unchanged. Output is always `.docx`, never a reconstructed `.doc`. User-approved despite the container image size cost; `soffice`-dependent tests must detect its absence and skip gracefully since the host `bun test` sandbox has no LibreOffice installed.
 - **AD-14** New `save_signature` MCP tool: decodes an input PNG (`pngjs`, pure JS), thresholds near-white pixels to `alpha: 0` (fixed luminance cutoff, not configurable), computes the bounding box of remaining non-transparent pixels, crops to it, and writes to `groups/<folder>/memory/signatures/<name>.png` — reuses `documents.ts`'s existing hand-rolled `encodePng` (Story 1.1's scanned-PDF render path) for the write side. Same per-agent-group storage scoping as `memory/documents/` — no cross-group read; a signature usable from more than one group is saved once per group, response text makes this explicit.
 - **AD-15** `fill_document_field` gains an optional `signatureName` argument, PDF-only in this story: resolves `memory/signatures/<name>.png` by exact filename match (directory-listed on a miss, for a usable error), embeds it via `pdf-lib`'s `pdfDoc.embedPng` + `page.drawImage`, and places it at whichever PDF target the call already resolves to (AcroForm field → the field's widget rectangle; text-layer line → same x/y as a text draw would use; scanned-page pixel position → same pixelX/pixelY conversion as a text draw). A fixed max-height (not a new argument) with aspect ratio preserved from the source PNG's natural pixel dimensions. `value` may be given alongside `signatureName` to draw a text value (e.g. a date) immediately beside the image, reusing the existing per-target text-draw logic offset by the image's drawn width. `signatureName` against a `.docx`/`.doc` document declines clearly — that stamping mode is a separate, later story (spine Constraints).
+- **AD-16** `signatureName` extended to `.docx` (and, for free via the existing `.doc`→`.docx` conversion delegation, `.doc`): a new OOXML media part (`word/media/image<n>.png`) plus a `word/_rels/document.xml.rels` relationship entry plus a `[Content_Types].xml` PNG default (added only if not already present) are written into the zip alongside the existing `word/document.xml` edit. The image is embedded as an inline `<w:drawing>` run, sized via a fixed max-height (EMU, same ballpark as AD-15's PDF constant) with aspect preserved (dimensions read via `pngjs`, already a dependency from AD-14). The run is **always inserted, never a replacement** for existing content — appended into the target table cell's last paragraph (or table-row target) or right after the target paragraph (fill-in-the-blank-line target) — matching the existing insertion helpers' shape (`insertRunIntoCell`/`insertRunAfterParagraph`) rather than the text-fill paths' in-place-splice behavior, since a signature has no natural "text to replace." `value` alongside `signatureName` inserts an additional text run immediately after the image run in the same paragraph. Requires moving `signatureName` out of the (now-stale) `PDF_ONLY_ARGS` gate from AD-15, since it is no longer PDF-exclusive.
 - New `container/skills/document-memory/SKILL.md` (agent-facing prose, same shape as `audio-report/SKILL.md`) teaches the agent when/how to call the three tools and how to run the numbered-pick-list disambiguation.
 - Deferred (spine-acknowledged, not built now): whether an edit refreshes the stored raw copy and/or stored extracted text (default: neither — a re-save is a separate, unspecified action); OCR fallback if agent-vision reading proves insufficient in practice; multi-file/batch fill operations; version history/undo for edited documents.
 
@@ -67,7 +68,7 @@ N/A — no UX design contract exists and none is needed. This feature has no UI 
 | FR3 | CAP-3 | AD-1, AD-2, AD-3, AD-4, AD-5, AD-7, AD-8, AD-10, AD-12 |
 | FR4 | CAP-4 | AD-1, AD-3, AD-13 |
 | FR5 | CAP-5 | AD-1, AD-14 |
-| FR6 | CAP-6 | AD-1, AD-15 |
+| FR6 | CAP-6 | AD-1, AD-15, AD-16 |
 | NFR1, NFR2, NFR3 | CAP-1, CAP-3 | AD-4, AD-5 |
 | NFR4 | CAP-1, CAP-2 | AD-6 |
 | NFR5 | CAP-3 | (existing `send_file`, unchanged) |
@@ -303,5 +304,37 @@ So that I get back a signed document without printing, signing by hand, and resc
 **Then** it declines clearly, listing the signature names that do exist (or that none are saved yet) — never guesses or silently skips the stamp
 
 **Given** a `signatureName` argument on a `.docx` or `.doc` document
+**When** `fill_document_field` runs (this story's predecessor, Story 1.7)
+**Then** it declines clearly that signature stamping into Word documents isn't supported yet (superseded by Story 1.8 below)
+
+### Story 1.8: Stamp a Saved Signature into a Saved .docx
+
+As a NanoClaw user,
+I want to tell my agent to sign (and optionally date) a Word document I've already saved, using a signature I saved earlier,
+So that I get back a signed document the same way I already can for a PDF.
+
+**Acceptance Criteria:**
+
+**Given** a saved `.docx` with a matching table row and a saved signature name
+**When** the user asks to stamp that row/cell with the signature
+**Then** the image is embedded as a new OOXML media part, referenced via a new relationship, and inserted as an additional run in that cell's last paragraph — existing cell content (if any) is untouched, not replaced (FR6, AD-16)
+
+**Given** a saved `.docx` with a fill-in-the-blank line matching a `lineNumber` and a saved signature name, no matching table
+**When** the user asks to stamp that line with the signature
+**Then** the image run is inserted right after the target paragraph, same insertion point a text fill-in-the-blank would use
+
+**Given** a signature name and a text `value` (e.g. a date) given together for the same target
 **When** `fill_document_field` runs
-**Then** it declines clearly that signature stamping into Word documents isn't supported yet (spine Constraints — that's a separate, later story)
+**Then** the image run is inserted, followed immediately by a text run with the value, in the same paragraph, one new `.docx`, one call
+
+**Given** a saved `.doc` (legacy binary) document, converted to `.docx` via the existing Story 1.5 pipeline, and a saved signature name
+**When** the user asks to stamp it
+**Then** the same `.docx` image-stamping logic runs against the converted file unchanged (no new `.doc`-specific code), and the response still discloses the `.docx` output format
+
+**Given** a `signatureName` that doesn't match any saved signature
+**When** `fill_document_field` runs against a `.docx`/`.doc` document
+**Then** it declines clearly, listing actual saved signature names — same behavior as the PDF path (Story 1.7)
+
+**Given** the produced `.docx` after a signature stamp
+**When** it's inspected (`word/document.xml`, `word/media/`, `word/_rels/document.xml.rels`, `[Content_Types].xml`)
+**Then** it opens as a well-formed, valid `.docx` — the new relationship and content-type entries are present and correctly reference the new media part, and any pre-existing image relationships/media parts in the source document are untouched
