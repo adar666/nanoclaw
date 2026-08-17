@@ -2,7 +2,7 @@
 title: 'Create an Event on Your Own Calendar'
 type: 'feature'
 created: '2026-08-17'
-status: 'in-progress'
+status: 'done'
 review_loop_iteration: 0
 context: []
 baseline_commit: '70cfafd'
@@ -63,10 +63,10 @@ baseline_commit: '70cfafd'
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `container/agent-runner/src/index.ts` (or the correct startup point) -- `NODE_EXTRA_CA_CERTS ??= SSL_CERT_FILE` shim (AD-15)
-- [ ] `container/agent-runner/src/mcp-tools/calendar.ts` -- `create_calendar_event` tool: arg validation, timezone conversion, `fetch()` call, gateway-error parsing, success response
-- [ ] `container/agent-runner/src/mcp-tools/calendar.test.ts` -- bun:test coverage for the I/O matrix above (mock `fetch` for unit tests; a real end-to-end call against the actual gateway is a separate, manual verification step — this story's tests do not require live Google Calendar credentials to pass)
-- [ ] `container/skills/calendar/SKILL.md` -- new skill file (AD-14)
+- [x] `container/agent-runner/src/index.ts` -- `NODE_EXTRA_CA_CERTS ??= SSL_CERT_FILE`-equivalent shim (AD-15) + the critical `nanoclaw` MCP server `env: {}` → `env: { ...process.env }` fix (see Spec Change Log)
+- [x] `container/agent-runner/src/mcp-tools/calendar.ts` -- `create_calendar_event` tool: arg validation, timezone conversion, `fetch()` call, gateway-error parsing, success response
+- [x] `container/agent-runner/src/mcp-tools/calendar.test.ts` -- bun:test coverage for the I/O matrix above (mock `fetch` for unit tests; a real end-to-end call against the actual gateway is a separate, manual verification step — this story's tests do not require live Google Calendar credentials to pass)
+- [x] `container/skills/calendar/SKILL.md` -- new skill file (AD-14)
 
 **Acceptance Criteria:**
 - Given the story is complete, when `cd container/agent-runner && bun test` runs, then all tests pass using mocked `fetch` responses (real credentials aren't available in the test sandbox).
@@ -75,7 +75,9 @@ baseline_commit: '70cfafd'
 
 ## Spec Change Log
 
-(none yet — record here if implementation surfaces a genuine deviation from the frozen Boundaries above)
+- 2026-08-17 (implementation, well-justified deviation from literal Boundary text): the frozen Boundaries specify `NODE_EXTRA_CA_CERTS ??= SSL_CERT_FILE`. The implementation uses an explicit `if (SSL_CERT_FILE && !NODE_EXTRA_CA_CERTS)` guard instead — `??=` on a `process.env` key would coerce a genuinely-unset value through `undefined`-stringification in a way this codebase's own conventions avoid; the explicit guard is behaviorally equivalent and safer. Verified by `tls-shim.test.ts`'s dedicated case for a pre-existing `NODE_EXTRA_CA_CERTS` value.
+
+- 2026-08-17 (code review — blind-hunter/edge-case-hunter/verification-gap, 6 patch findings applied, 1 CRITICAL pre-existing bug found and fixed, rest deferred): all three review lenses independently converged on the same critical finding, which I then verified myself by reading the actual installed `@modelcontextprotocol/sdk` package and grepping the compiled Claude Code binary directly: `container/agent-runner/src/index.ts`'s `nanoclaw` MCP server entry used `env: {}` (pre-existing code, predating this story) — the MCP stdio transport spawns each server with a curated 6-variable safe-list (`HOME`/`LOGNAME`/`PATH`/`SHELL`/`TERM`/`USER`) merged with the server's own `env`, never full `process.env` by default. An empty `env: {}` meant the subprocess actually running `calendar.ts`'s `fetch()` never received `HTTPS_PROXY`, `SSL_CERT_FILE`, or `NODE_EXTRA_CA_CERTS` at all — not just breaking AD-15's TLS shim, but AD-1's entire premise that calendar calls route through the OneCLI gateway. Every real call would have gone straight to Google with zero credential injection and failed outright. Fixed to `env: { ...process.env }` (correct here since `nanoclaw` is this codebase's own first-party server, not an untrusted third party — the curated-default security rationale doesn't apply), with a new structural regression test (`index.wiring.test.ts`) asserting the source text never regresses to a literal `env: {}` again — confirmed to actually catch the regression by reverting the fix locally, watching the test fail, then restoring it. Also fixed: no local chronological validation (`end <= start` silently sent to Google unvalidated); no per-item guest-email format validation (non-string/malformed entries silently coerced into bogus attendees); a blanket 401/403 → "not connected" relabeling that discarded the real error body whenever no setup URL was actually found in it (masking real Google errors like quota/scope/permission issues as a false "reconnect" prompt); no request timeout (an unbounded `fetch()` could hang the whole agent turn — now a 30s `AbortSignal.timeout`); and a guest-confirmation message built from the request body rather than what Google's response actually echoed back (a dropped/rejected guest would have been falsely confirmed as invited). **Deferred, not fixed** (logged to `ARCHITECTURE-SPINE.md`'s Deferred section): no idempotency/`iCalUID` dedup key against a duplicate retry; raw network-error messages surfaced verbatim to chat text (minor infra-detail-leak risk); `SKILL.md` wording around a real (non-not-connected) 403 case, moot once the blanket-relabeling fix landed. **Verified independently**, not just self-reported: re-ran `cd container/agent-runner && bun test` three times (340 pass, 8 skip, 0 fail every run) and `pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit` (clean) myself after the patch round, and independently confirmed the critical `index.ts` fix by reading the actual diff before accepting the implementer's report.
 
 ## Design Notes
 
@@ -95,4 +97,13 @@ Testing the TLS shim without live credentials: the shim itself (setting an env v
 
 ## Suggested Review Order
 
-(filled in at story completion, once real line numbers exist)
+- Start here -- the critical env-inheritance fix and why it's correct.
+  [`index.ts:91-116`](../../container/agent-runner/src/index.ts#L91), [`index.wiring.test.ts`](../../container/agent-runner/src/index.wiring.test.ts)
+- TLS shim (AD-15), now actually reachable thanks to the fix above.
+  [`tls-shim.ts`](../../container/agent-runner/src/tls-shim.ts)
+- Tool handler -- arg validation, timezone conversion, guest-email validation, chronological check, timeout, gateway-error handling.
+  [`calendar.ts:132`](../../container/agent-runner/src/mcp-tools/calendar.ts#L132)
+- Test suite.
+  [`calendar.test.ts:35`](../../container/agent-runner/src/mcp-tools/calendar.test.ts#L35)
+- Agent-facing usage guide.
+  [`SKILL.md`](../../container/skills/calendar/SKILL.md)
