@@ -1238,6 +1238,266 @@ function insertRunIntoCell(xml: string, cellNode: XmlNode, value: string): strin
   return xml.slice(0, insertAt) + `<w:p>${runXml}</w:p>` + xml.slice(insertAt);
 }
 
+// ---------------------------------------------------------------------------
+// .docx signature stamping (Story 1.8) — embeds a saved signature PNG
+// (resolveSignaturePng, Story 1.7, reused unmodified) as a new OOXML media
+// part and inserts it as an *additional* <w:drawing> run at whichever
+// table-cell or fill-in-the-blank-line target fillDocx already resolved —
+// never a replacement for existing text (unlike a plain text `value` fill).
+//
+// Three zip parts always change together: `word/media/imageN.png`, a new
+// relationship in `word/_rels/document.xml.rels`, and (only if none already
+// exists) a PNG `<Default>` entry in `[Content_Types].xml`. The "next free
+// id" computations below always read from the *original*, pre-edit zip
+// contents, so they can never collide with anything already present in the
+// source .docx — including a pre-existing embedded image's own media file/
+// relationship/content-type entries, which are left untouched.
+// ---------------------------------------------------------------------------
+
+/** EMU per point (ECMA-376 DrawingML) — the unit wp:extent/a:ext expect. */
+const EMU_PER_POINT = 12700;
+
+const RELATIONSHIPS_XML_NS = 'http://schemas.openxmlformats.org/package/2006/relationships';
+const IMAGE_RELATIONSHIP_TYPE = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/image';
+const CONTENT_TYPES_NS = 'http://schemas.openxmlformats.org/package/2006/content-types';
+
+// Fallback shape used only when the source .docx's zip has no
+// word/_rels/document.xml.rels or [Content_Types].xml part at all — a real
+// Word-produced .docx always has both, but a hand-built/minimal test fixture
+// (or a genuinely malformed input) might not. Synthesizing a minimal valid
+// starting point here is strictly additive: it never removes or reinterprets
+// anything the source actually had, since these fallbacks are only ever used
+// when the part was entirely absent.
+const DEFAULT_RELS_XML =
+  '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + `<Relationships xmlns="${RELATIONSHIPS_XML_NS}"></Relationships>`;
+const DEFAULT_CONTENT_TYPES_XML =
+  '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + `<Types xmlns="${CONTENT_TYPES_NS}"></Types>`;
+
+/** Next free `rId<n>` in a relationships part — scans existing `Id="rId(\d+)"` occurrences (either quote style — XML allows single- or double-quoted attribute values), returns max+1 (1 if none found). */
+function nextRelationshipId(relsXml: string): number {
+  let max = 0;
+  const re = /\bId=["']rId(\d+)["']/g;
+  let m: RegExpExecArray | null;
+  // eslint-disable-next-line no-cond-assign
+  while ((m = re.exec(relsXml))) {
+    const n = parseInt(m[1], 10);
+    if (n > max) max = n;
+  }
+  return max + 1;
+}
+
+/** Next free `word/media/imageN.<ext>` number across every existing entry in the zip (any extension — an existing image1.jpeg still claims the number 1), returns max+1 (1 if none found). */
+function nextMediaImageNumber(zip: JSZipType): number {
+  let max = 0;
+  const re = /^word\/media\/image(\d+)\./;
+  zip.forEach((relPath) => {
+    const m = re.exec(relPath);
+    if (m) {
+      const n = parseInt(m[1], 10);
+      if (n > max) max = n;
+    }
+  });
+  return max + 1;
+}
+
+/** Appends a new image `<Relationship>` right before `</Relationships>`. */
+function addImageRelationship(relsXml: string, id: number, target: string): string {
+  const entry = `<Relationship Id="rId${id}" Type="${IMAGE_RELATIONSHIP_TYPE}" Target="${target}"/>`;
+  if (relsXml.includes('</Relationships>')) {
+    return relsXml.replace('</Relationships>', `${entry}</Relationships>`);
+  }
+  // Defensive fallback for a self-closing <Relationships/> root — never
+  // produced by DEFAULT_RELS_XML above, but cheap insurance against an
+  // atypical real-world producer.
+  return relsXml.replace(/<Relationships([^>]*)\/>/, `<Relationships$1>${entry}</Relationships>`);
+}
+
+/**
+ * Adds a `<Default Extension="png" .../>` entry unless a PNG `Default` (any
+ * quote style) is already present — never a duplicate. An OPC `Override` is
+ * deliberately NOT treated as sufficient: per OPC content-type resolution,
+ * an `Override` only applies to its own exact `PartName`, not to the `.png`
+ * extension generally — a `.docx` with a scoped Override for one existing
+ * image part but no extension-wide `Default` would otherwise leave the
+ * *new* `word/media/imageN.png` part with no applicable content-type
+ * mapping at all (an invalid OOXML package). Always adding the Default when
+ * none exists is harmless even alongside an unrelated Override — a
+ * redundant-but-consistent Default is spec-legal, unlike the false-negative
+ * the Override check used to produce.
+ */
+function ensurePngContentType(contentTypesXml: string): string {
+  if (/<Default\s+Extension=["']png["']/i.test(contentTypesXml)) return contentTypesXml;
+  const entry = '<Default Extension="png" ContentType="image/png"/>';
+  if (contentTypesXml.includes('</Types>')) {
+    return contentTypesXml.replace('</Types>', `${entry}</Types>`);
+  }
+  return contentTypesXml.replace(/<Types([^>]*)\/>/, `<Types$1>${entry}</Types>`);
+}
+
+/** Next free `<wp:docPr id="N">` in word/document.xml — scans for the current max (either quote style), returns max+1 (1 if none found). Duplicate docPr ids can make Word/LibreOffice misbehave. */
+function nextDocPrId(xml: string): number {
+  let max = 0;
+  const re = /<wp:docPr\b[^>]*\bid=["'](\d+)["']/g;
+  let m: RegExpExecArray | null;
+  // eslint-disable-next-line no-cond-assign
+  while ((m = re.exec(xml))) {
+    const n = parseInt(m[1], 10);
+    if (n > max) max = n;
+  }
+  return max + 1;
+}
+
+/** A PNG's natural pixel dimensions, via pngjs (Story 1.6's dependency) — used to derive an aspect-preserved width for a fixed max-height placement. */
+function readPngDimensions(bytes: Buffer): { width: number; height: number } {
+  const decoded = PNG.sync.read(bytes);
+  return { width: decoded.width, height: decoded.height };
+}
+
+/**
+ * The canonical minimal inline-image OOXML run (Design Notes). Namespaces
+ * (`wp`/`a`/`pic`/`r`) are declared inline on the elements that introduce
+ * each prefix, rather than assumed to already be declared on the source
+ * .docx's root `<w:document>` element — this keeps the run self-contained
+ * regardless of what the source producer happened to declare at the root.
+ */
+function buildDrawingRunXml(relId: number, widthEmu: number, heightEmu: number, docPrId: number): string {
+  return (
+    '<w:r><w:drawing>' +
+    '<wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" ' +
+    'distT="0" distB="0" distL="0" distR="0">' +
+    `<wp:extent cx="${widthEmu}" cy="${heightEmu}"/>` +
+    '<wp:effectExtent l="0" t="0" r="0" b="0"/>' +
+    `<wp:docPr id="${docPrId}" name="Picture ${docPrId}"/>` +
+    '<wp:cNvGraphicFramePr>' +
+    '<a:graphicFrameLocks xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" noChangeAspect="1"/>' +
+    '</wp:cNvGraphicFramePr>' +
+    '<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">' +
+    '<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">' +
+    '<pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">' +
+    '<pic:nvPicPr>' +
+    `<pic:cNvPr id="${docPrId}" name="Picture ${docPrId}"/>` +
+    '<pic:cNvPicPr/>' +
+    '</pic:nvPicPr>' +
+    '<pic:blipFill>' +
+    `<a:blip r:embed="rId${relId}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"/>` +
+    '<a:stretch><a:fillRect/></a:stretch>' +
+    '</pic:blipFill>' +
+    '<pic:spPr>' +
+    `<a:xfrm><a:off x="0" y="0"/><a:ext cx="${widthEmu}" cy="${heightEmu}"/></a:xfrm>` +
+    '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>' +
+    '</pic:spPr>' +
+    '</pic:pic>' +
+    '</a:graphicData>' +
+    '</a:graphic>' +
+    '</wp:inline>' +
+    '</w:drawing></w:r>'
+  );
+}
+
+/** Additional text run following a stamped image, same run-construction convention as insertRunAfterParagraph — a leading space keeps it from visually running into the image. */
+function buildSignatureValueRunXml(value: string): string {
+  return `<w:r><w:t xml:space="preserve"> ${xmlEscapeText(value)}</w:t></w:r>`;
+}
+
+/** Table-cell target, image case: appends into the cell's last paragraph (or a new paragraph if it has none) — mirrors insertRunIntoCell's insertion point, but used unconditionally for an image regardless of whether the cell already has text. */
+function appendRunXmlIntoCell(xml: string, cellNode: XmlNode, runXml: string): string {
+  const paragraphs = cellNode.children.filter((c) => c.tag === 'p');
+  if (paragraphs.length > 0) {
+    const lastP = paragraphs[paragraphs.length - 1];
+    if (lastP.close === -1) throw new Error('Malformed table cell XML (unclosed paragraph) — cannot stamp.');
+    const insertAt = lastP.close;
+    return xml.slice(0, insertAt) + runXml + xml.slice(insertAt);
+  }
+  if (cellNode.close === -1) throw new Error('Malformed table cell XML (unclosed cell) — cannot stamp.');
+  const insertAt = cellNode.close;
+  return xml.slice(0, insertAt) + `<w:p>${runXml}</w:p>` + xml.slice(insertAt);
+}
+
+/** Fill-in-the-blank-line target, image case: appends right after the target paragraph's existing content — mirrors insertRunAfterParagraph's insertion point, but used unconditionally for an image regardless of whether the paragraph matched via an underscore blank or a trailing-colon label (the existing blank/label text is never touched). */
+function appendRunXmlAfterParagraph(xml: string, pNode: XmlNode, runXml: string): string {
+  const runs = pNode.children.filter((c) => c.tag === 'r');
+  if (runs.length > 0) {
+    const lastRun = runs[runs.length - 1];
+    if (lastRun.end === -1) throw new Error('Malformed paragraph XML (unclosed run) — cannot stamp.');
+    const insertAt = lastRun.end;
+    return xml.slice(0, insertAt) + runXml + xml.slice(insertAt);
+  }
+  if (pNode.close === -1) throw new Error('Malformed paragraph XML (unclosed paragraph) — cannot stamp.');
+  const insertAt = pNode.close;
+  return xml.slice(0, insertAt) + runXml + xml.slice(insertAt);
+}
+
+interface SignatureStampParts {
+  /** The drawing run XML, plus an additional text run right after it when `value` was also given — ready to splice into word/document.xml at the resolved target's insertion point. */
+  insertXml: string;
+  mediaNumber: number;
+  /** word/_rels/document.xml.rels content, already updated with the new relationship. */
+  relsXml: string;
+  /** [Content_Types].xml content, already updated (or left as-is if a PNG Default already existed). */
+  contentTypesXml: string;
+}
+
+/**
+ * Reads whatever's needed from the *original*, unmodified zip (rels,
+ * content-types, existing document.xml) to compute every next-free id, then
+ * returns the ready-to-splice run XML and the two updated part contents —
+ * the caller still has to actually splice insertXml into document.xml and
+ * write all four zip.file(...) calls (document.xml, media, rels,
+ * content-types) together before generateAsync (spec: "all three or none").
+ *
+ * Returns `{ error }` instead when the signature PNG's dimensions are
+ * degenerate (width or height <= 0) — reachable if a file was hand-placed
+ * under memory/signatures/ bypassing save_signature's own empty-bbox guard,
+ * or corrupted after saving. Dividing by a zero height to derive the
+ * aspect-preserved width would otherwise produce Infinity/NaN and emit an
+ * invalid `cx="Infinity"` attribute into the drawing XML.
+ */
+async function prepareSignatureStamp(
+  zip: JSZipType,
+  documentXml: string,
+  signaturePng: Buffer,
+  value: string | undefined,
+): Promise<SignatureStampParts | { error: string }> {
+  const dims = readPngDimensions(signaturePng);
+  if (dims.width <= 0 || dims.height <= 0) {
+    return {
+      error:
+        `The saved signature image has degenerate dimensions (${dims.width}x${dims.height}px) — cannot size it ` +
+        'for stamping.',
+    };
+  }
+  const heightEmu = SIGNATURE_MAX_HEIGHT_PT * EMU_PER_POINT;
+  const widthEmu = Math.round(heightEmu * (dims.width / dims.height));
+
+  const mediaNumber = nextMediaImageNumber(zip);
+
+  const relsFile = zip.file('word/_rels/document.xml.rels');
+  const relsXmlOriginal = relsFile ? await relsFile.async('string') : DEFAULT_RELS_XML;
+  const relId = nextRelationshipId(relsXmlOriginal);
+
+  const contentTypesFile = zip.file('[Content_Types].xml');
+  const contentTypesXmlOriginal = contentTypesFile ? await contentTypesFile.async('string') : DEFAULT_CONTENT_TYPES_XML;
+
+  const docPrId = nextDocPrId(documentXml);
+  const drawingRunXml = buildDrawingRunXml(relId, widthEmu, heightEmu, docPrId);
+  const insertXml = value !== undefined ? drawingRunXml + buildSignatureValueRunXml(value) : drawingRunXml;
+
+  return {
+    insertXml,
+    mediaNumber,
+    relsXml: addImageRelationship(relsXmlOriginal, relId, `media/image${mediaNumber}.png`),
+    contentTypesXml: ensurePngContentType(contentTypesXmlOriginal),
+  };
+}
+
+/** Writes all three new/updated zip parts together, alongside the (already-spliced) new document.xml — never a partial subset. */
+function applySignatureZipParts(zip: JSZipType, newDocumentXml: string, signaturePng: Buffer, parts: SignatureStampParts): void {
+  zip.file('word/document.xml', newDocumentXml);
+  zip.file(`word/media/image${parts.mediaNumber}.png`, signaturePng);
+  zip.file('word/_rels/document.xml.rels', parts.relsXml);
+  zip.file('[Content_Types].xml', parts.contentTypesXml);
+}
+
 function writeFillOutput(baseDir: string, slug: string, ext: string, data: Buffer): string {
   const dir = path.join(baseDir, '.document-fills');
   fs.mkdirSync(dir, { recursive: true });
@@ -1445,7 +1705,8 @@ async function fillDocxTextLine(
   roots: XmlNode[],
   meta: DocumentMeta,
   lineNumber: number,
-  value: string,
+  value: string | undefined,
+  signaturePng: Buffer | undefined,
   opts: FillOpts,
 ): Promise<ReturnType<typeof ok> | ReturnType<typeof err>> {
   const candidates = findDocxLineCandidates(xml, roots);
@@ -1456,9 +1717,25 @@ async function fillDocxTextLine(
     );
   }
 
+  // Image case: always appended right after the target paragraph's existing
+  // content — never a replacement, regardless of whether the paragraph
+  // matched via an underscore blank or a trailing-colon label.
+  if (signaturePng !== undefined) {
+    const stamp = await prepareSignatureStamp(zip, xml, signaturePng, value);
+    if ('error' in stamp) return err(stamp.error);
+    const newXml = appendRunXmlAfterParagraph(xml, target.pNode, stamp.insertXml);
+    applySignatureZipParts(zip, newXml, signaturePng, stamp);
+    const outBytes = await zip.generateAsync({ type: 'nodebuffer' });
+    const outPath = writeFillOutput(opts.baseDir, meta.slug, 'docx', outBytes);
+    return ok(
+      `Stamped ${describeStamp(true, value)} right after line ${lineNumber} ("${target.text}") of "${meta.slug}". ` +
+        `New file at ${outPath} — call send_file to deliver it.`,
+    );
+  }
+
   const newXml = target.underscoreNodes
-    ? replaceCellText(xml, target.underscoreNodes, value)
-    : insertRunAfterParagraph(xml, target.pNode, value);
+    ? replaceCellText(xml, target.underscoreNodes, value!)
+    : insertRunAfterParagraph(xml, target.pNode, value!);
 
   zip.file('word/document.xml', newXml);
   const outBytes = await zip.generateAsync({ type: 'nodebuffer' });
@@ -1480,6 +1757,18 @@ async function fillDocx(
   const tableArg = typeof args.table === 'number' ? args.table : undefined;
   const columnArg = typeof args.column === 'number' ? args.column : undefined;
   const lineNumberArg = typeof args.lineNumber === 'number' ? args.lineNumber : undefined;
+  const signatureNameRaw = typeof args.signatureName === 'string' ? args.signatureName : undefined;
+  const signatureName = signatureNameRaw?.trim();
+  if (signatureNameRaw !== undefined && !signatureName) return err('signatureName cannot be empty.');
+
+  // Resolved once here, regardless of which target branch below ends up
+  // being picked — mirrors fillPdf's identical up-front resolution.
+  let signaturePng: Buffer | undefined;
+  if (signatureName !== undefined) {
+    const resolved = resolveSignaturePng(opts.baseDir, signatureName);
+    if ('error' in resolved) return err(resolved.error);
+    signaturePng = resolved.bytes;
+  }
 
   // Table-row targeting (Story 1.2) always wins when the caller gives row
   // and/or table — text-line mode only activates when the caller instead
@@ -1515,17 +1804,23 @@ async function fillDocx(
 
   if (!usesTablePath) {
     if (lineNumberArg !== undefined) {
-      if (value === undefined) return err('value is required together with lineNumber.');
-      return fillDocxTextLine(zip, xml, roots, meta, lineNumberArg, value, opts);
+      if (value === undefined && signaturePng === undefined) {
+        return err('value or signatureName is required together with lineNumber.');
+      }
+      return fillDocxTextLine(zip, xml, roots, meta, lineNumberArg, value, signaturePng, opts);
     }
     // Discovery (no row/table/lineNumber given) — always scans for
     // fill-in-the-blank paragraphs regardless of whether the document also
-    // has tables; a mixed document's response names both possibilities.
+    // has tables; a mixed document's response names both possibilities. A
+    // signatureName given alongside a bare-discovery call was already
+    // resolved (or errored) above but is otherwise unused here — this
+    // response is identical whether or not one was passed, mirroring
+    // fillPdf's own "no target given" branches.
     return docxDiscoveryResponse(tables, findDocxLineCandidates(xml, roots));
   }
 
   if (row === undefined) return err('row is required for a .docx fill (1-indexed row within the target table).');
-  if (value === undefined) return err('value is required.');
+  if (value === undefined && signaturePng === undefined) return err('value or signatureName is required.');
   if (tables.length === 0) return err('This document has no tables to fill.');
 
   let tableIndex: number;
@@ -1569,8 +1864,23 @@ async function fillDocx(
     );
   }
 
+  // Image case: always appended into the cell's last paragraph — never a
+  // replacement, regardless of whether the cell already has text.
+  if (signaturePng !== undefined) {
+    const stamp = await prepareSignatureStamp(zip, xml, signaturePng, value);
+    if ('error' in stamp) return err(stamp.error);
+    const newXml = appendRunXmlIntoCell(xml, targetCell, stamp.insertXml);
+    applySignatureZipParts(zip, newXml, signaturePng, stamp);
+    const outBytes = await zip.generateAsync({ type: 'nodebuffer' });
+    const outPath = writeFillOutput(opts.baseDir, meta.slug, 'docx', outBytes);
+    return ok(
+      `Stamped ${describeStamp(true, value)} into table ${tableIndex}, row ${row}, column ${cellIndex} of ` +
+        `"${meta.slug}". New file at ${outPath} — call send_file to deliver it.`,
+    );
+  }
+
   const tNodes = collectDescendants(targetCell, 't');
-  const newXml = tNodes.length > 0 ? replaceCellText(xml, tNodes, value) : insertRunIntoCell(xml, targetCell, value);
+  const newXml = tNodes.length > 0 ? replaceCellText(xml, tNodes, value!) : insertRunIntoCell(xml, targetCell, value!);
 
   zip.file('word/document.xml', newXml);
   const outBytes = await zip.generateAsync({ type: 'nodebuffer' });
@@ -1759,11 +2069,12 @@ async function pdfListLines(rawPath: string): Promise<ReturnType<typeof ok> | Re
 }
 
 // ---------------------------------------------------------------------------
-// Signature stamping (Story 1.7) — draws a saved signature PNG (from
-// save_signature, Story 1.6) at whichever of the three PDF fill targets
-// below the call already resolves to, via pdf-lib's embedPng/drawImage.
-// PDF-only; a .docx/.doc call with signatureName is rejected earlier by
-// PDF_ONLY_ARGS (fillDocumentFieldImpl), before fillPdf is ever reached.
+// Signature stamping, PDF path (Story 1.7) — draws a saved signature PNG
+// (from save_signature, Story 1.6) at whichever of the three PDF fill
+// targets below the call already resolves to, via pdf-lib's
+// embedPng/drawImage. Story 1.8 extends signatureName to .docx/.doc too
+// (see fillDocx/fillDocxTextLine's own signaturePng handling and the
+// ".docx signature stamping" helpers above) — this section stays PDF-only.
 // ---------------------------------------------------------------------------
 
 /**
@@ -2319,9 +2630,10 @@ async function fillDoc(
 
 // `lineNumber` is a shared arg (Story 1.4 adds it to .docx text-line targeting, alongside
 // its pre-existing Story 1.2 use for a .pdf text-layer line) — it belongs in neither
-// file-type-exclusive list below.
+// file-type-exclusive list below. `signatureName` used to be PDF-only (Story 1.7); Story
+// 1.8 extends it to .docx/.doc too, so it no longer belongs in either exclusive list.
 const DOCX_ONLY_ARGS = ['table', 'row', 'column'] as const;
-const PDF_ONLY_ARGS = ['fieldName', 'pixelX', 'pixelY', 'signatureName'] as const;
+const PDF_ONLY_ARGS = ['fieldName', 'pixelX', 'pixelY'] as const;
 
 function presentArgNames(args: Record<string, unknown>, keys: readonly string[]): string[] {
   return keys.filter((k) => args[k] !== undefined);
@@ -2402,11 +2714,13 @@ export const fillDocumentField: McpToolDefinition = {
       'blanks). Never pass row/table together with lineNumber. For a .pdf: targets an AcroForm field (fieldName) ' +
       'if the PDF has one matching, otherwise a text-layer line (a first call with no lineNumber returns the ' +
       'detected lines to choose from) or, for a scanned PDF, a pixel position on a rendered page (a first call ' +
-      'with no pixelX/pixelY renders page 1 and returns its pixel dimensions). For a .pdf, "signatureName" ' +
-      '(instead of, or together with, "value") stamps a signature already saved via save_signature at that same ' +
-      'target — image only for the AcroForm case (the field\'s text is left unset), image plus text beside it ' +
-      'if "value" is also given for the line/pixel cases. Signature stamping is PDF-only; not yet available for ' +
-      '.docx/.doc. For a legacy .doc: converts it to ' +
+      'with no pixelX/pixelY renders page 1 and returns its pixel dimensions). For any file type, "signatureName" ' +
+      '(instead of, or together with, "value") stamps a signature already saved via save_signature at whichever ' +
+      'target the call resolves to — for a .pdf: image only for the AcroForm case (the field\'s text is left ' +
+      'unset), image plus text beside it if "value" is also given for the line/pixel cases; for a .docx: the ' +
+      'image is always an additional inserted run (never a replacement) at the same table-cell or ' +
+      'fill-in-the-blank-line target row/lineNumber would otherwise resolve, with an additional text run right ' +
+      'after it if "value" is also given. For a legacy .doc: converts it to ' +
       '.docx once (via LibreOffice), then applies the same .docx targeting rules above — the returned file is ' +
       'always .docx, never a reconstructed .doc.',
     inputSchema: {
@@ -2462,10 +2776,12 @@ export const fillDocumentField: McpToolDefinition = {
         signatureName: {
           type: 'string',
           description:
-            '.pdf only: the exact name of a signature already saved via save_signature (matches ' +
-            'memory/signatures/<name>.png exactly — no fuzzy matching). Stamps that signature image at whichever ' +
-            'of fieldName/lineNumber/pixelX+pixelY the call resolves to. Give "value" alongside it to also draw ' +
-            'text (e.g. a date) right beside the image in the same call. Not supported for .docx/.doc.',
+            'The exact name of a signature already saved via save_signature (matches ' +
+            'memory/signatures/<name>.png exactly — no fuzzy matching). Works for .pdf, .docx, and .doc. Stamps ' +
+            'that signature image at whichever of fieldName/lineNumber/pixelX+pixelY (.pdf) or row+table/' +
+            'lineNumber (.docx/.doc) the call resolves to — for a .docx/.doc this is always an additional ' +
+            'inserted image, never a replacement of existing cell/paragraph text. Give "value" alongside it to ' +
+            'also draw/insert a text run (e.g. a date) right beside/after the image in the same call.',
         },
       },
       required: ['document'],

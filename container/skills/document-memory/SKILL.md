@@ -1,6 +1,6 @@
 ---
 name: document-memory
-description: Save a Word (.docx or legacy .doc) or PDF file the user sends into this agent group's persistent memory, so its content can be recalled in a later, unrelated conversation without resending the file. Also fill a value into a table row, form field, or line of a document already saved this way and send back a new file, or recall/answer questions about what a previously saved document says. Also save a PNG image of a handwritten signature as a reusable, background-removed asset, and stamp a saved signature into a saved PDF (not yet available for .docx/.doc). Use when the user sends a Word/PDF attachment and asks to save/remember/keep it, asks to fill in / complete a blank on a document already saved, asks what a saved document says/contains, asks to summarize/recall a document already saved, sends a signature image and asks to save/remember it for reuse, or asks to sign/stamp a saved PDF with a saved signature.
+description: Save a Word (.docx or legacy .doc) or PDF file the user sends into this agent group's persistent memory, so its content can be recalled in a later, unrelated conversation without resending the file. Also fill a value into a table row, form field, or line of a document already saved this way and send back a new file, or recall/answer questions about what a previously saved document says. Also save a PNG image of a handwritten signature as a reusable, background-removed asset, and stamp a saved signature into a saved PDF, .docx, or .doc. Use when the user sends a Word/PDF attachment and asks to save/remember/keep it, asks to fill in / complete a blank on a document already saved, asks what a saved document says/contains, asks to summarize/recall a document already saved, sends a signature image and asks to save/remember it for reuse, or asks to sign/stamp a saved document with a saved signature.
 ---
 
 # Saving a document to memory
@@ -199,16 +199,17 @@ Three mechanisms, auto-detected — you never pick a mode explicitly:
    - Second call: `fill_document_field({ document, pixelX, pixelY, value })`
      — draws the value there.
 
-## Stamping a saved signature into a saved PDF
+## Stamping a saved signature into a saved document
 
-**PDF only** — a `.docx`/`.doc` document with `signatureName` is declined
-clearly, not silently ignored; signature stamping into Word documents isn't
-built yet. See "Saving a reusable signature" below for how a signature gets
-saved in the first place — that has to happen before this can work.
+Works for `.pdf`, `.docx`, and legacy `.doc`. See "Saving a reusable
+signature" below for how a signature gets saved in the first place — that
+has to happen before this can work.
 
 Add `signatureName` (the exact name it was saved under — no fuzzy matching,
-unlike `document`) to any of the three `fill_document_field` PDF calls
-above, in place of or alongside `value`:
+unlike `document`) to a `fill_document_field` call, in place of or alongside
+`value`.
+
+**For a `.pdf`** — add it to any of the three PDF calls:
 
 - **AcroForm field**: `fill_document_field({ document, fieldName, signatureName })`
   — draws the signature image scaled to fit and centered within the
@@ -221,9 +222,28 @@ above, in place of or alongside `value`:
 - **Scanned/pixel position**: `fill_document_field({ document, pixelX, pixelY, signatureName })`
   — same idea, at the pixel position you already picked.
 
-**Give `value` alongside `signatureName`** (any of the three calls above)
-to draw both the signature image and a text value — e.g. a date — right
-next to each other in the same call, same call's single new file.
+**For a `.docx` (or a saved legacy `.doc`, converted first exactly like a
+plain fill)** — add it to either of the two docx targeting calls:
+
+- **Table cell**: `fill_document_field({ document, row, table, signatureName })`
+  — inserts the signature image into the target cell **as an additional
+  run**. Any existing text already in that cell (or elsewhere in the
+  document) is left completely untouched — this never replaces text, unlike
+  a plain `value` fill of the same cell.
+- **Fill-in-the-blank line**: `fill_document_field({ document, lineNumber, signatureName })`
+  — inserts the image right after the target paragraph (the underscore
+  blank or trailing-colon label itself is left as-is, not overwritten).
+
+A `.docx`/`.doc` signature stamp is **flow-layout, not a fixed position** —
+there's no pixel/point coordinate to give it the way a PDF has; it always
+lands at whichever table-cell or fill-in-the-blank-line target `row`/`table`
+or `lineNumber` already resolves to, sized to a fixed max height with its
+aspect ratio preserved (never stretched/distorted).
+
+**Give `value` alongside `signatureName`** (any of the calls above, PDF or
+docx/doc) to draw/insert both the signature image and a text value — e.g. a
+date — right next to/after each other in the same call, same call's single
+new file.
 
 If `signatureName` doesn't match any saved signature exactly, the tool
 declines and lists the signature names actually saved (or says none are
@@ -318,8 +338,7 @@ asks to save/remember it for reuse (e.g. "save my signature", "remember
 this signature as Uriel"). `save_signature` itself is **save-only** — it
 never places the signature into any document itself. To actually stamp a
 saved signature into a document, see "Stamping a saved signature into a
-saved PDF" above — **PDF only**; a Word document (`.docx`/`.doc`) can't be
-signed this way yet, say so plainly if that's what the user wants.
+saved document" above — works for `.pdf`, `.docx`, and `.doc`.
 
 ## Workflow
 
@@ -357,6 +376,6 @@ signed this way yet, say so plainly if that's what the user wants.
   replacement.
 - Don't imply a saved signature is shared with any other agent group — it's
   saved only for this group.
-- Don't attempt to stamp a signature into a `.docx`/`.doc` document — say
-  plainly that's not supported yet, rather than falling back to a
-  text-only fill or trying some other workaround.
+- For a `.docx`/`.doc` signature stamp, don't replace existing table-cell or
+  paragraph text — it's always an additional inserted run, alongside
+  whatever was already there.
