@@ -1,8 +1,8 @@
 /**
- * save_document — persist a Word (.docx/.doc) or PDF attachment to the agent
- * group's durable per-group memory (see docs/memory.md's OKF convention),
- * so a later, unrelated conversation can be answered from it without the
- * file being resent.
+ * save_document — persist a Word (.docx/.doc), PDF, or image (.jpg/.jpeg/
+ * .png) attachment to the agent group's durable per-group memory (see
+ * docs/memory.md's OKF convention), so a later, unrelated conversation can
+ * be answered from it without the file being resent.
  *
  * All work runs synchronously in-container, in the same MCP tool call
  * (no host round-trip — this needs no external API/credential):
@@ -27,8 +27,14 @@
  *     one-time `.doc` -> `.docx` conversion feeding the existing, unmodified
  *     `.docx` fill pipeline; save/recall never touch it.
  *
- * `.docx`, `.doc`, and `.pdf` are in scope; anything else is declined
- * cleanly with no memory footprint at all.
+ *   - image (`.jpg`/`.jpeg`/`.png`): no rendering step, since the uploaded
+ *     file already IS the image — same two-call vision-read pattern as a
+ *     scanned PDF page (agent reads it directly, calls back with
+ *     `extractedText`). Cannot be targeted by `fill_document_field` — there's
+ *     no field/target on a plain image.
+ *
+ * `.docx`, `.doc`, `.pdf`, and images (`.jpg`/`.jpeg`/`.png`) are in scope;
+ * anything else is declined cleanly with no memory footprint at all.
  *
  * Storage shape (AD-6):
  *   memory/documents/files/<slug>.<ext>   — canonical raw copy
@@ -84,7 +90,8 @@ function errnoCode(e: unknown): string | undefined {
   return e && typeof e === 'object' && 'code' in e ? (e as NodeJS.ErrnoException).code : undefined;
 }
 
-const SUPPORTED_EXTENSIONS = new Set(['docx', 'doc', 'pdf']);
+const SUPPORTED_EXTENSIONS = new Set(['docx', 'doc', 'pdf', 'jpg', 'jpeg', 'png']);
+const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png']);
 
 // ---------------------------------------------------------------------------
 // Path containment — `path` is a model-supplied argument. Resolve it (either
@@ -535,8 +542,8 @@ export async function saveDocumentImpl(
     const ext = path.extname(originalFilename).slice(1).toLowerCase();
     if (!SUPPORTED_EXTENSIONS.has(ext)) {
       return err(
-        `Unsupported file type "${ext ? `.${ext}` : '(none)'}" — save_document only handles Word (.docx/.doc) ` +
-          'and PDF (.pdf) files.',
+        `Unsupported file type "${ext ? `.${ext}` : '(none)'}" — save_document only handles Word (.docx/.doc), ` +
+          'PDF (.pdf), and image (.jpg/.jpeg/.png) files.',
       );
     }
 
@@ -581,6 +588,22 @@ export async function saveDocumentImpl(
         bodyText = extractedText;
         renderPathToCleanup = renderPath;
       }
+    } else if (IMAGE_EXTENSIONS.has(ext)) {
+      // No rendering step — the uploaded file already IS the image to look
+      // at. Same two-call vision-read pattern as a scanned PDF page: first
+      // call (no extractedText) points the agent at the file and asks it to
+      // read it and call back; second call (extractedText given) finishes
+      // the save. resolvedPath stays valid for both calls (it's the
+      // original inbox file, never moved) so there's nothing to render or
+      // clean up.
+      if (extractedText === undefined) {
+        return ok(
+          `This is an image (${ext}) — I can't extract its content myself. Read it yourself at "${filePath}", ` +
+            'then call save_document again with the same path and an "extractedText" argument containing what ' +
+            'you read (a description, any readable text, numbers, etc.), to finish saving it to memory.',
+        );
+      }
+      bodyText = extractedText;
     } else if (ext === 'doc') {
       bodyText = await extractDocText(resolvedPath);
       if (!bodyText) {
@@ -2672,6 +2695,13 @@ export async function fillDocumentFieldImpl(
       );
     }
 
+    if (IMAGE_EXTENSIONS.has(meta.ext)) {
+      return err(
+        `"${meta.slug}" is a saved image (.${meta.ext}) — fill_document_field only fills/stamps a .docx, .doc, ` +
+          'or .pdf document. There is no field/target to fill on a plain image.',
+      );
+    }
+
     if (meta.ext === 'pdf') {
       const wrongArgs = presentArgNames(args, DOCX_ONLY_ARGS);
       if (wrongArgs.length > 0) {
@@ -2794,9 +2824,10 @@ export const saveDocument: McpToolDefinition = {
   tool: {
     name: 'save_document',
     description:
-      "Save a Word (.docx or legacy .doc) or PDF file to this agent group's persistent memory: copies the raw " +
-      'file, extracts its text, and records an entry in memory/index.md so it can be recalled later without ' +
-      'resending it. Declines cleanly for any other file type.',
+      "Save a Word (.docx or legacy .doc), PDF, or image (.jpg/.jpeg/.png) file to this agent group's persistent " +
+      'memory: copies the raw file, extracts its text (for an image or scanned PDF, asks you to read it yourself ' +
+      'and call back with extractedText), and records an entry in memory/index.md so it can be recalled later ' +
+      'without resending it. Declines cleanly for any other file type.',
     inputSchema: {
       type: 'object' as const,
       properties: {
