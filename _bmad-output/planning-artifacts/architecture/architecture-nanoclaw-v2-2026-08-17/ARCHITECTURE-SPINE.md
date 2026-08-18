@@ -133,11 +133,11 @@ graph LR
 - **Prevents:** A code change per newly-added calendar, and a second OAuth-connection path — AD-2 already fixes OneCLI to exactly one Google Calendar connection per project, so a second real OAuth grant per calendar was never architecturally available. This resolves SPEC.md's CAP-6 open question outright rather than narrowing it.
 - **Rule:** The two-value `calendar` argument enum becomes a config-driven registry — a `name → {calendarId, ownerEmail}` map. **DB-backed** (`container_configs`-style, mirroring `src/db/container-configs.ts`'s established per-agent-group-config pattern), **not** a `.ts` constants file — a source file needs a rebuild + service restart per this project's own documented rebuild rules (CLAUDE.md), which would contradict the "never a code change" claim below; a DB row does not. A newly-added calendar's owner grants access via the same Google-native sharing Devorah already uses (AD-3: Settings → Share with specific people → "Make changes to events" with the one connected account). Adding a calendar is a DB write (via `ncl` or a future admin path) plus that one-time sharing action — never a code change or rebuild.
 
-### AD-19 — Guest auto-validation against household memory, ambiguity asks, unmatched blocks
+### AD-19 — Guest auto-validation against household memory, ambiguity asks, unmatched blocks [REVISED, 2026-08-18 — persona-level, not tool-code]
 
 - **Binds:** CAP-7
-- **Prevents:** CAP-7 depending on the agent happening to already have a guest's email in context, and a resolved-but-wrong email being sent silently.
-- **Rule:** Before constructing the Google Calendar `attendees` array, every guest token that isn't already a valid email-shaped string is resolved against `groups/household/memory/household/people.md` automatically. A matched name resolves to its known email with no user turn spent. An ambiguous match (more than one household-memory entry plausibly matches) presents a numbered candidate list — same disambiguation precedent as AD-7. An unmatched name is asked for directly; the agent asks and blocks rather than proceeding without it.
+- **Prevents:** CAP-7 depending on the agent happening to already have a guest's email in context, and a resolved-but-wrong email being sent silently. Also prevents a fragile tool-code parser against `people.md`'s real shape — that file is free-form prose (mixed Hebrew/English names, no fixed schema), confirmed by inspection ahead of Story 2.4's build; a regex/parser inside `calendar.ts` would break on any future hand-edit.
+- **Rule:** Resolving a first-name-only guest against `groups/household/memory/household/people.md` is a **persona/skill-instruction responsibility** (`container/skills/calendar/SKILL.md`) — the same precedent AD-5 already established for sender-to-person resolution ("reads from the group's own existing OKF memory... never a hardcoded name in tool or skill code"). The agent, which already has this file in its own memory context, resolves the name itself before calling a calendar tool: a matched name resolves to its known email with no extra user turn; an ambiguous match presents a numbered candidate list, same disambiguation precedent as AD-7; an unmatched name is asked for directly, never guessed. `calendar.ts`'s existing `EMAIL_RE`/`validateGuestEmails` already structurally enforces the floor of this rule — a non-email-shaped guest string is rejected with a clear error, not silently accepted — so the only gap this story closes is making proactive resolution (before the tool call, not only reactive after a rejection) an explicit, documented persona instruction.
 
 ## Consistency Conventions
 
@@ -180,7 +180,7 @@ Operational prerequisite (not code, and — post-pivot — not blocking): Devora
 | CAP-4 (idempotency guard) | `calendar.ts`'s `create_calendar_event` | AD-16, AD-13 (timezone-normalized match), AD-19 (ordering) |
 | CAP-5 (recurring events) | `calendar.ts`'s `create_calendar_event` (`recurrence` argument) | AD-17, AD-16 (recurring creates exempt from dup-match) |
 | CAP-6 (calendars beyond two) | `calendar.ts` + new `src/db/calendar-registry.ts` | AD-18, AD-2 (revised) |
-| CAP-7 (guest auto-validation) | `calendar.ts`'s `create_calendar_event`/`update_calendar_event` | AD-19, AD-5, AD-16 (ordering) |
+| CAP-7 (guest auto-validation) | `container/skills/calendar/SKILL.md` (persona-level, AD-19 revised) — `calendar.ts`'s existing `EMAIL_RE`/`validateGuestEmails` provides the structural floor | AD-19, AD-5, AD-16 (ordering) |
 
 ## Deferred
 

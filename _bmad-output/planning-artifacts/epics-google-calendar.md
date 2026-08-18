@@ -287,22 +287,24 @@ As a NanoClaw user,
 I want an unresolved guest named by first name only to be checked against household memory automatically,
 So that I don't have to spell out an email address the agent could already know.
 
+> **Correction, 2026-08-18** (spec-stage discovery ahead of this story's build — see `ARCHITECTURE-SPINE.md`'s AD-19 revision): `people.md` is free-form prose (mixed Hebrew/English, no fixed schema) — a `calendar.ts` code-level parser would be fragile and break on any hand-edit. AD-5 already established the correct precedent for this exact class of resolution: persona-level, the agent reads its own memory context, never a tool-code parser. This story is therefore a **`container/skills/calendar/SKILL.md`-only change** — the existing `EMAIL_RE`/`validateGuestEmails` in `calendar.ts` already structurally rejects a non-email guest string with a clear error (the "never silently guess" floor); what's missing is an explicit persona instruction to resolve proactively, before the tool call, not only reactively after that rejection.
+
 **Acceptance Criteria:**
 
-**Given** a create/update request naming a guest by a token that isn't already a valid email address
-**When** the tool resolves the `guests`/`attendees` list
-**Then** it looks up `groups/household/memory/household/people.md` automatically — not only when the agent already happens to have it in context — and a matched name resolves to its known email with no extra user turn (FR7, AD-19, AD-5)
+**Given** a create/update request naming a guest by a token that isn't a valid email address (e.g. a first name)
+**When** the agent prepares to call `create_calendar_event`/`update_calendar_event`
+**Then** it looks up `groups/household/memory/household/people.md` itself, proactively, before the call — not only after the tool rejects a bad guest string — and a matched name resolves to its known email with no extra user turn (FR7, AD-19, AD-5)
 
 **Given** more than one household-memory entry plausibly matches the named guest
-**When** resolution runs
-**Then** a numbered candidate list is presented and the tool waits for a pick — same disambiguation precedent as AD-7, never guessed (AD-19)
+**When** the agent resolves it
+**Then** it presents a numbered candidate list and waits for a pick — same disambiguation precedent as AD-7, never guessed (AD-19)
 
 **Given** no household-memory entry matches at all
-**When** resolution runs
-**Then** the agent asks for the email directly and blocks rather than silently proceeding without it (AD-19)
+**When** the agent resolves it
+**Then** it asks the user for the email directly and blocks rather than silently proceeding without it, or calling the tool with a guess (AD-19)
 
-**Given** this story's resolution also runs on the same `create_calendar_event` call as Story 2.1's duplicate check
-**When** both need to ask something
-**Then** guest resolution (this story, AD-19) always asks first, the duplicate check (AD-16) second — never simultaneously (AD-16 Ordering rule)
+**Given** the agent forgets or skips this persona instruction and calls the tool with a non-email guest string anyway
+**When** `create_calendar_event`/`update_calendar_event` runs
+**Then** the existing `EMAIL_RE`/`validateGuestEmails` check still rejects it with a clear error — the structural floor holds regardless of persona compliance (unchanged `calendar.ts` behavior, not part of this story's diff)
 
-Source: `ARCHITECTURE-SPINE.md` AD-19; `SPEC-google-calendar/SPEC.md` CAP-7.
+Source: `ARCHITECTURE-SPINE.md` AD-19 (revised); `SPEC-google-calendar/SPEC.md` CAP-7.
