@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach, mock } from 'bun:test';
 
-import { createCalendarEvent, listCalendarEvents, updateCalendarEvent } from './calendar.js';
+import { createCalendarEvent, listCalendarEvents, updateCalendarEvent, deleteCalendarEvent } from './calendar.js';
 import { TIMEZONE, parseZonedToUtc, formatLocalTime } from '../timezone.js';
 
 const originalFetch = globalThis.fetch;
@@ -1093,5 +1093,226 @@ describe('update_calendar_event MCP tool', () => {
     await updateCalendarEvent.handler({ calendar: 'uriel', eventId: 'evt-1', description: 'New notes' });
     const sentBody = JSON.parse(calls[0].init!.body as string);
     expect(sentBody).toEqual({ description: 'New notes' });
+  });
+});
+
+describe('delete_calendar_event MCP tool', () => {
+  it('declares only calendar as required (eventId/eventQuery are alternatives)', () => {
+    expect(deleteCalendarEvent.tool.name).toBe('delete_calendar_event');
+    expect(deleteCalendarEvent.tool.inputSchema).toMatchObject({ required: ['calendar'] });
+  });
+
+  it('declines a missing calendar argument, no fetch attempted', async () => {
+    const fn = stubFetchThrows();
+    const result = await deleteCalendarEvent.handler({ eventId: 'evt-1' });
+    expect(result.isError).toBe(true);
+    expect(fn).not.toHaveBeenCalled();
+  });
+
+  it('declines an unknown calendar value, no fetch attempted', async () => {
+    const fn = stubFetchThrows();
+    const result = await deleteCalendarEvent.handler({ calendar: 'devora', eventId: 'evt-1' });
+    expect(result.isError).toBe(true);
+    expect(fn).not.toHaveBeenCalled();
+  });
+
+  it('declines when neither eventId nor eventQuery is given, no fetch attempted', async () => {
+    const fn = stubFetchThrows();
+    const result = await deleteCalendarEvent.handler({ calendar: 'uriel' });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('eventId or eventQuery');
+    expect(fn).not.toHaveBeenCalled();
+  });
+
+  it('confirm omitted: previews a direct eventId without deleting — no fetch attempted', async () => {
+    const fn = stubFetchThrows();
+    const result = await deleteCalendarEvent.handler({ calendar: 'uriel', eventId: 'evt-1' });
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('evt-1');
+    expect(result.content[0].text.toLowerCase()).toContain('not deleted');
+    expect(result.content[0].text).toContain('confirm: true');
+    expect(fn).not.toHaveBeenCalled();
+  });
+
+  it('confirm: false explicitly: previews a direct eventId without deleting — no fetch attempted', async () => {
+    const fn = stubFetchThrows();
+    const result = await deleteCalendarEvent.handler({ calendar: 'uriel', eventId: 'evt-1', confirm: false });
+    expect(result.isError).toBeFalsy();
+    expect(fn).not.toHaveBeenCalled();
+  });
+
+  it('confirm: true with a direct eventId — DELETE to the exact event URL, no search call', async () => {
+    const { fn, calls } = stubFetch(200, {});
+
+    const result = await deleteCalendarEvent.handler({ calendar: 'uriel', eventId: 'evt-known', confirm: true });
+
+    expect(result.isError).toBeFalsy();
+    expect(fn).toHaveBeenCalledTimes(1);
+    expect(calls[0].url).toBe('https://www.googleapis.com/calendar/v3/calendars/primary/events/evt-known');
+    expect(calls[0].init?.method).toBe('DELETE');
+  });
+
+  it('routes calendar: "devorah" to her calendar ID in the DELETE URL', async () => {
+    const { calls } = stubFetch(200, {});
+    await deleteCalendarEvent.handler({ calendar: 'devorah', eventId: 'evt-1', confirm: true });
+    expect(calls[0].url).toContain(encodeURIComponent('adardevora@gmail.com'));
+  });
+
+  it('eventId takes priority over eventQuery when both are given — no search call made', async () => {
+    const { fn, calls } = stubFetch(200, {});
+
+    const result = await deleteCalendarEvent.handler({
+      calendar: 'uriel',
+      eventId: 'evt-direct',
+      eventQuery: 'this should be ignored',
+      confirm: true,
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect(fn).toHaveBeenCalledTimes(1); // one call: the DELETE, no search GET
+    expect(calls[0].url).toContain('/events/evt-direct');
+    expect(calls[0].init?.method).toBe('DELETE');
+  });
+
+  it('resolves a single search match and previews it (with real details) without deleting', async () => {
+    const { fn } = stubFetchSequence([
+      {
+        status: 200,
+        body: {
+          items: [
+            {
+              id: 'evt-found',
+              summary: 'Dentist',
+              start: { dateTime: '2026-08-20T14:00:00.000Z' },
+              end: { dateTime: '2026-08-20T15:00:00.000Z' },
+            },
+          ],
+        },
+      },
+    ]);
+
+    const result = await deleteCalendarEvent.handler({ calendar: 'uriel', eventQuery: 'dentist' });
+
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('Dentist');
+    expect(result.content[0].text).toContain('evt-found');
+    expect(result.content[0].text.toLowerCase()).toContain('not deleted');
+    expect(fn).toHaveBeenCalledTimes(1); // search only, no DELETE
+  });
+
+  it('resolves a single search match and deletes it when confirm: true, echoing real event details', async () => {
+    const { fn, calls } = stubFetchSequence([
+      {
+        status: 200,
+        body: {
+          items: [
+            {
+              id: 'evt-found',
+              summary: 'Dentist',
+              start: { dateTime: '2026-08-20T14:00:00.000Z' },
+              end: { dateTime: '2026-08-20T15:00:00.000Z' },
+            },
+          ],
+        },
+      },
+      { status: 200, body: {} },
+    ]);
+
+    const result = await deleteCalendarEvent.handler({ calendar: 'uriel', eventQuery: 'dentist', confirm: true });
+
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('Dentist');
+    expect(fn).toHaveBeenCalledTimes(2);
+    expect(calls[1].url).toContain('/events/evt-found');
+    expect(calls[1].init?.method).toBe('DELETE');
+  });
+
+  it('declines with zero search matches, no DELETE attempted, and states the window searched', async () => {
+    const { fn } = stubFetchSequence([{ status: 200, body: { items: [] } }]);
+
+    const result = await deleteCalendarEvent.handler({
+      calendar: 'uriel',
+      eventQuery: 'nonexistent',
+      from: '2026-09-01T00:00:00',
+      to: '2026-09-03T00:00:00',
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text.toLowerCase()).toContain('no events found');
+    expect(result.content[0].text).toContain(
+      formatLocalTime(parseZonedToUtc('2026-09-01T00:00:00', TIMEZONE).toISOString(), TIMEZONE),
+    );
+    expect(fn).toHaveBeenCalledTimes(1); // search only, no DELETE
+  });
+
+  it('returns a numbered candidate list (not an error) on multiple search matches, no DELETE attempted', async () => {
+    const { fn } = stubFetchSequence([
+      {
+        status: 200,
+        body: {
+          items: [
+            {
+              id: 'evt-a',
+              summary: 'Team sync',
+              start: { dateTime: '2026-08-20T14:00:00.000Z' },
+              end: { dateTime: '2026-08-20T15:00:00.000Z' },
+            },
+            {
+              id: 'evt-b',
+              summary: 'Team sync',
+              start: { dateTime: '2026-08-21T14:00:00.000Z' },
+              end: { dateTime: '2026-08-21T15:00:00.000Z' },
+            },
+          ],
+        },
+      },
+    ]);
+
+    const result = await deleteCalendarEvent.handler({ calendar: 'uriel', eventQuery: 'team sync', confirm: true });
+
+    expect(result.isError).toBeFalsy(); // discovery response, not an error
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain('evt-a');
+    expect(text).toContain('evt-b');
+    expect(text).toContain('1.');
+    expect(text).toContain('2.');
+    expect(fn).toHaveBeenCalledTimes(1); // search only, no DELETE — even with confirm: true, ambiguity blocks it
+  });
+
+  it('surfaces the gateway connect_url when not connected (401)', async () => {
+    stubFetch(401, { connect_url: 'https://onecli.example/connect/google-calendar' });
+    const result = await deleteCalendarEvent.handler({ calendar: 'uriel', eventId: 'evt-1', confirm: true });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('https://onecli.example/connect/google-calendar');
+  });
+
+  it('does NOT relabel a real 403 (no setup URL) as "not connected"', async () => {
+    stubFetch(403, { error: { message: 'requiredAccessLevel' } });
+    const result = await deleteCalendarEvent.handler({ calendar: 'devorah', eventId: 'evt-1', confirm: true });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text.toLowerCase()).not.toContain('not connected');
+    expect(result.content[0].text).toContain('403');
+  });
+
+  it('returns an MCP error (not a throw) when the DELETE fetch itself rejects', async () => {
+    globalThis.fetch = mock(async () => {
+      throw new Error('network unreachable');
+    }) as unknown as typeof fetch;
+
+    const result = await deleteCalendarEvent.handler({ calendar: 'uriel', eventId: 'evt-1', confirm: true });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('network unreachable');
+  });
+
+  it('surfaces a clear timeout message on the DELETE 30s bound', async () => {
+    globalThis.fetch = mock(async () => {
+      throw new DOMException('The operation timed out.', 'TimeoutError');
+    }) as unknown as typeof fetch;
+
+    const result = await deleteCalendarEvent.handler({ calendar: 'uriel', eventId: 'evt-1', confirm: true });
+
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as { text: string }).text.toLowerCase()).toContain('timed out');
   });
 });

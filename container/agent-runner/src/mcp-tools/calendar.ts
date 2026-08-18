@@ -551,13 +551,65 @@ interface EventsPatchResponse {
   htmlLink?: string;
 }
 
+/**
+ * Resolve which event a call targets — a direct eventId, or a search via
+ * eventQuery with the same 0/1/2+ disambiguation semantics list_calendar_events
+ * exposes (zero declines, one resolves, two+ returns a numbered candidate
+ * list instead of an error). Shared by update_calendar_event and
+ * delete_calendar_event so neither duplicates this flow (spec cal-1.5 Code
+ * Map: "reuse cal-1.3's search logic, don't duplicate it" — the same
+ * argument applies one level up, to the target-resolution wrapper itself).
+ *
+ * A direct eventId does no lookup (matches update_calendar_event's existing
+ * minimal-lookup precedent) — the returned event carries only `id` in that
+ * case, nothing else.
+ */
+async function resolveTargetEvent(
+  calendarId: string,
+  calendar: string,
+  toolName: string,
+  verb: string,
+  target: { eventId?: string; eventQuery?: string; from?: string; to?: string },
+): Promise<{ event: CalendarEventItem } | { response: CallToolResult }> {
+  if (target.eventId) {
+    return { event: { id: target.eventId } };
+  }
+
+  const searchResult = await searchEvents(calendarId, { query: target.eventQuery, from: target.from, to: target.to });
+  if ('error' in searchResult) return { response: searchResult.error };
+
+  const rangeDesc = formatRangeDesc(searchResult.timeMin, searchResult.timeMax);
+
+  if (searchResult.events.length === 0) {
+    return {
+      response: err(
+        `No events found on ${calendar}'s calendar matching "${target.eventQuery}" between ${rangeDesc} — nothing to ${verb}.`,
+      ),
+    };
+  }
+  if (searchResult.events.length > 1) {
+    const lines = [
+      `Found ${searchResult.events.length} events matching "${target.eventQuery}" on ${calendar}'s calendar ` +
+        `(${rangeDesc}) — re-call ${toolName} with the specific eventId:`,
+    ];
+    searchResult.events.forEach((ev, i) => {
+      lines.push(`${i + 1}. ${formatEventLine(ev)}`);
+    });
+    if (searchResult.truncated) {
+      lines.push(`(Search capped at ${MAX_RESULTS} — there may be more matches than shown.)`);
+    }
+    return { response: ok(lines.join('\n')) };
+  }
+  return { event: searchResult.events[0] };
+}
+
 export const updateCalendarEvent: McpToolDefinition = {
   tool: {
     name: 'update_calendar_event',
     description:
       "Update a real event on Uriel's or Devora's Google Calendar. Target it either by a known eventId " +
       '(e.g. from a prior list_calendar_events call) or by eventQuery free-text search. Never deletes/cancels ' +
-      'an event — that capability does not exist.',
+      'an event — use delete_calendar_event for that.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -651,35 +703,14 @@ export const updateCalendarEvent: McpToolDefinition = {
       return err(`end ("${end}") must be after start ("${start}")`);
     }
 
-    let targetEventId: string;
-    if (eventId) {
-      targetEventId = eventId;
-    } else {
-      const searchResult = await searchEvents(calendarId, { query: eventQuery, from, to });
-      if ('error' in searchResult) return searchResult.error;
-
-      const rangeDesc = formatRangeDesc(searchResult.timeMin, searchResult.timeMax);
-
-      if (searchResult.events.length === 0) {
-        return err(
-          `No events found on ${calendar}'s calendar matching "${eventQuery}" between ${rangeDesc} — nothing to update.`,
-        );
-      }
-      if (searchResult.events.length > 1) {
-        const lines = [
-          `Found ${searchResult.events.length} events matching "${eventQuery}" on ${calendar}'s calendar ` +
-            `(${rangeDesc}) — re-call update_calendar_event with the specific eventId:`,
-        ];
-        searchResult.events.forEach((ev, i) => {
-          lines.push(`${i + 1}. ${formatEventLine(ev)}`);
-        });
-        if (searchResult.truncated) {
-          lines.push(`(Search capped at ${MAX_RESULTS} — there may be more matches than shown.)`);
-        }
-        return ok(lines.join('\n'));
-      }
-      targetEventId = searchResult.events[0].id;
-    }
+    const resolved = await resolveTargetEvent(calendarId, calendar, 'update_calendar_event', 'update', {
+      eventId,
+      eventQuery,
+      from,
+      to,
+    });
+    if ('response' in resolved) return resolved.response;
+    const targetEventId = resolved.event.id;
 
     // `!== undefined`, not truthy — see the "nothing to update" gate above:
     // an explicit '' is a real value (clear this field) and must reach
@@ -740,4 +771,123 @@ export const updateCalendarEvent: McpToolDefinition = {
   },
 };
 
-registerTools([createCalendarEvent, listCalendarEvents, updateCalendarEvent]);
+export const deleteCalendarEvent: McpToolDefinition = {
+  tool: {
+    name: 'delete_calendar_event',
+    description:
+      "Delete a real event from Uriel's or Devora's Google Calendar. This cannot be undone. Always preview " +
+      'first: call with confirm omitted or false to resolve the event without deleting it, get a real ' +
+      'confirmation from the user (e.g. via ask_user_question), then re-call with confirm: true and the same ' +
+      'eventId to actually delete it. Target the event either by a known eventId or by eventQuery free-text search.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        calendar: {
+          type: 'string',
+          enum: ['uriel', 'devorah'],
+          description: 'Which calendar the event is on.',
+        },
+        eventId: {
+          type: 'string',
+          description:
+            'The real Google event id, if already known. When given, targets this exact event directly — no search.',
+        },
+        eventQuery: {
+          type: 'string',
+          description:
+            'Free-text search to find the event when eventId is not known. Exactly one match resolves it; ' +
+            'zero matches declines; two or more return a numbered candidate list (id/title/time) — re-call with ' +
+            'the specific eventId from that list.',
+        },
+        from: {
+          type: 'string',
+          description: 'Optional search window start, naive local wall-clock, used only with eventQuery. Defaults to start of today.',
+        },
+        to: {
+          type: 'string',
+          description: 'Optional search window end, used only with eventQuery. Defaults to 7 days after from.',
+        },
+        confirm: {
+          type: 'boolean',
+          description:
+            'Must be true to actually delete. Omitted or false resolves and previews the event without ' +
+            'deleting it — never set this true without first getting a real confirmation from the user.',
+        },
+      },
+      required: ['calendar'],
+    },
+  },
+  async handler(args) {
+    const calendar = args.calendar as string | undefined;
+    const eventId = args.eventId as string | undefined;
+    const eventQuery = args.eventQuery as string | undefined;
+    const from = args.from as string | undefined;
+    const to = args.to as string | undefined;
+    const confirm = args.confirm === true;
+
+    if (!calendar) return err(`calendar is required — one of: ${Object.keys(CALENDAR_IDS).join(', ')}`);
+    const calendarId = CALENDAR_IDS[calendar];
+    if (!calendarId) {
+      return err(`Unknown calendar "${calendar}" — must be one of: ${Object.keys(CALENDAR_IDS).join(', ')}`);
+    }
+
+    if (!eventId && !eventQuery) {
+      return err('Either eventId or eventQuery is required to target an event to delete.');
+    }
+
+    const resolved = await resolveTargetEvent(calendarId, calendar, 'delete_calendar_event', 'delete', {
+      eventId,
+      eventQuery,
+      from,
+      to,
+    });
+    if ('response' in resolved) return resolved.response;
+    const targetEventId = resolved.event.id;
+    // A direct eventId did no lookup (resolveTargetEvent's documented
+    // precedent) — nothing to echo beyond the id itself in that case.
+    const targetDesc = eventId ? `event ${targetEventId} on ${calendar}'s calendar` : formatEventLine(resolved.event);
+
+    if (!confirm) {
+      return ok(
+        [
+          `Ready to delete: ${targetDesc}.`,
+          `This cannot be undone — NOT deleted yet. Confirm with the user first, then re-call ` +
+            `delete_calendar_event with eventId: "${targetEventId}" and confirm: true.`,
+        ].join('\n'),
+      );
+    }
+
+    let response: Response;
+    try {
+      response = await fetch(`${eventsUrl(calendarId)}/${encodeURIComponent(targetEventId)}`, {
+        method: 'DELETE',
+        signal: AbortSignal.timeout(30_000),
+      });
+    } catch (e) {
+      const isTimeout = e instanceof Error && (e.name === 'TimeoutError' || e.name === 'AbortError');
+      const msg = e instanceof Error ? e.message : String(e);
+      log(`delete_calendar_event: fetch failed: ${msg}`);
+      if (isTimeout) {
+        return err('Timed out waiting for Google Calendar (30s) — the gateway or Google may be unreachable right now.');
+      }
+      return err(`Could not reach Google Calendar: ${msg}`);
+    }
+
+    if (!response.ok) {
+      const bodyText = await response.text();
+      log(`delete_calendar_event: gateway/API returned ${response.status}`);
+      const setupUrl = extractSetupUrl(bodyText);
+      if (setupUrl) {
+        return err(notConnectedMessage('delete the event', setupUrl));
+      }
+      return err(`Google Calendar API returned ${response.status}: ${bodyText.slice(0, 500)}`);
+    }
+
+    // events.delete returns 204 No Content on success — nothing to echo back
+    // from the response itself; confirm from what was already resolved above.
+    log(`delete_calendar_event: deleted event ${targetEventId} on ${calendar}'s calendar`);
+    return ok(`Deleted: ${targetDesc}.`);
+  },
+};
+
+registerTools([createCalendarEvent, listCalendarEvents, updateCalendarEvent, deleteCalendarEvent]);

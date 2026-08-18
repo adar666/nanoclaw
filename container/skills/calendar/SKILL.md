@@ -1,22 +1,23 @@
 ---
 name: calendar
 description: >-
-  Create, read, and update real events on Uriel's or Devorah's Google
-  Calendar via create_calendar_event, list_calendar_events, and
-  update_calendar_event. Use whenever asked to schedule, book, put
-  something on the calendar, check what's coming up, answer "when is X",
-  or reschedule/edit an existing event — for either person, not just this
-  agent's own identity. Also covers the OneCLI connect-link flow for a
-  not-yet-connected calendar, and the deliberate distinction from
+  Create, read, update, and delete real events on Uriel's or Devorah's
+  Google Calendar via create_calendar_event, list_calendar_events,
+  update_calendar_event, and delete_calendar_event. Use whenever asked to
+  schedule, book, put something on the calendar, check what's coming up,
+  answer "when is X", reschedule/edit an existing event, or cancel/delete
+  one — for either person, not just this agent's own identity. Also covers
+  the OneCLI connect-link flow for a not-yet-connected calendar, the
+  required delete-confirmation flow, and the deliberate distinction from
   second-brain's own, unrelated Google OAuth (never disclose that one).
 metadata:
   author: nanoclaw
-  version: "1.1.1"
+  version: "1.2.0"
 ---
 
 # Calendar
 
-Three tools operate on **Uriel's or Devorah's** real Google Calendar. Both
+Four tools operate on **Uriel's or Devorah's** real Google Calendar. Both
 calendars are reachable through the one Google account this system has
 connected — Devorah's calendar isn't a separate connection, she shares it
 with the connected account (Google Calendar's own sharing feature), so
@@ -27,8 +28,8 @@ every tool reaches it the same way it reaches Uriel's own.
   "when is X" questions. **Always** use this instead of answering from
   memory or a guess — calendar state changes and you don't have it cached.
 - `update_calendar_event` — fix a mistake or reschedule an existing event.
-  There is no delete/cancel tool; if asked to cancel an event, say plainly
-  that's not something you can do yet.
+- `delete_calendar_event` — cancel/remove an event. Irreversible — always
+  requires an explicit confirmation step first, see below.
 
 ## create_calendar_event
 
@@ -86,14 +87,39 @@ Two ways to target the event to change:
 At least one of `title`, `start`, `end`, `description`, `location` must be
 given — the tool declines if there's nothing to change. Only the field(s)
 given are changed; everything else about the event is left alone (a real
-partial update, not a recreate). There is no delete/cancel capability.
+partial update, not a recreate). This tool never deletes/cancels an event —
+use `delete_calendar_event` for that.
 
 The confirmation reflects what Google's response actually echoes back, not
 just a restatement of the request — relay that, same as `create_calendar_event`.
 
+## delete_calendar_event
+
+Deleting an event cannot be undone — **always** a two-step flow, no
+exceptions:
+
+1. Call `delete_calendar_event` with `confirm` omitted (or `false`) and a
+   target — same `eventId`-vs-`eventQuery` choice as `update_calendar_event`
+   (same disambiguation: zero matches declines, one resolves, two or more
+   return a numbered candidate list). This only **previews** the event —
+   nothing is deleted yet.
+2. Relay the preview to the user and get a **real** confirmation — use
+   `ask_user_question` (e.g. title "Confirm deletion") rather than assuming
+   a vague "yeah go ahead" earlier in the conversation covers it.
+3. Only after the user actually confirms, re-call `delete_calendar_event`
+   with the same `eventId` from the preview and `confirm: true`.
+
+Never set `confirm: true` on the first call, and never infer consent from
+context — the tool itself won't stop you (there's no server-side state
+tying calls together), so this is on you to get right every time. If the
+user's request already reads as an explicit, specific instruction to delete
+one named event ("cancel my 3pm dentist appointment"), you still preview
+first and confirm before the real delete — the instruction to delete isn't
+the same thing as confirming *which* event once it's actually been found.
+
 ## Two calendars, either one, from any chat
 
-All three tools are reachable from household, dm-with-uriel, or
+All four tools are reachable from household, dm-with-uriel, or
 dm-with-partner alike — there's no "wrong" chat to ask from, and no need to
 relay/forward a request anywhere. If a request names both people ("check
 mine and Devorah's" / "put it on both calendars"), call the tool once per
@@ -120,7 +146,7 @@ rule, wherever it's stated for this group, still stands.
 
 ## When not connected
 
-If any of the three tools returns an error containing a connect link (the
+If any of the four tools returns an error containing a connect link (the
 gateway's `connect_url`), that's the OneCLI connection for *these tools* —
 present it plainly, the same as the `onecli-gateway` skill's general rule
 for any not-connected app:

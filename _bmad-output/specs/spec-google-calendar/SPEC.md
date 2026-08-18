@@ -39,7 +39,7 @@ A pain to solve: right now, scheduling a household event means leaving the chat 
 
 ## Non-goals
 
-- Deleting/cancelling an event — a separate, higher-stakes destructive action than create/update; revisit if requested.
+- ~~Deleting/cancelling an event~~ — **built, 2026-08-18** (bounded change, no new spec version): `delete_calendar_event` MCP tool, same `calendar.ts`/`calendar` skill. Requires an explicit `confirm: true` on a second call after a preview — see `container/agent-runner/src/mcp-tools/calendar.ts` and `container/skills/calendar/SKILL.md`.
 - Recurring-event creation (e.g. "every Thursday") — single-occurrence events only for v1; revisit if requested.
 - Calendars other than Uriel's and Devorah's (a shared/family calendar, an invited guest's own calendar).
 - Free-busy conflict detection or scheduling-suggestion logic beyond what's explicitly asked.
