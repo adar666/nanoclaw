@@ -5,15 +5,16 @@ description: >-
   Google Calendar via create_calendar_event, list_calendar_events,
   update_calendar_event, and delete_calendar_event. Use whenever asked to
   schedule, book, put something on the calendar, check what's coming up,
-  answer "when is X", reschedule/edit an existing event, or cancel/delete
-  one — for either person, not just this agent's own identity. Also covers
+  answer "when is X", reschedule/edit an existing event, cancel/delete
+  one, or set up a recurring/repeating event (e.g. a weekly standup) — for
+  either person, not just this agent's own identity. Also covers
   the OneCLI connect-link flow for a not-yet-connected calendar (create and
   delete each block on their own built-in confirmation — nothing to
   orchestrate), and the deliberate distinction from second-brain's own,
   unrelated Google OAuth (never disclose that one).
 metadata:
   author: nanoclaw
-  version: "1.3.1"
+  version: "1.4.1"
 ---
 
 # Calendar
@@ -46,6 +47,18 @@ every tool reaches it the same way it reaches Uriel's own.
   configured timezone — write times the way a person would say them
   ("3pm Wednesday"), not converted to UTC yourself.
 - `description`, `location` (optional).
+- `recurrence` (optional) — a single RFC5545 `RRULE` line to make this a
+  repeating event, e.g. `"RRULE:FREQ=WEEKLY;BYDAY=TH"` for every Thursday.
+  Omit for a single, one-off event (the default, unchanged behavior). One
+  line only — don't combine it with `EXDATE`/`RDATE` lines, not supported.
+  If `start`'s day doesn't match the rule (e.g. `start` on a Monday with
+  `BYDAY=TH`), Google may shift the actual first occurrence — when relaying
+  the confirmation, translate the raw `RRULE:...` into plain language
+  ("every Thursday") rather than reading it back verbatim. No validation on
+  the shape beyond requiring a string — a malformed RRULE surfaces as a
+  real error from Google, not a client-side check. There is currently no
+  way to add/change/remove recurrence on an *existing* event via
+  `update_calendar_event` — recreate the event instead.
 - `guests` (optional) — array of email addresses to invite.
 
 A successful call returns the real event's details plus its Google-assigned

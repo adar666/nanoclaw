@@ -1,5 +1,15 @@
 > **Superseded (epic-1 retro action item AI-5):** these items were merged into `_bmad-output/planning-artifacts/architecture/architecture-nanoclaw-v2-2026-08-16/ARCHITECTURE-SPINE.md`'s own Deferred section, which is the single source of truth going forward. Kept here only for the append-only history this file's format assumes.
 
+- source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-2-recurring-events.md`
+  summary: update_calendar_event silently drops a recurrence argument if one is passed to it (no schema entry, not destructured, no error) rather than rejecting it clearly — there is no way to add/change/remove recurrence on an existing event short of delete-and-recreate.
+  evidence: Blind-hunter review finding; out of this story's scope (spec explicitly said don't touch update_calendar_event), but worth a real decision before someone assumes update supports it.
+- source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-2-recurring-events.md`
+  summary: list_calendar_events' output doesn't indicate whether a listed event is part of a recurring series, even though CalendarEventItem.recurrence/recurringEventId are already read internally.
+  evidence: Blind-hunter review finding; real UX gap, out of this story's scope (list wasn't touched).
+- source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-2-recurring-events.md`
+  summary: The idempotency guard's precheck only brackets the new event's own first-occurrence [startUtc, endUtc] window — a new recurring series' later occurrences are never checked against existing events, so a later occurrence could double-book with no warning.
+  evidence: Edge-case-hunter review finding; spec explicitly said don't touch the idempotency guard's existing exclusion logic for this story, and full recurrence-aware dedup is a materially bigger feature.
+
 - source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-1-idempotency-guard-on-event-creation.md`
   summary: A zero-duration existing duplicate (start === end === the new event's own start) lands exactly on the pre-check's exclusive `timeMin` bound and would be excluded from the returned page, missing the guard entirely.
   evidence: Blind-hunter review loop-1 finding; genuinely rare (a real zero-duration Google Calendar event is unusual) and a real fix (padding the window) would slightly change matching semantics, not purely mechanical — worth a deliberate look, not a blind patch.

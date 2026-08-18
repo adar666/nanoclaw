@@ -111,6 +111,12 @@ interface EventBody {
   description?: string;
   location?: string;
   attendees?: Array<{ email: string }>;
+  // Google's actual wire shape is always an array (RFC5545 lines), even
+  // though the tool's own `recurrence` argument is a single RRULE string
+  // (spec cal-2.2) — the handler wraps it as `[recurrence]` when building
+  // this body. Don't widen the input schema to an array to "match" this;
+  // the asymmetry is deliberate (one line is the supported shape for now).
+  recurrence?: string[];
 }
 
 interface EventsInsertResponse {
@@ -121,6 +127,7 @@ interface EventsInsertResponse {
   location?: string;
   description?: string;
   attendees?: Array<{ email?: string }>;
+  recurrence?: string[]; // see EventBody.recurrence's comment — same array-vs-single-string asymmetry
 }
 
 export const createCalendarEvent: McpToolDefinition = {
@@ -150,6 +157,12 @@ export const createCalendarEvent: McpToolDefinition = {
         },
         description: { type: 'string', description: 'Optional event description.' },
         location: { type: 'string', description: 'Optional event location.' },
+        recurrence: {
+          type: 'string',
+          description:
+            'Optional recurrence rule to make this a repeating event — a single RFC5545 RRULE line, ' +
+            'e.g. "RRULE:FREQ=WEEKLY;BYDAY=TH" for every Thursday. Omit for a single-occurrence event.',
+        },
         guests: {
           type: 'array',
           items: { type: 'string' },
@@ -166,6 +179,7 @@ export const createCalendarEvent: McpToolDefinition = {
     const end = args.end as string | undefined;
     const description = args.description as string | undefined;
     const location = args.location as string | undefined;
+    const recurrence = args.recurrence as string | undefined;
     const guests = args.guests as unknown;
 
     if (!calendar) return err(`calendar is required — one of: ${Object.keys(CALENDAR_IDS).join(', ')}`);
@@ -178,6 +192,9 @@ export const createCalendarEvent: McpToolDefinition = {
     if (!end) return err('end is required');
     if (guests !== undefined && !Array.isArray(guests)) {
       return err('guests must be an array of email address strings');
+    }
+    if (recurrence !== undefined && typeof recurrence !== 'string') {
+      return err('recurrence must be a single RFC5545 RRULE string');
     }
 
     let guestEmails: string[] = [];
@@ -202,6 +219,7 @@ export const createCalendarEvent: McpToolDefinition = {
     };
     if (description) eventBody.description = description;
     if (location) eventBody.location = location;
+    if (recurrence && recurrence.trim()) eventBody.recurrence = [recurrence.trim()];
     if (guestEmails.length > 0) {
       eventBody.attendees = guestEmails.map((email) => ({ email }));
     }
@@ -232,9 +250,13 @@ export const createCalendarEvent: McpToolDefinition = {
     const duplicate = findDuplicateCandidate(precheck.events, title, startUtc, new Date());
     if (duplicate) {
       const ageDesc = formatAgeDesc(duplicate.ageMs);
+      // A recurring create has a bigger blast radius than a one-off (an
+      // entire series, not a single event) — say so, since "anyway?" reads
+      // identically for both otherwise (spec cal-2.2 review finding).
+      const recurringNote = eventBody.recurrence ? ' This would create a recurring series, not a single event.' : '';
       const confirmResult = await createHooks.confirmCreation(
         `This looks like it might already be on ${calendar}'s calendar — created ${ageDesc}:\n` +
-          `${formatConfirmationSummary(duplicate.event)}\n\nCreate "${title}" anyway?`,
+          `${formatConfirmationSummary(duplicate.event)}\n\nCreate "${title}" anyway?${recurringNote}`,
       );
       if ('error' in confirmResult) return confirmResult.error;
       if (!confirmResult.confirmed) {
@@ -303,6 +325,13 @@ export const createCalendarEvent: McpToolDefinition = {
     const confirmedAttendees = event.attendees?.length ? event.attendees : eventBody.attendees;
     const confirmedEmails = confirmedAttendees?.map((a) => a.email).filter((e): e is string => !!e);
     if (confirmedEmails && confirmedEmails.length > 0) lines.push(`Guests: ${confirmedEmails.join(', ')}`);
+    // Same echo-preference as attendees above: Google's own response is the
+    // source of truth for what recurrence was actually set, falling back to
+    // what was sent only if the response happens to omit the field.
+    const confirmedRecurrence = Array.isArray(event.recurrence) && event.recurrence.length ? event.recurrence : eventBody.recurrence;
+    if (confirmedRecurrence && confirmedRecurrence.length > 0) {
+      lines.push(`Recurrence: ${confirmedRecurrence.join(', ')}`);
+    }
     if (event.htmlLink) lines.push(`Link: ${event.htmlLink}`);
 
     log(`create_calendar_event: created "${title}" on ${calendar}'s calendar`);

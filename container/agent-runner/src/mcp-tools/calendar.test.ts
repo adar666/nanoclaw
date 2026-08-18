@@ -888,6 +888,243 @@ describe('create_calendar_event MCP tool', () => {
       expect(result.isError).toBeFalsy();
     });
   });
+
+  describe('recurrence (spec cal-2.2)', () => {
+    const start = '2026-08-20T15:00:00';
+    const end = '2026-08-20T16:00:00';
+    const RRULE = 'RRULE:FREQ=WEEKLY;BYDAY=TH';
+
+    it('no recurrence given — regression: byte-identical to pre-story behavior (no recurrence field sent, plain confirmation)', async () => {
+      const { calls } = stubFetchSequence([
+        PRECHECK_EMPTY,
+        {
+          status: 200,
+          body: {
+            summary: 'Team sync',
+            start: { dateTime: parseZonedToUtc(start, TIMEZONE).toISOString(), timeZone: TIMEZONE },
+            end: { dateTime: parseZonedToUtc(end, TIMEZONE).toISOString(), timeZone: TIMEZONE },
+            htmlLink: 'https://calendar.google.com/event?eid=norec',
+          },
+        },
+      ]);
+
+      const result = await createCalendarEvent.handler({ calendar: 'uriel', title: 'Team sync', start, end });
+
+      expect(result.isError).toBeFalsy();
+      const sentBody = JSON.parse(calls[1].init!.body as string);
+      expect(sentBody).not.toHaveProperty('recurrence');
+      const text = (result.content[0] as { text: string }).text;
+      expect(text).not.toContain('Recurrence:');
+    });
+
+    it('valid RRULE given — wraps as recurrence: [arg] in the outgoing body, confirmation echoes Google\'s response value', async () => {
+      const { calls } = stubFetchSequence([
+        PRECHECK_EMPTY,
+        {
+          status: 200,
+          body: {
+            summary: 'Team sync',
+            start: { dateTime: parseZonedToUtc(start, TIMEZONE).toISOString(), timeZone: TIMEZONE },
+            end: { dateTime: parseZonedToUtc(end, TIMEZONE).toISOString(), timeZone: TIMEZONE },
+            recurrence: [RRULE],
+            htmlLink: 'https://calendar.google.com/event?eid=rec1',
+          },
+        },
+      ]);
+
+      const result = await createCalendarEvent.handler({
+        calendar: 'uriel',
+        title: 'Team sync',
+        start,
+        end,
+        recurrence: RRULE,
+      });
+
+      expect(result.isError).toBeFalsy();
+      const sentBody = JSON.parse(calls[1].init!.body as string);
+      expect(sentBody.recurrence).toEqual([RRULE]);
+      const text = (result.content[0] as { text: string }).text;
+      expect(text).toContain(`Recurrence: ${RRULE}`);
+    });
+
+    it('confirmation prefers what Google\'s response echoes back over what was sent, when they differ', async () => {
+      const normalized = 'RRULE:FREQ=WEEKLY;BYDAY=TH;WKST=SU'; // Google normalized/echoed a different string
+      const { calls } = stubFetchSequence([
+        PRECHECK_EMPTY,
+        {
+          status: 200,
+          body: {
+            summary: 'Team sync',
+            recurrence: [normalized],
+            htmlLink: 'https://calendar.google.com/event?eid=rec2',
+          },
+        },
+      ]);
+
+      const result = await createCalendarEvent.handler({
+        calendar: 'uriel',
+        title: 'Team sync',
+        start,
+        end,
+        recurrence: RRULE,
+      });
+
+      const sentBody = JSON.parse(calls[1].init!.body as string);
+      expect(sentBody.recurrence).toEqual([RRULE]); // sent the raw arg, unmodified
+      const text = (result.content[0] as { text: string }).text;
+      expect(text).toContain(`Recurrence: ${normalized}`); // confirmation echoes what Google returned
+      expect(text).not.toContain(`Recurrence: ${RRULE}\n`); // not just restating the sent value verbatim
+    });
+
+    it('empty string recurrence is treated as falsy — no recurrence field sent, single-occurrence event created', async () => {
+      const { calls } = stubFetchSequence([
+        PRECHECK_EMPTY,
+        {
+          status: 200,
+          body: {
+            summary: 'Team sync',
+            htmlLink: 'https://calendar.google.com/event?eid=rec3',
+          },
+        },
+      ]);
+
+      const result = await createCalendarEvent.handler({
+        calendar: 'uriel',
+        title: 'Team sync',
+        start,
+        end,
+        recurrence: '',
+      });
+
+      expect(result.isError).toBeFalsy();
+      const sentBody = JSON.parse(calls[1].init!.body as string);
+      expect(sentBody).not.toHaveProperty('recurrence');
+      const text = (result.content[0] as { text: string }).text;
+      expect(text).not.toContain('Recurrence:');
+    });
+
+    it('Google rejects a malformed RRULE (400 on the POST) — surfaced via the existing generic error path, no client-side validation', async () => {
+      stubFetchSequence([
+        PRECHECK_EMPTY,
+        {
+          status: 400,
+          body: { error: { code: 400, message: 'Invalid recurrence rule' } },
+        },
+      ]);
+
+      const result = await createCalendarEvent.handler({
+        calendar: 'uriel',
+        title: 'Team sync',
+        start,
+        end,
+        recurrence: 'RRULE:NOT-A-REAL-RULE',
+      });
+
+      expect(result.isError).toBe(true);
+      const text = (result.content[0] as { text: string }).text;
+      expect(text).toContain('400');
+      expect(text).toContain('Invalid recurrence rule');
+    });
+
+    it('a recurring create still trips the idempotency guard against an existing one-off match', async () => {
+      const startUtc = parseZonedToUtc(start, TIMEZONE);
+      const duplicate = {
+        id: 'evt-dup-rec',
+        summary: '  Team Sync  ',
+        start: { dateTime: startUtc.toISOString(), timeZone: TIMEZONE },
+        end: { dateTime: new Date(startUtc.getTime() + 3_600_000).toISOString(), timeZone: TIMEZONE },
+        created: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
+      };
+      const { fn: confirmFn } = stubConfirmCreation({ confirmed: false });
+      const { fn } = stubFetchSequence([{ status: 200, body: { items: [duplicate] } }]);
+
+      const result = await createCalendarEvent.handler({
+        calendar: 'uriel',
+        title: 'Team sync',
+        start,
+        end,
+        recurrence: RRULE,
+      });
+
+      expect(confirmFn).toHaveBeenCalledTimes(1); // guard still runs, unaffected by recurrence
+      expect(fn).toHaveBeenCalledTimes(1); // pre-check GET only — no POST, guard declined
+      expect(result.content[0].text.toLowerCase()).toContain('not created');
+    });
+
+    it('declares recurrence as an optional string in the tool schema', () => {
+      expect(createCalendarEvent.tool.inputSchema).toMatchObject({
+        properties: { recurrence: { type: 'string' } },
+        required: ['calendar', 'title', 'start', 'end'],
+      });
+      expect((createCalendarEvent.tool.inputSchema.required as string[]) ?? []).not.toContain('recurrence');
+    });
+
+    it('rejects a non-string recurrence argument with no fetch attempted', async () => {
+      const fn = stubFetchThrows();
+      const result = await createCalendarEvent.handler({
+        calendar: 'uriel',
+        title: 'Team sync',
+        start,
+        end,
+        recurrence: ['RRULE:FREQ=WEEKLY'] as unknown as string,
+      });
+
+      expect(result.isError).toBe(true);
+      expect(fn).not.toHaveBeenCalled();
+    });
+
+    it('whitespace-only recurrence is treated the same as empty — no recurrence field sent', async () => {
+      const { calls } = stubFetchSequence([
+        PRECHECK_EMPTY,
+        { status: 200, body: { summary: 'Team sync', htmlLink: 'https://calendar.google.com/event?eid=rec4' } },
+      ]);
+
+      const result = await createCalendarEvent.handler({ calendar: 'uriel', title: 'Team sync', start, end, recurrence: '   ' });
+
+      expect(result.isError).toBeFalsy();
+      const sentBody = JSON.parse(calls[1].init!.body as string);
+      expect(sentBody).not.toHaveProperty('recurrence');
+    });
+
+    it('does not crash when Google\'s response has a malformed (non-array) recurrence field — falls back to the sent value', async () => {
+      const { calls } = stubFetchSequence([
+        PRECHECK_EMPTY,
+        {
+          status: 200,
+          body: {
+            summary: 'Team sync',
+            recurrence: RRULE, // malformed: a bare string, not an array — Google shouldn't send this, but must not crash if it does
+            htmlLink: 'https://calendar.google.com/event?eid=rec5',
+          },
+        },
+      ]);
+
+      const result = await createCalendarEvent.handler({ calendar: 'uriel', title: 'Team sync', start, end, recurrence: RRULE });
+
+      expect(result.isError).toBeFalsy(); // no uncaught TypeError from calling .join on a string
+      const sentBody = JSON.parse(calls[1].init!.body as string);
+      expect(sentBody.recurrence).toEqual([RRULE]);
+      const text = (result.content[0] as { text: string }).text;
+      expect(text).toContain(`Recurrence: ${RRULE}`); // falls back to what was sent, since Google's shape was unusable
+    });
+
+    it('the duplicate-confirmation question notes the pending create is a recurring series, not just a one-off', async () => {
+      const startUtc = parseZonedToUtc(start, TIMEZONE);
+      const duplicate = {
+        id: 'evt-dup-rec2',
+        summary: 'Team sync',
+        start: { dateTime: startUtc.toISOString(), timeZone: TIMEZONE },
+        end: { dateTime: new Date(startUtc.getTime() + 3_600_000).toISOString(), timeZone: TIMEZONE },
+        created: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
+      };
+      const { questions } = stubConfirmCreation({ confirmed: false });
+      stubFetchSequence([{ status: 200, body: { items: [duplicate] } }]);
+
+      await createCalendarEvent.handler({ calendar: 'uriel', title: 'Team sync', start, end, recurrence: RRULE });
+
+      expect(questions[0]).toContain('recurring series');
+    });
+  });
 });
 
 describe('list_calendar_events MCP tool', () => {
