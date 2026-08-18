@@ -10,7 +10,7 @@ sources: []
 
 ## Why
 
-A pain to solve: right now, scheduling a household event means leaving the chat and opening Google Calendar by hand — and the agent can't answer "what's on the calendar" without being told. The user wants the agent to read and write two people's calendars (Uriel's and Devorah's) directly from chat: say "schedule X" and get a real calendar event with the right details; ask "what's on" and get a real answer.
+A pain to solve: scheduling a household event used to mean leaving chat and opening Google Calendar by hand, and the agent couldn't answer "what's on the calendar" without being told. Epic 1 solved the core loop — create, read, update, delete on Uriel's or Devorah's calendar from chat. Epic 2 hardens and extends that loop: guard against duplicate writes, support recurrence, admit calendars beyond the original two, and auto-resolve guests the agent already half-knows.
 
 ## Capabilities
 
@@ -26,33 +26,48 @@ A pain to solve: right now, scheduling a household event means leaving the chat 
   - **intent:** A user can ask the agent to change an already-created event's details (time, location, guests, description) on a named calendar. If the target event is ambiguous, the agent presents a numbered candidate list and waits for a pick rather than guessing.
   - **success:** The named event's changed field(s) reflect the new value on the real calendar; everything else about the event is unchanged.
 
+- **CAP-4**
+  - **intent:** A duplicate or retried `create_calendar_event` call (network hiccup, agent retry, two chat surfaces racing) does not silently double-book the same event.
+  - **success:** A create request closely matching one already created moments ago on the same calendar is declined, deduped, or asked about — never silently creates a second event.
+
+- **CAP-5**
+  - **intent:** A user can ask the agent to create a recurring event ("every Thursday at 3pm") instead of a single occurrence.
+  - **success:** A real recurring Google Calendar event is created with a correct `RRULE`, confirmed back with the pattern actually set.
+
+- **CAP-6**
+  - **intent:** A user can reach a calendar outside the original two (Uriel's, Devorah's) — e.g. a shared family calendar — through the same four tools.
+  - **success:** A request naming a calendar outside `{uriel, devorah}` is served via a config/mapping addition, with no code change required per newly-added calendar.
+
+- **CAP-7**
+  - **intent:** A guest named by first name only (not an email) in a create/update request is checked against household memory automatically, not only when the agent already happens to have it in context.
+  - **success:** A first-name-only guest auto-resolves via lookup against `groups/household/memory/household/people.md`; an ambiguous or unmatched name is asked about, never guessed.
+
 ## Constraints
 
 - Google Calendar only — not Outlook or any other provider (user-confirmed).
-- Two named calendars only: Uriel's and Devorah's — two separate, independently-owned Google Calendars, each addressed explicitly by name. (How access to each is authenticated is an implementation/architecture-stage detail, not a spec-level constraint — see the architecture spine's AD-2/AD-3.)
 - Credentials never pass through chat, code, or env vars — routed exclusively through the OneCLI Gateway proxy, the same pattern every other credentialed action in this codebase already uses.
-- If a request targets a calendar whose OAuth isn't connected yet (most likely Devorah's, initially), the tool declines clearly with instructions to connect it — never silently falls back to the other calendar or fails with an opaque error.
-- The target calendar (Uriel's vs Devorah's) is always an explicit selection — never inferred/guessed when a request is ambiguous about whose calendar it means; the agent asks.
-- New MCP tool(s) live under `container/agent-runner/src/mcp-tools/`, registered via the existing `McpToolDefinition` + `registerTools()` convention — same mechanism as the document-memory tools.
+- If a request targets a calendar whose OAuth isn't connected yet, the tool declines clearly with instructions to connect it — never silently falls back to another calendar or fails with an opaque error.
+- The target calendar is always an explicit selection — never inferred/guessed when a request is ambiguous about whose calendar it means; the agent asks. This holds for any calendar in the registry, hardcoded or config-added via CAP-6.
+- New/extended MCP tool(s) live under `container/agent-runner/src/mcp-tools/calendar.ts`, registered via the existing `McpToolDefinition` + `registerTools()` convention.
 - All calendar writes (create/update) are triggered by an explicit user chat instruction in the same turn — no autonomous/background/scheduled calendar writes without a direct request.
-- The exact Google Calendar client library (Node/Bun-compatible) is not pinned here — deferred to the architecture stage's stack research.
 
 ## Non-goals
 
-- ~~Deleting/cancelling an event~~ — **built, 2026-08-18** (bounded change, no new spec version): `delete_calendar_event` MCP tool, same `calendar.ts`/`calendar` skill. Blocks on a real, tool-internal user confirmation (same mechanism as `ask_user_question`) before ever issuing the delete — no `confirm` argument for the agent to set itself; see `container/agent-runner/src/mcp-tools/calendar.ts` and `container/skills/calendar/SKILL.md`.
-- Recurring-event creation (e.g. "every Thursday") — single-occurrence events only for v1; revisit if requested.
-- Calendars other than Uriel's and Devorah's (a shared/family calendar, an invited guest's own calendar).
 - Free-busy conflict detection or scheduling-suggestion logic beyond what's explicitly asked.
+- Editing or cancelling a single occurrence of a recurring series independently of the whole series (CAP-5 covers creation only; single-occurrence edits are a future revisit).
 
 ## Success signal
 
-A user says "schedule a meeting with X on Thursday at 3pm at the office, with Yossi" and the agent creates a real Google Calendar event on the right calendar with every given detail correctly set, confirming back with the event's details/link. Separately, "what do I have tomorrow" returns real events from the calendar for that day.
+A retried "schedule a meeting with X on Thursday at 3pm" never creates two events. "Every Thursday at 3pm" creates one correctly-recurring event. A third calendar (e.g. a family calendar) works the same way Uriel's and Devorah's do, added via config, not code. "Schedule with Yossi" (first name only, known to household memory) resolves his email without the user spelling it out.
 
 ## Assumptions
 
-- Which agent group(s)/wiring this tool is exposed through (household, dm-with-uriel, a new per-person grouping) is an architecture-stage decision, not resolved here.
-- "Guests" means attendee email addresses added to the event; the agent may already know some people's emails from existing household memory (`groups/household/memory/household/people.md`) and can ask when it doesn't.
+- CAP-4's dedup check is scoped per-calendar, not global — a near-identical event on two different calendars is not a duplicate.
+- CAP-6's config/mapping mechanism reuses the existing `calendar` argument shape (a name → calendarId lookup), not a new argument shape.
 
 ## Open Questions
 
-- Whether an unresolvable guest email blocks event creation or the agent asks and proceeds without it — resolved at build stage.
+- CAP-4: exact dedup-match definition (iCalUID-based vs title+time+calendar heuristic) and the time window counting as "moments ago" — resolved at build stage.
+- CAP-5: whether recurring events go through the existing `create_calendar_event` tool (extended) or a new tool — resolved at architecture/build stage.
+- CAP-6: how a newly-added calendar's owner grants access (Devorah's native-sharing pattern reused per-calendar, vs a per-calendar OAuth connection) — resolved at architecture stage.
+- CAP-7: exact trigger condition (every non-email guest string vs only ones the agent flags as uncertain) — resolved at build stage.
