@@ -4,7 +4,7 @@ type: architecture-spine
 purpose: build-substrate
 altitude: feature
 paradigm: 'single connection, Google-native calendar sharing'
-scope: 'MCP tools for reading and writing Google Calendar events, on either of two calendars reachable through one connected Google account'
+scope: 'MCP tools for reading and writing Google Calendar events, on any calendar in this group''s registry (Uriel''s and Devorah''s by default, more via AD-18) reachable through one connected Google account'
 status: final
 created: '2026-08-17'
 updated: '2026-08-18'
@@ -17,7 +17,7 @@ companions: []
 
 ## Design Paradigm
 
-**Single connection, Google-native calendar sharing.** [PIVOT, 2026-08-17 — see AD-2/AD-3] Google Calendar OAuth in OneCLI is one connection per *project*, not per agent identity (live-verified: `onecli apps get --provider google-calendar` returns a global `connection.status`, with no `--agent` scoping anywhere in the CLI surface). One Google account is connected (Uriel's, already done). Its granted `calendar.events` scope covers editing events on **any** calendar that account has access to — not just its own — so Devorah shares her calendar with Uriel's connected account (a one-time action in her own Google Calendar app, no OneCLI/OAuth involvement on her side at all). A calendar MCP tool call takes an explicit `calendar` argument (`uriel` | `devorah`) resolving to a `calendarId` (`primary`, or Devorah's own email) — the tool is a thin, stateless parameter mapping, not a routing decision. Any of the three chat surfaces can call it directly through the one connected identity; no cross-agent relay is needed anywhere in this design.
+**Single connection, Google-native calendar sharing.** [PIVOT, 2026-08-17 — see AD-2/AD-3] Google Calendar OAuth in OneCLI is one connection per *project*, not per agent identity (live-verified: `onecli apps get --provider google-calendar` returns a global `connection.status`, with no `--agent` scoping anywhere in the CLI surface). One Google account is connected (Uriel's, already done). Its granted `calendar.events` scope covers editing events on **any** calendar that account has access to — not just its own — so Devorah (and, per AD-18, any operator-added calendar owner) shares their calendar with Uriel's connected account (a one-time action in their own Google Calendar app, no OneCLI/OAuth involvement on their side at all). A calendar MCP tool call takes an explicit `calendar` argument resolving to a `calendarId` via AD-18's registry (`primary` for `uriel`, Devorah's own email for `devorah` by default, plus any config-added name) — the tool is a thin, stateless parameter mapping, not a routing decision, and the set of valid names is **not** closed at two [REVISED, 2026-08-18 — AD-18]. Any of the three chat surfaces can call it directly through the one connected identity; no cross-agent relay is needed anywhere in this design.
 
 ## Invariants & Rules
 
@@ -28,6 +28,7 @@ graph LR
     end
     C -->|fetch, HTTPS_PROXY, calendarId=primary| GCU[Google Calendar — Uriel<br/>owned by the connected account]
     C -->|fetch, HTTPS_PROXY, calendarId=devorah's email| GCD[Google Calendar — Devorah<br/>shared with the connected account]
+    C -->|fetch, HTTPS_PROXY, calendarId from registry| GCN[Google Calendar — any config-added name<br/>AD-18, shared the same way]
 ```
 
 ### AD-1 — Calendar access via the existing OneCLI Gateway proxy
@@ -131,7 +132,7 @@ graph LR
 
 - **Binds:** CAP-6
 - **Prevents:** A code change per newly-added calendar, and a second OAuth-connection path — AD-2 already fixes OneCLI to exactly one Google Calendar connection per project, so a second real OAuth grant per calendar was never architecturally available. This resolves SPEC.md's CAP-6 open question outright rather than narrowing it.
-- **Rule:** The two-value `calendar` argument enum becomes a config-driven registry — a `name → {calendarId, ownerEmail}` map. **DB-backed** (`container_configs`-style, mirroring `src/db/container-configs.ts`'s established per-agent-group-config pattern), **not** a `.ts` constants file — a source file needs a rebuild + service restart per this project's own documented rebuild rules (CLAUDE.md), which would contradict the "never a code change" claim below; a DB row does not. A newly-added calendar's owner grants access via the same Google-native sharing Devorah already uses (AD-3: Settings → Share with specific people → "Make changes to events" with the one connected account). Adding a calendar is a DB write (via `ncl` or a future admin path) plus that one-time sharing action — never a code change or rebuild.
+- **Rule [tightened, Story 2.3 build]:** The two-value `calendar` argument enum becomes a config-driven registry — a `name → {calendarId}` map, no separate `ownerEmail` field (the original sketch here overspecified: nothing in the codebase ever consumed a distinct owner-email, and `calendarId` already *is* the effective identifier — see Devorah's own entry, her email as the `calendarId` itself). **DB-backed** (`container_configs`-style, mirroring `src/db/container-configs.ts`'s established per-agent-group-config pattern), **not** a `.ts` constants file — a source file needs a rebuild + service restart per this project's own documented rebuild rules (CLAUDE.md), which would contradict the "never a code change" claim below; a DB row does not. A newly-added calendar's owner grants access via the same Google-native sharing Devorah already uses (AD-3: Settings → Share with specific people → "Make changes to events" with the one connected account). Adding a calendar is a DB write (via `ncl` or a future admin path) plus that one-time sharing action — never a code change or rebuild.
 
 ### AD-19 — Guest auto-validation against household memory, ambiguity asks, unmatched blocks [REVISED, 2026-08-18 — persona-level, not tool-code]
 
@@ -162,7 +163,7 @@ container/agent-runner/src/mcp-tools/
   calendar.ts             # create_calendar_event, list_calendar_events, update_calendar_event, delete_calendar_event
   calendar.test.ts        # bun:test coverage
 src/db/
-  calendar-registry.ts     # NEW (AD-18): DB-backed name -> {calendarId, ownerEmail} registry, container_configs-style, replaces the two-value enum
+  calendar-registry.ts     # NEW (AD-18): DB-backed name -> {calendarId} registry, container_configs-style, replaces the two-value enum
 container/skills/
   calendar/               # NEW container skill: when/how to use the tools, the `calendar` argument, AD-5's sender-identity rule
     SKILL.md

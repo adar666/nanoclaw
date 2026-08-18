@@ -785,6 +785,55 @@ describe('create_calendar_event MCP tool', () => {
       expect(result.isError).toBeFalsy();
     });
 
+    it('a recurring create DOES match an existing recurring master/instance with the same instant+title — retry protection, epic-2 retro fix', async () => {
+      // The bug: excluding every recurring candidate unconditionally (as
+      // written for Story 2.1, before Story 2.2 added `recurrence`) meant a
+      // retried recurring create could never find its own just-created
+      // series as a duplicate — the guard silently did nothing for exactly
+      // the case it exists to protect. Fixed by keying the exclusion on
+      // whether the NEW request is itself recurring, not on the candidate
+      // alone.
+      const { fn: confirmFn } = stubConfirmCreation({ confirmed: false });
+      const masterCandidate = baseDuplicateCandidate({ recurrence: ['RRULE:FREQ=WEEKLY;BYDAY=TH'] });
+      const { fn } = stubFetchSequence([{ status: 200, body: { items: [masterCandidate] } }]);
+
+      const result = await createCalendarEvent.handler({
+        calendar: 'uriel',
+        title: 'Team sync',
+        start,
+        end,
+        recurrence: 'RRULE:FREQ=WEEKLY;BYDAY=TH',
+      });
+
+      expect(confirmFn).toHaveBeenCalledTimes(1); // matched — the retry is blocked, same as any other duplicate
+      expect(fn).toHaveBeenCalledTimes(1); // pre-check only — no POST
+      expect(result.content[0].text.toLowerCase()).toContain('not created');
+    });
+
+    it('a recurring create still matches a non-recurring one-off candidate with the same instant+title (recurrence never relaxes the match)', async () => {
+      const { fn: confirmFn } = stubConfirmCreation({ confirmed: true });
+      const oneOffCandidate = baseDuplicateCandidate(); // no recurrence/recurringEventId
+      const { fn } = stubFetchSequence([
+        { status: 200, body: { items: [oneOffCandidate] } },
+        { status: 200, body: { summary: 'Team sync' } },
+      ]);
+
+      const result = await createCalendarEvent.handler({
+        calendar: 'uriel',
+        title: 'Team sync',
+        start,
+        end,
+        recurrence: 'RRULE:FREQ=WEEKLY;BYDAY=TH',
+      });
+
+      // Same instant+title+recency still matches regardless of the NEW
+      // request's own recurrence — recurrence only changes which
+      // CANDIDATES are eligible, never relaxes the match itself.
+      expect(confirmFn).toHaveBeenCalledTimes(1);
+      expect(fn).toHaveBeenCalledTimes(2); // pre-check GET, then the POST (user confirmed "create anyway")
+      expect(result.isError).toBeFalsy();
+    });
+
     it('does not treat a match outside the 10-minute recency window as a duplicate — POST proceeds', async () => {
       const { fn: confirmFn } = stubConfirmCreation({ confirmed: true });
       const staleCandidate = baseDuplicateCandidate({ created: new Date(Date.now() - 15 * 60 * 1000).toISOString() });

@@ -1,17 +1,20 @@
 /**
- * create_calendar_event / list_calendar_events / update_calendar_event —
- * read and write real events on one of two Google Calendars via direct
- * `fetch()` calls routed through the container's already-injected
- * `HTTPS_PROXY` — no Google API client library (AD-6).
+ * create_calendar_event / list_calendar_events / update_calendar_event /
+ * delete_calendar_event — read and write real events on this group's
+ * configured Google Calendars via direct `fetch()` calls routed through
+ * the container's already-injected `HTTPS_PROXY` — no Google API client
+ * library (AD-6).
  *
  * [2026-08-17 pivot — see ARCHITECTURE-SPINE.md AD-2/AD-3] Google Calendar
  * OAuth in OneCLI is one connection per *project*, not per agent identity —
  * live-verified via `onecli apps get --provider google-calendar` (no
  * per-agent scoping exists in the CLI at all). So there is exactly one
  * connected Google account, and which calendar a call targets is picked by
- * the `calendar` argument (`"uriel"` | `"devorah"`), resolved to a
- * `calendarId` here — never by which container/identity happens to be
- * calling. Devora's calendar is reachable because she shares it with the
+ * the `calendar` argument, resolved to a `calendarId` via `resolveCalendarIds()`
+ * below — **not** a closed `"uriel"`/`"devorah"` set (AD-18, Story 2.3: a
+ * config-driven registry extends it) — never by which container/identity
+ * happens to be calling. Each configured calendar is reachable because its
+ * owner shares it with the
  * connected account (Google Calendar's own sharing, not a second OAuth
  * grant) — the already-granted `calendar.events` scope covers editing
  * events on any calendar the connected account can access, not just its
@@ -297,7 +300,7 @@ export const createCalendarEvent: McpToolDefinition = {
       );
     }
 
-    const duplicate = findDuplicateCandidate(precheck.events, title, startUtc, new Date());
+    const duplicate = findDuplicateCandidate(precheck.events, title, startUtc, new Date(), Boolean(eventBody.recurrence));
     if (duplicate) {
       const ageDesc = formatAgeDesc(duplicate.ageMs);
       // A recurring create has a bigger blast radius than a one-off (an
@@ -589,24 +592,39 @@ const DUPLICATE_RECENCY_WINDOW_MS = 10 * 60 * 1000;
  * own offset/Z per the Calendar API, so a plain `Date` comparison is already
  * timezone-normalized — never a raw string compare, and never fooled by a
  * candidate sharing the same local numerals but a different `timeZone`) +
- * case-insensitive-trimmed title match + not part of any recurring series
- * (excludes both a master, which carries `recurrence`, and an expanded
- * instance, which carries `recurringEventId` instead — `fetchEvents` sets
- * `singleEvents=true`, so only instances are ever returned here, but both
- * are excluded for correctness) + `created` within the last 10 minutes,
- * with a clock-skew-safe lower bound (a `created` timestamp in the future
- * yields a negative age, which never matches). A candidate with no `created`
- * field can't have its recency verified and is never treated as a match.
+ * case-insensitive-trimmed title match + `created` within the last 10
+ * minutes, with a clock-skew-safe lower bound (a `created` timestamp in
+ * the future yields a negative age, which never matches). A candidate with
+ * no `created` field can't have its recency verified and is never treated
+ * as a match.
+ *
+ * A candidate that's part of a recurring series (a master, carrying
+ * `recurrence`, or an expanded instance, carrying `recurringEventId` —
+ * `fetchEvents` sets `singleEvents=true`, so only instances are ever
+ * returned here) is excluded from matching **only when the new request
+ * itself is a one-off** — that's the case AD-16 originally wrote this
+ * exclusion for: stop an unrelated pre-existing series' occurrence from
+ * false-matching a coincidentally same-titled one-off create. Once AD-17
+ * added `recurrence` as a `create_calendar_event` argument, applying that
+ * same exclusion unconditionally silently defeated the whole guard for the
+ * exact case it exists to catch: a retried/racing *recurring* create would
+ * always find "no duplicate", because every real candidate (the series it
+ * just created) carries `recurringEventId`/`recurrence` and got skipped
+ * regardless of what's being created. Retrospective finding (epic-2,
+ * cross-story boundary pass) — fixed by keying the exclusion on whether
+ * `newRecurrence` is set, not on the candidate alone.
  */
 function findDuplicateCandidate(
   events: CalendarEventItem[],
   title: string,
   startUtc: Date,
   now: Date,
+  newRecurrence: boolean,
 ): { event: CalendarEventItem; ageMs: number } | undefined {
   const normalizedTitle = title.trim().toLowerCase();
   for (const ev of events) {
-    if (ev.recurrence || ev.recurringEventId) continue; // part of a recurring series — never a match
+    const candidateIsRecurring = Boolean(ev.recurrence || ev.recurringEventId);
+    if (candidateIsRecurring && !newRecurrence) continue; // one-off create — an unrelated series is never a match
     if (!ev.start?.dateTime) continue; // all-day or malformed — no instant to compare
     if (new Date(ev.start.dateTime).getTime() !== startUtc.getTime()) continue;
     if ((ev.summary ?? '').trim().toLowerCase() !== normalizedTitle) continue;
