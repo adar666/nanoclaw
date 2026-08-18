@@ -27,6 +27,7 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { TIMEZONE, parseZonedToUtc, formatLocalTime } from '../timezone.js';
 import type { McpToolDefinition } from './types.js';
 import { registerTools } from './server.js';
+import { askUserQuestion } from './interactive.js';
 
 /**
  * The only two calendars in scope (spec non-goal: no others). "uriel" maps
@@ -771,14 +772,51 @@ export const updateCalendarEvent: McpToolDefinition = {
   },
 };
 
+const CONFIRM_DELETE_LABEL = 'Yes, delete it';
+const CANCEL_DELETE_LABEL = 'No, cancel';
+
+/**
+ * Real, blocking human confirmation via the same card-and-poll mechanism
+ * ask_user_question already exposes — reused in-process rather than via a
+ * second MCP round trip. Deliberately not a `confirm: boolean` argument the
+ * agent supplies itself: an earlier design trusted the agent to always call
+ * ask_user_question on its own before setting such a flag, and a live
+ * incident (2026-08-18) showed that trust doesn't hold — the agent treated
+ * the user's own delete request as sufficient confirmation and deleted the
+ * event with no question ever shown. Calling askUserQuestion.handler
+ * directly here makes that skip structurally impossible.
+ */
+async function defaultConfirmDeletion(question: string): Promise<{ confirmed: boolean } | { error: CallToolResult }> {
+  const result = await askUserQuestion.handler({
+    title: 'Confirm deletion',
+    question,
+    options: [CONFIRM_DELETE_LABEL, CANCEL_DELETE_LABEL],
+  });
+  if (result.isError) return { error: result };
+  const answer = (result.content[0] as { text?: string } | undefined)?.text;
+  return { confirmed: answer === CONFIRM_DELETE_LABEL };
+}
+
+/**
+ * Exported so tests can substitute the confirmation gate without going
+ * anywhere near the real ask_user_question DB round trip (writeMessageOut /
+ * findQuestionResponse / getSessionRouting all require a live session DB).
+ * Production code never overrides this — only calendar.test.ts does, and
+ * always restores it in afterEach.
+ */
+export const deleteHooks = {
+  confirmDeletion: defaultConfirmDeletion,
+};
+
 export const deleteCalendarEvent: McpToolDefinition = {
   tool: {
     name: 'delete_calendar_event',
     description:
-      "Delete a real event from Uriel's or Devora's Google Calendar. This cannot be undone. Always preview " +
-      'first: call with confirm omitted or false to resolve the event without deleting it, get a real ' +
-      'confirmation from the user (e.g. via ask_user_question), then re-call with confirm: true and the same ' +
-      'eventId to actually delete it. Target the event either by a known eventId or by eventQuery free-text search.',
+      "Delete a real event from Uriel's or Devora's Google Calendar. This cannot be undone. The tool itself " +
+      "blocks and asks the user to confirm (a real yes/no card, same mechanism as ask_user_question) before " +
+      'issuing the actual delete — there is nothing else to orchestrate, one call resolves the target, gets a ' +
+      'real confirmation, and deletes (or does not) in sequence. Target the event either by a known eventId or ' +
+      'by eventQuery free-text search.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -807,12 +845,6 @@ export const deleteCalendarEvent: McpToolDefinition = {
           type: 'string',
           description: 'Optional search window end, used only with eventQuery. Defaults to 7 days after from.',
         },
-        confirm: {
-          type: 'boolean',
-          description:
-            'Must be true to actually delete. Omitted or false resolves and previews the event without ' +
-            'deleting it — never set this true without first getting a real confirmation from the user.',
-        },
       },
       required: ['calendar'],
     },
@@ -823,7 +855,6 @@ export const deleteCalendarEvent: McpToolDefinition = {
     const eventQuery = args.eventQuery as string | undefined;
     const from = args.from as string | undefined;
     const to = args.to as string | undefined;
-    const confirm = args.confirm === true;
 
     if (!calendar) return err(`calendar is required — one of: ${Object.keys(CALENDAR_IDS).join(', ')}`);
     const calendarId = CALENDAR_IDS[calendar];
@@ -847,14 +878,19 @@ export const deleteCalendarEvent: McpToolDefinition = {
     // precedent) — nothing to echo beyond the id itself in that case.
     const targetDesc = eventId ? `event ${targetEventId} on ${calendar}'s calendar` : formatEventLine(resolved.event);
 
-    if (!confirm) {
-      return ok(
-        [
-          `Ready to delete: ${targetDesc}.`,
-          `This cannot be undone — NOT deleted yet. Confirm with the user first, then re-call ` +
-            `delete_calendar_event with eventId: "${targetEventId}" and confirm: true.`,
-        ].join('\n'),
-      );
+    // Structurally blocks on a real human confirmation — no separate
+    // "preview" call the agent has to remember to make, and no way for the
+    // agent's own judgment to substitute for asking (see calendar.ts's file
+    // header note / the 2026-08-18 live incident this replaced: an earlier
+    // `confirm: boolean` argument trusted the agent to always ask first and
+    // it silently didn't, deleting an event on the user's very first real
+    // request with zero confirmation shown).
+    const confirmResult = await deleteHooks.confirmDeletion(
+      `Delete this event from ${calendar}'s calendar? This cannot be undone.\n${targetDesc}`,
+    );
+    if ('error' in confirmResult) return confirmResult.error;
+    if (!confirmResult.confirmed) {
+      return ok(`Not deleted: ${targetDesc}.`);
     }
 
     let response: Response;

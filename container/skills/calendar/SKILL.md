@@ -7,12 +7,13 @@ description: >-
   schedule, book, put something on the calendar, check what's coming up,
   answer "when is X", reschedule/edit an existing event, or cancel/delete
   one — for either person, not just this agent's own identity. Also covers
-  the OneCLI connect-link flow for a not-yet-connected calendar, the
-  required delete-confirmation flow, and the deliberate distinction from
-  second-brain's own, unrelated Google OAuth (never disclose that one).
+  the OneCLI connect-link flow for a not-yet-connected calendar (delete
+  blocks on its own built-in confirmation — nothing to orchestrate), and
+  the deliberate distinction from second-brain's own, unrelated Google
+  OAuth (never disclose that one).
 metadata:
   author: nanoclaw
-  version: "1.2.0"
+  version: "1.2.1"
 ---
 
 # Calendar
@@ -95,27 +96,20 @@ just a restatement of the request — relay that, same as `create_calendar_event
 
 ## delete_calendar_event
 
-Deleting an event cannot be undone — **always** a two-step flow, no
-exceptions:
+Target the event the same way as `update_calendar_event` — `eventId`
+directly, or `eventQuery` (+ optional `from`/`to`) with the same
+disambiguation (zero matches declines, one resolves, two or more return a
+numbered candidate list, nothing deleted).
 
-1. Call `delete_calendar_event` with `confirm` omitted (or `false`) and a
-   target — same `eventId`-vs-`eventQuery` choice as `update_calendar_event`
-   (same disambiguation: zero matches declines, one resolves, two or more
-   return a numbered candidate list). This only **previews** the event —
-   nothing is deleted yet.
-2. Relay the preview to the user and get a **real** confirmation — use
-   `ask_user_question` (e.g. title "Confirm deletion") rather than assuming
-   a vague "yeah go ahead" earlier in the conversation covers it.
-3. Only after the user actually confirms, re-call `delete_calendar_event`
-   with the same `eventId` from the preview and `confirm: true`.
-
-Never set `confirm: true` on the first call, and never infer consent from
-context — the tool itself won't stop you (there's no server-side state
-tying calls together), so this is on you to get right every time. If the
-user's request already reads as an explicit, specific instruction to delete
-one named event ("cancel my 3pm dentist appointment"), you still preview
-first and confirm before the real delete — the instruction to delete isn't
-the same thing as confirming *which* event once it's actually been found.
+Once exactly one event is resolved, **the tool itself asks the user to
+confirm** — a real yes/no card, the same mechanism as `ask_user_question` —
+and only issues the actual delete if they say yes. This is one call, not a
+flow you orchestrate: you don't call it once to preview and again to
+confirm, and there is no `confirm` argument to set. Just call
+`delete_calendar_event` with a target; it blocks, shows the user the
+resolved event, and either deletes it or doesn't, depending on their
+answer. Relay the result — don't send your own extra "are you sure?"
+message first, the tool's card already is that question.
 
 ## Two calendars, either one, from any chat
 

@@ -48,7 +48,7 @@ NFR6: All calendar writes are triggered by an explicit user chat instruction in 
 - **AD-15** `NODE_EXTRA_CA_CERTS ??= SSL_CERT_FILE` shim closes a real TLS-trust gap in `fetch()`'s CA handling for the gateway's MITM proxy — plus a critical, pre-existing sibling fix (the `nanoclaw` MCP server's spawn `env: {}` → `env: { ...process.env }`, found in the same review round) without which no calendar `fetch()` call could reach the gateway at all.
 - Operational prerequisite (not code, and not blocking): Devorah shares her Google Calendar with the connected account before her calendar is reachable — a one-time action in her own Google Calendar app.
 - Deferred (spine-acknowledged, not built now): no idempotency/duplicate-request guard on `create_calendar_event`; recurring events; calendars beyond Uriel's/Devorah's; automatic guest-list validation against household memory.
-- ~~Deletion/cancellation~~ — **built, 2026-08-18**, bounded change (no new story number): `delete_calendar_event`, gated by an explicit `confirm: true` on a second call after a preview. See `SPEC-google-calendar`'s Non-goals section and `calendar.ts`.
+- ~~Deletion/cancellation~~ — **built, 2026-08-18**, bounded change (no new story number): `delete_calendar_event`, blocking on a real tool-internal confirmation (an initial `confirm: boolean`-argument design was replaced the same day after a live incident showed the agent could — and did — self-authorize past it; see `ARCHITECTURE-SPINE.md`'s Deferred section). See `SPEC-google-calendar`'s Non-goals section and `calendar.ts`.
 
 ### UX Design Requirements
 
