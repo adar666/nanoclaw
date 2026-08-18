@@ -15,7 +15,7 @@ description: >-
   unrelated Google OAuth (never disclose that one).
 metadata:
   author: nanoclaw
-  version: "1.5.1"
+  version: "1.6.0"
 ---
 
 # Calendar
@@ -63,7 +63,34 @@ the same way it reaches Uriel's own.
   real error from Google, not a client-side check. There is currently no
   way to add/change/remove recurrence on an *existing* event via
   `update_calendar_event` — recreate the event instead.
-- `guests` (optional) — array of email addresses to invite.
+- `guests` (optional) — array of email addresses to invite. If someone
+  names a guest by first name, nickname, or Hebrew name only (not an
+  email) — this group's own memory file records people by whichever name
+  form they actually use, not a canonical English first name — resolve it
+  yourself against `groups/household/memory/household/people.md` *before*
+  calling this tool, the same resolve-yourself approach as the
+  sender-identity rule above, never a hardcoded name. (If this group has
+  no such memory file, skip straight to asking for the email.) A clear
+  single match resolves to that person's known email with no extra turn
+  spent. A recognized person with *no* email recorded (this file doesn't
+  guarantee one for everyone) — treat the same as no match: ask directly,
+  don't invent one. More than one plausible match: present a numbered
+  candidate list — this is a persona-level judgment call against free
+  text, not the tool-backed candidate list `update_calendar_event`/
+  `delete_calendar_event` build from real Google data elsewhere in this
+  skill, but the same never-guess principle applies. No match at all: ask
+  for the email directly rather than guessing or silently dropping the
+  guest. More than one guest to resolve in one request: resolve each
+  independently, and if more than one needs a question, ask them together
+  in one turn rather than one at a time. Whatever you resolve, relay which
+  email each name mapped to along with the rest of the confirmation (see
+  below) — and remember a real guest invite emails that person, so this
+  isn't a no-consequence guess to get wrong. Only pass this tool a real
+  email address — it validates the shape and rejects anything else with a
+  clear error, which is the floor this behavior sits on top of, not a
+  substitute for resolving proactively. `update_calendar_event` has no
+  `guests` argument at all today — it can't add, change, or remove
+  attendees on an existing event.
 
 A successful call returns the real event's details plus its Google-assigned
 `htmlLink`. Always relay that link and the details actually set back to the
@@ -114,8 +141,10 @@ Two ways to target the event to change:
 At least one of `title`, `start`, `end`, `description`, `location` must be
 given — the tool declines if there's nothing to change. Only the field(s)
 given are changed; everything else about the event is left alone (a real
-partial update, not a recreate). This tool never deletes/cancels an event —
-use `delete_calendar_event` for that.
+partial update, not a recreate). No `guests` argument exists here — this
+tool can't add, change, or remove attendees on an existing event; say so
+if asked, rather than silently ignoring the request. This tool never
+deletes/cancels an event — use `delete_calendar_event` for that.
 
 The confirmation reflects what Google's response actually echoes back, not
 just a restatement of the request — relay that, same as `create_calendar_event`.

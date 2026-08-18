@@ -1,5 +1,9 @@
 > **Superseded (epic-1 retro action item AI-5):** these items were merged into `_bmad-output/planning-artifacts/architecture/architecture-nanoclaw-v2-2026-08-16/ARCHITECTURE-SPINE.md`'s own Deferred section, which is the single source of truth going forward. Kept here only for the append-only history this file's format assumes.
 
+- source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-4-guest-list-validation.md`
+  summary: SKILL.md's new guest-resolution instructions (and AD-5's pre-existing sender-identity resolution, same pattern) are unfalsifiable persona-level behavioral claims — no eval harness or persona-behavior test exists anywhere in this repo to check whether the agent actually resolves proactively, asks on ambiguity, or asks when unmatched, versus e.g. guessing a plausible-looking (but wrong) email that would still pass the tool's EMAIL_RE shape check silently.
+  evidence: Verification-gap review finding; an inherent limitation of persona-level instructions in this codebase, not something this story introduces or could fix alone — worth a real eval-harness investment if this class of bug ever bites in practice.
+
 - source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-3-calendars-beyond-uriel-and-devorah.md`
   summary: Concurrent `ncl groups config add-calendar`/`remove-calendar` calls on the same group can lose an update (read-then-write, not transactional) — same class of race as every other `config add-X`/`remove-X` JSON-column CLI verb on this table (mounts, MCP servers, packages), not new to this story.
   evidence: Edge-case-hunter review finding; pre-existing systemic pattern across the whole `config add-X` family, surfaced incidentally by this story rather than introduced by it.
