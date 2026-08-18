@@ -772,6 +772,103 @@ export const updateCalendarEvent: McpToolDefinition = {
   },
 };
 
+/**
+ * Same as timezone.ts's shared formatLocalTime, but 24-hour. Deliberately
+ * local, not promoted to the shared (host-mirrored) module — used only for
+ * delete_calendar_event's confirmation question, which a chat card shows to
+ * the user verbatim. Every other tool's output goes through the agent's own
+ * reply first, and this install's persona already renders times in 24h
+ * there — formatLocalTime's shared `hour12: true` default is fine when an
+ * LLM re-narrates it, wrong when it reaches the user unmediated (2026-08-18
+ * finding: a real confirmation card showed "8pm" instead of "20:00").
+ */
+function formatLocalTime24h(utcIso: string): string {
+  return new Date(utcIso).toLocaleString('en-US', {
+    timeZone: TIMEZONE,
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
+}
+
+function formatEventTimeRange24h(start?: EventTimePoint, end?: EventTimePoint): string {
+  if (start?.dateTime) {
+    const s = formatLocalTime24h(start.dateTime);
+    const e = end?.dateTime ? formatLocalTime24h(end.dateTime) : '?';
+    return `${s} → ${e}`;
+  }
+  if (start?.date) {
+    if (end?.date && end.date !== start.date) return `All day: ${start.date} → ${end.date}`;
+    return `All day: ${start.date}`;
+  }
+  return 'time unknown';
+}
+
+/**
+ * Human-facing summary for the delete confirmation card — title, 24h local
+ * time, location. Deliberately NOT formatEventLine: that includes the raw
+ * Google event id, useful for the agent's own follow-up tool calls, pure
+ * noise to a human deciding yes/no (same 2026-08-18 finding as the 24h note
+ * above — the id showed up verbatim in a real confirmation card).
+ */
+function formatConfirmationSummary(ev: CalendarEventItem): string {
+  const title = ev.summary ?? '(no title)';
+  let line = `${title} — ${formatEventTimeRange24h(ev.start, ev.end)}`;
+  if (ev.location) line += ` @ ${ev.location}`;
+  return line;
+}
+
+/**
+ * `GET .../events/{eventId}` — fetches one event's full details. Used only
+ * by delete_calendar_event's direct-eventId path: update_calendar_event
+ * deliberately skips this lookup for its own PATCH (spec cal-1.5's
+ * minimal-lookup precedent), but delete's confirmation card needs a real
+ * title/time to show the user, not just a bare id (see
+ * formatConfirmationSummary above). Same AD-8 gateway-error handling and 30s
+ * timeout bound as every other fetch in this file.
+ */
+async function fetchSingleEvent(
+  calendarId: string,
+  eventId: string,
+): Promise<{ event: CalendarEventItem } | { error: CallToolResult }> {
+  let response: Response;
+  try {
+    response = await fetch(`${eventsUrl(calendarId)}/${encodeURIComponent(eventId)}`, {
+      signal: AbortSignal.timeout(30_000),
+    });
+  } catch (e) {
+    const isTimeout = e instanceof Error && (e.name === 'TimeoutError' || e.name === 'AbortError');
+    const msg = e instanceof Error ? e.message : String(e);
+    log(`delete_calendar_event: lookup fetch failed: ${msg}`);
+    if (isTimeout) {
+      return {
+        error: err('Timed out waiting for Google Calendar (30s) — the gateway or Google may be unreachable right now.'),
+      };
+    }
+    return { error: err(`Could not reach Google Calendar: ${msg}`) };
+  }
+
+  const bodyText = await response.text();
+  if (!response.ok) {
+    log(`delete_calendar_event: lookup gateway/API returned ${response.status}`);
+    const setupUrl = extractSetupUrl(bodyText);
+    if (setupUrl) return { error: err(notConnectedMessage('delete the event', setupUrl)) };
+    return { error: err(`Google Calendar API returned ${response.status}: ${bodyText.slice(0, 500)}`) };
+  }
+
+  let event: CalendarEventItem;
+  try {
+    event = JSON.parse(bodyText) as CalendarEventItem;
+  } catch {
+    log('delete_calendar_event: lookup 2xx response body was not valid JSON');
+    return { error: err('The event could not be read back from the response.') };
+  }
+  return { event };
+}
+
 const CONFIRM_DELETE_LABEL = 'Yes, delete it';
 const CANCEL_DELETE_LABEL = 'No, cancel';
 
@@ -874,9 +971,19 @@ export const deleteCalendarEvent: McpToolDefinition = {
     });
     if ('response' in resolved) return resolved.response;
     const targetEventId = resolved.event.id;
-    // A direct eventId did no lookup (resolveTargetEvent's documented
-    // precedent) — nothing to echo beyond the id itself in that case.
-    const targetDesc = eventId ? `event ${targetEventId} on ${calendar}'s calendar` : formatEventLine(resolved.event);
+
+    // A direct eventId did no lookup in resolveTargetEvent (matches
+    // update_calendar_event's precedent, which never fetches before its own
+    // PATCH) — but delete's confirmation card needs real details, not a
+    // bare id, so fetch them now. The eventQuery path already has full
+    // details from the search above.
+    let eventForDisplay: CalendarEventItem = resolved.event;
+    if (eventId) {
+      const lookup = await fetchSingleEvent(calendarId, eventId);
+      if ('error' in lookup) return lookup.error;
+      eventForDisplay = lookup.event;
+    }
+    const targetDesc = formatEventLine(eventForDisplay); // agent-facing (result text) — id is useful context there
 
     // Structurally blocks on a real human confirmation — no separate
     // "preview" call the agent has to remember to make, and no way for the
@@ -884,9 +991,13 @@ export const deleteCalendarEvent: McpToolDefinition = {
     // header note / the 2026-08-18 live incident this replaced: an earlier
     // `confirm: boolean` argument trusted the agent to always ask first and
     // it silently didn't, deleting an event on the user's very first real
-    // request with zero confirmation shown).
+    // request with zero confirmation shown). The question text itself is
+    // human-facing — formatConfirmationSummary, not formatEventLine: no raw
+    // event id, 24h time (a second, related 2026-08-18 finding — this text
+    // reaches the user as a chat card verbatim, bypassing the agent's own
+    // rephrasing step every other tool's output goes through).
     const confirmResult = await deleteHooks.confirmDeletion(
-      `Delete this event from ${calendar}'s calendar? This cannot be undone.\n${targetDesc}`,
+      `Delete this event from ${calendar}'s calendar? This cannot be undone.\n${formatConfirmationSummary(eventForDisplay)}`,
     );
     if ('error' in confirmResult) return confirmResult.error;
     if (!confirmResult.confirmed) {
