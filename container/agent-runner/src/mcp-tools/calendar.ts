@@ -1,8 +1,8 @@
 /**
- * create_calendar_event — creates a real event on one of two Google
- * Calendars via a single direct `fetch()` call routed through the
- * container's already-injected `HTTPS_PROXY` — no Google API client
- * library (AD-6).
+ * create_calendar_event / list_calendar_events / update_calendar_event —
+ * read and write real events on one of two Google Calendars via direct
+ * `fetch()` calls routed through the container's already-injected
+ * `HTTPS_PROXY` — no Google API client library (AD-6).
  *
  * [2026-08-17 pivot — see ARCHITECTURE-SPINE.md AD-2/AD-3] Google Calendar
  * OAuth in OneCLI is one connection per *project*, not per agent identity —
@@ -11,7 +11,7 @@
  * connected Google account, and which calendar a call targets is picked by
  * the `calendar` argument (`"uriel"` | `"devorah"`), resolved to a
  * `calendarId` here — never by which container/identity happens to be
- * calling. Devorah's calendar is reachable because she shares it with the
+ * calling. Devora's calendar is reachable because she shares it with the
  * connected account (Google Calendar's own sharing, not a second OAuth
  * grant) — the already-granted `calendar.events` scope covers editing
  * events on any calendar the connected account can access, not just its
@@ -22,7 +22,9 @@
  * shim that bridges the two (`../tls-shim.js`, AD-15) runs at agent-runner
  * startup (see `index.ts`), before this tool's `fetch()` can ever run.
  */
-import { TIMEZONE, parseZonedToUtc } from '../timezone.js';
+import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+
+import { TIMEZONE, parseZonedToUtc, formatLocalTime } from '../timezone.js';
 import type { McpToolDefinition } from './types.js';
 import { registerTools } from './server.js';
 
@@ -31,7 +33,8 @@ import { registerTools } from './server.js';
  * to the connected account's own calendar; "devorah" to her calendar,
  * reachable because she shares it with the connected account (AD-3) — not
  * a second OAuth connection. Matches `groups/household/memory/household/
- * people.md`'s recorded email for Devora.
+ * people.md`'s recorded email for Devora. Shared by all three tools in this
+ * file (create/list/update) — do not duplicate this mapping.
  */
 const CALENDAR_IDS: Record<string, string> = {
   uriel: 'primary',
@@ -78,8 +81,8 @@ function extractSetupUrl(bodyText: string): string | undefined {
   }
 }
 
-function notConnectedMessage(setupUrl: string): string {
-  return `Can't create the event — this agent's Google Calendar isn't connected yet. Connect it here: ${setupUrl}`;
+function notConnectedMessage(action: string, setupUrl: string): string {
+  return `Can't ${action} — this agent's Google Calendar isn't connected yet. Connect it here: ${setupUrl}`;
 }
 
 /**
@@ -233,7 +236,7 @@ export const createCalendarEvent: McpToolDefinition = {
       // quota, sharing policy, ...) and must not be relabeled as
       // "reconnect your calendar," which would discard the real cause.
       if (setupUrl) {
-        return err(notConnectedMessage(setupUrl));
+        return err(notConnectedMessage('create the event', setupUrl));
       }
       return err(`Google Calendar API returned ${response.status}: ${bodyText.slice(0, 500)}`);
     }
@@ -266,4 +269,475 @@ export const createCalendarEvent: McpToolDefinition = {
   },
 };
 
-registerTools([createCalendarEvent]);
+// ---------------------------------------------------------------------------
+// Shared read plumbing for list_calendar_events / update_calendar_event's
+// search-based disambiguation path (spec cal-1.5: "reuse cal-1.3's search
+// logic, don't duplicate it").
+// ---------------------------------------------------------------------------
+
+interface EventTimePoint {
+  dateTime?: string;
+  date?: string; // present instead of dateTime for all-day events
+  timeZone?: string;
+}
+
+interface CalendarEventItem {
+  id: string;
+  summary?: string;
+  start?: EventTimePoint;
+  end?: EventTimePoint;
+  location?: string;
+  description?: string;
+}
+
+interface EventsListApiResponse {
+  items?: CalendarEventItem[];
+  nextPageToken?: string;
+}
+
+/**
+ * Google defaults to 250 anyway; set explicitly so `nextPageToken` in the
+ * response reliably signals "there were more than this many" (AD: never
+ * silently cap/truncate without saying so — spec cal-1.3 Boundaries).
+ */
+const MAX_RESULTS = 250;
+
+/** Midnight today in TIMEZONE, expressed as a UTC Date. */
+function startOfTodayUtc(): Date {
+  const fmt = new Intl.DateTimeFormat('en-CA', {
+    timeZone: TIMEZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+  const parts = Object.fromEntries(
+    fmt.formatToParts(new Date()).filter((p) => p.type !== 'literal').map((p) => [p.type, p.value]),
+  );
+  return parseZonedToUtc(`${parts.year}-${parts.month}-${parts.day}T00:00:00`, TIMEZONE);
+}
+
+const DEFAULT_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Resolve the from/to search window per spec cal-1.3: naive local wall-clock
+ * inputs (same shape as create_calendar_event's start/end), defaulting to
+ * "today through 7 days from now" in the group's own timezone when either
+ * side is omitted. `to`, when omitted, is always `from` (or today) + 7d —
+ * not tied to whether `from` itself was given explicitly.
+ */
+function resolveTimeWindow(
+  from: string | undefined,
+  to: string | undefined,
+): { timeMin: Date; timeMax: Date } | { error: string } {
+  let timeMin: Date;
+  if (from) {
+    timeMin = parseZonedToUtc(from, TIMEZONE);
+    if (Number.isNaN(timeMin.getTime())) return { error: `from is not a valid date/time: "${from}"` };
+  } else {
+    timeMin = startOfTodayUtc();
+  }
+
+  let timeMax: Date;
+  if (to) {
+    timeMax = parseZonedToUtc(to, TIMEZONE);
+    if (Number.isNaN(timeMax.getTime())) return { error: `to is not a valid date/time: "${to}"` };
+  } else {
+    timeMax = new Date(timeMin.getTime() + DEFAULT_WINDOW_MS);
+  }
+
+  if (timeMax.getTime() <= timeMin.getTime()) {
+    // Interpolate the *resolved* values, not the raw (possibly-omitted)
+    // args — if `from` was omitted (defaults to today) and only `to` is
+    // invalid, the raw args would literally read `from ("undefined")`.
+    return {
+      error:
+        `to ("${formatLocalTime(timeMax.toISOString(), TIMEZONE)}") must be after ` +
+        `from ("${formatLocalTime(timeMin.toISOString(), TIMEZONE)}")`,
+    };
+  }
+  return { timeMin, timeMax };
+}
+
+/** Human-readable time range for one event, timezone-displayed (never raw UTC). */
+function formatEventTimeRange(start?: EventTimePoint, end?: EventTimePoint): string {
+  if (start?.dateTime) {
+    const s = formatLocalTime(start.dateTime, TIMEZONE);
+    const e = end?.dateTime ? formatLocalTime(end.dateTime, TIMEZONE) : '?';
+    return `${s} → ${e}`;
+  }
+  if (start?.date) {
+    if (end?.date && end.date !== start.date) return `All day: ${start.date} → ${end.date}`;
+    return `All day: ${start.date}`;
+  }
+  return 'time unknown';
+}
+
+/**
+ * One event's id/title/time/location, shared by list_calendar_events'
+ * results and update_calendar_event's multi-match candidate list — so a
+ * disambiguation candidate list never drops a field (e.g. location) that
+ * the list output includes, which would make two same-title/same-time
+ * events differing only by location indistinguishable.
+ */
+function formatEventLine(ev: CalendarEventItem): string {
+  const title = ev.summary ?? '(no title)';
+  let line = `[${ev.id}] ${title} — ${formatEventTimeRange(ev.start, ev.end)}`;
+  if (ev.location) line += ` @ ${ev.location}`;
+  return line;
+}
+
+/** Human-readable "<start> to <end>" description of a resolved search window. */
+function formatRangeDesc(timeMin: Date, timeMax: Date): string {
+  return `${formatLocalTime(timeMin.toISOString(), TIMEZONE)} to ${formatLocalTime(timeMax.toISOString(), TIMEZONE)}`;
+}
+
+/**
+ * `GET .../events` with the query-param shape events.list expects
+ * (`timeMin`/`timeMax`/`q`/`singleEvents=true`/`orderBy=startTime`), same
+ * gateway-error handling (AD-8) and 30s timeout bound as create's insert
+ * call. Returns either the raw events + a truncation flag, or an
+ * already-built MCP error result the caller can return directly.
+ */
+async function fetchEvents(
+  calendarId: string,
+  params: { timeMinIso: string; timeMaxIso: string; q?: string },
+): Promise<{ events: CalendarEventItem[]; truncated: boolean } | { error: CallToolResult }> {
+  const url = new URL(eventsUrl(calendarId));
+  url.searchParams.set('timeMin', params.timeMinIso);
+  url.searchParams.set('timeMax', params.timeMaxIso);
+  url.searchParams.set('singleEvents', 'true');
+  url.searchParams.set('orderBy', 'startTime');
+  url.searchParams.set('maxResults', String(MAX_RESULTS));
+  if (params.q) url.searchParams.set('q', params.q);
+
+  let response: Response;
+  try {
+    response = await fetch(url.toString(), { signal: AbortSignal.timeout(30_000) });
+  } catch (e) {
+    const isTimeout = e instanceof Error && (e.name === 'TimeoutError' || e.name === 'AbortError');
+    const msg = e instanceof Error ? e.message : String(e);
+    log(`calendar events list: fetch failed: ${msg}`);
+    if (isTimeout) {
+      return {
+        error: err('Timed out waiting for Google Calendar (30s) — the gateway or Google may be unreachable right now.'),
+      };
+    }
+    return { error: err(`Could not reach Google Calendar: ${msg}`) };
+  }
+
+  const bodyText = await response.text();
+  if (!response.ok) {
+    log(`calendar events list: gateway/API returned ${response.status}`);
+    const setupUrl = extractSetupUrl(bodyText);
+    if (setupUrl) return { error: err(notConnectedMessage('list events', setupUrl)) };
+    return { error: err(`Google Calendar API returned ${response.status}: ${bodyText.slice(0, 500)}`) };
+  }
+
+  let parsed: EventsListApiResponse;
+  try {
+    parsed = JSON.parse(bodyText) as EventsListApiResponse;
+  } catch {
+    log('calendar events list: 2xx response body was not valid JSON');
+    return { error: err('The events list could not be read back from the response.') };
+  }
+
+  return { events: parsed.items ?? [], truncated: Boolean(parsed.nextPageToken) };
+}
+
+/**
+ * Shared search entry point — resolves the from/to window then calls
+ * fetchEvents. Both `list_calendar_events` and `update_calendar_event`'s
+ * eventQuery disambiguation path call this; neither duplicates the window
+ * resolution or the HTTP call (spec cal-1.5 Code Map).
+ *
+ * Returns the resolved `timeMin`/`timeMax` alongside the events so callers
+ * that need to describe the window searched (range-description text, the
+ * inverted-window error) reuse this single resolution rather than calling
+ * `resolveTimeWindow` a second time — two independent `new Date()`-based
+ * resolutions could in principle disagree at a midnight boundary.
+ */
+async function searchEvents(
+  calendarId: string,
+  params: { query?: string; from?: string; to?: string },
+): Promise<
+  | { events: CalendarEventItem[]; truncated: boolean; timeMin: Date; timeMax: Date }
+  | { error: CallToolResult }
+> {
+  const window = resolveTimeWindow(params.from, params.to);
+  if ('error' in window) return { error: err(window.error) };
+  const fetched = await fetchEvents(calendarId, {
+    timeMinIso: window.timeMin.toISOString(),
+    timeMaxIso: window.timeMax.toISOString(),
+    q: params.query || undefined,
+  });
+  if ('error' in fetched) return fetched;
+  return { ...fetched, timeMin: window.timeMin, timeMax: window.timeMax };
+}
+
+export const listCalendarEvents: McpToolDefinition = {
+  tool: {
+    name: 'list_calendar_events',
+    description:
+      "List real events on Uriel's or Devora's Google Calendar (both reachable through one connected " +
+      'account — Devora\'s via calendar sharing, not a separate connection). Use for "what\'s on my/their ' +
+      'calendar" or "when is X" questions — never answer those from memory or a guess.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        calendar: {
+          type: 'string',
+          enum: ['uriel', 'devorah'],
+          description: 'Which calendar to list events from.',
+        },
+        from: {
+          type: 'string',
+          description:
+            'Start of the range, naive local wall-clock, no offset/Z (e.g. "2026-08-20T00:00:00"). ' +
+            "Interpreted in this group's own configured timezone. Defaults to the start of today.",
+        },
+        to: {
+          type: 'string',
+          description: 'End of the range, same naive local wall-clock shape as from. Defaults to 7 days after from.',
+        },
+        query: {
+          type: 'string',
+          description: 'Optional free-text search (Google\'s own search, e.g. "dentist") to filter events.',
+        },
+      },
+      required: ['calendar'],
+    },
+  },
+  async handler(args) {
+    const calendar = args.calendar as string | undefined;
+    const from = args.from as string | undefined;
+    const to = args.to as string | undefined;
+    const query = args.query as string | undefined;
+
+    if (!calendar) return err(`calendar is required — one of: ${Object.keys(CALENDAR_IDS).join(', ')}`);
+    const calendarId = CALENDAR_IDS[calendar];
+    if (!calendarId) {
+      return err(`Unknown calendar "${calendar}" — must be one of: ${Object.keys(CALENDAR_IDS).join(', ')}`);
+    }
+
+    const result = await searchEvents(calendarId, { query, from, to });
+    if ('error' in result) return result.error;
+
+    const rangeDesc = formatRangeDesc(result.timeMin, result.timeMax);
+    const queryDesc = query ? ` matching "${query}"` : '';
+
+    if (result.events.length === 0) {
+      return ok(`No events found on ${calendar}'s calendar${queryDesc} between ${rangeDesc}.`);
+    }
+
+    const lines = [`Events on ${calendar}'s calendar${queryDesc} (${rangeDesc}):`];
+    for (const ev of result.events) {
+      lines.push(`- ${formatEventLine(ev)}`);
+    }
+    if (result.truncated) {
+      lines.push(`(Results capped at ${MAX_RESULTS} — there may be more events than shown.)`);
+    }
+
+    log(`list_calendar_events: ${result.events.length} event(s) on ${calendar}'s calendar`);
+    return ok(lines.join('\n'));
+  },
+};
+
+interface EventsPatchResponse {
+  summary?: string;
+  start?: EventTimePoint;
+  end?: EventTimePoint;
+  location?: string;
+  description?: string;
+  htmlLink?: string;
+}
+
+export const updateCalendarEvent: McpToolDefinition = {
+  tool: {
+    name: 'update_calendar_event',
+    description:
+      "Update a real event on Uriel's or Devora's Google Calendar. Target it either by a known eventId " +
+      '(e.g. from a prior list_calendar_events call) or by eventQuery free-text search. Never deletes/cancels ' +
+      'an event — that capability does not exist.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        calendar: {
+          type: 'string',
+          enum: ['uriel', 'devorah'],
+          description: 'Which calendar the event is on.',
+        },
+        eventId: {
+          type: 'string',
+          description:
+            'The real Google event id, if already known. When given, updates this exact event directly — no ' +
+            'search. Takes priority over eventQuery if both are given.',
+        },
+        eventQuery: {
+          type: 'string',
+          description:
+            'Free-text search to find the event when eventId is not known. Exactly one match updates directly; ' +
+            'zero matches declines; two or more return a numbered candidate list (id/title/time) — re-call with ' +
+            'the specific eventId from that list.',
+        },
+        from: {
+          type: 'string',
+          description: 'Optional search window start, naive local wall-clock, used only with eventQuery. Defaults to start of today.',
+        },
+        to: {
+          type: 'string',
+          description: 'Optional search window end, used only with eventQuery. Defaults to 7 days after from.',
+        },
+        title: { type: 'string', description: 'New title/summary, if changing.' },
+        start: { type: 'string', description: 'New start time, naive local wall-clock, if changing.' },
+        end: { type: 'string', description: 'New end time, naive local wall-clock, if changing.' },
+        description: { type: 'string', description: 'New description, if changing.' },
+        location: { type: 'string', description: 'New location, if changing.' },
+      },
+      required: ['calendar'],
+    },
+  },
+  async handler(args) {
+    const calendar = args.calendar as string | undefined;
+    const eventId = args.eventId as string | undefined;
+    const eventQuery = args.eventQuery as string | undefined;
+    const from = args.from as string | undefined;
+    const to = args.to as string | undefined;
+    const title = args.title as string | undefined;
+    const start = args.start as string | undefined;
+    const end = args.end as string | undefined;
+    const description = args.description as string | undefined;
+    const location = args.location as string | undefined;
+
+    if (!calendar) return err(`calendar is required — one of: ${Object.keys(CALENDAR_IDS).join(', ')}`);
+    const calendarId = CALENDAR_IDS[calendar];
+    if (!calendarId) {
+      return err(`Unknown calendar "${calendar}" — must be one of: ${Object.keys(CALENDAR_IDS).join(', ')}`);
+    }
+
+    if (!eventId && !eventQuery) {
+      return err('Either eventId or eventQuery is required to target an event to update.');
+    }
+
+    // `!== undefined`, not truthy — an explicit '' is a real, given value
+    // (clear this field), not the same as "this field wasn't mentioned".
+    // A truthy check here would both silently drop an explicit '' from the
+    // PATCH body below *and* wrongly decline as "nothing to update" when
+    // that '' was the only field given.
+    if (
+      title === undefined &&
+      start === undefined &&
+      end === undefined &&
+      description === undefined &&
+      location === undefined
+    ) {
+      return err('Nothing to update — give at least one of title, start, end, description, or location.');
+    }
+
+    let startUtc: Date | undefined;
+    if (start !== undefined) {
+      startUtc = parseZonedToUtc(start, TIMEZONE);
+      if (Number.isNaN(startUtc.getTime())) return err(`start is not a valid date/time: "${start}"`);
+    }
+    let endUtc: Date | undefined;
+    if (end !== undefined) {
+      endUtc = parseZonedToUtc(end, TIMEZONE);
+      if (Number.isNaN(endUtc.getTime())) return err(`end is not a valid date/time: "${end}"`);
+    }
+    // Only compared when both are given in the same call — a single-sided
+    // change (e.g. start only) is left to Google's own validation, since
+    // this tool never fetches the existing event just to compare against it
+    // (spec cal-1.5 Boundaries: partial PATCH, don't fetch-then-resend).
+    if (startUtc && endUtc && endUtc.getTime() <= startUtc.getTime()) {
+      return err(`end ("${end}") must be after start ("${start}")`);
+    }
+
+    let targetEventId: string;
+    if (eventId) {
+      targetEventId = eventId;
+    } else {
+      const searchResult = await searchEvents(calendarId, { query: eventQuery, from, to });
+      if ('error' in searchResult) return searchResult.error;
+
+      const rangeDesc = formatRangeDesc(searchResult.timeMin, searchResult.timeMax);
+
+      if (searchResult.events.length === 0) {
+        return err(
+          `No events found on ${calendar}'s calendar matching "${eventQuery}" between ${rangeDesc} — nothing to update.`,
+        );
+      }
+      if (searchResult.events.length > 1) {
+        const lines = [
+          `Found ${searchResult.events.length} events matching "${eventQuery}" on ${calendar}'s calendar ` +
+            `(${rangeDesc}) — re-call update_calendar_event with the specific eventId:`,
+        ];
+        searchResult.events.forEach((ev, i) => {
+          lines.push(`${i + 1}. ${formatEventLine(ev)}`);
+        });
+        if (searchResult.truncated) {
+          lines.push(`(Search capped at ${MAX_RESULTS} — there may be more matches than shown.)`);
+        }
+        return ok(lines.join('\n'));
+      }
+      targetEventId = searchResult.events[0].id;
+    }
+
+    // `!== undefined`, not truthy — see the "nothing to update" gate above:
+    // an explicit '' is a real value (clear this field) and must reach
+    // Google, not be silently dropped from the PATCH body.
+    const patchBody: Record<string, unknown> = {};
+    if (title !== undefined) patchBody.summary = title;
+    if (startUtc) patchBody.start = { dateTime: startUtc.toISOString(), timeZone: TIMEZONE };
+    if (endUtc) patchBody.end = { dateTime: endUtc.toISOString(), timeZone: TIMEZONE };
+    if (description !== undefined) patchBody.description = description;
+    if (location !== undefined) patchBody.location = location;
+
+    let response: Response;
+    try {
+      response = await fetch(`${eventsUrl(calendarId)}/${encodeURIComponent(targetEventId)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patchBody),
+        signal: AbortSignal.timeout(30_000),
+      });
+    } catch (e) {
+      const isTimeout = e instanceof Error && (e.name === 'TimeoutError' || e.name === 'AbortError');
+      const msg = e instanceof Error ? e.message : String(e);
+      log(`update_calendar_event: fetch failed: ${msg}`);
+      if (isTimeout) {
+        return err('Timed out waiting for Google Calendar (30s) — the gateway or Google may be unreachable right now.');
+      }
+      return err(`Could not reach Google Calendar: ${msg}`);
+    }
+
+    const bodyText = await response.text();
+    if (!response.ok) {
+      log(`update_calendar_event: gateway/API returned ${response.status}`);
+      const setupUrl = extractSetupUrl(bodyText);
+      if (setupUrl) {
+        return err(notConnectedMessage('update the event', setupUrl));
+      }
+      return err(`Google Calendar API returned ${response.status}: ${bodyText.slice(0, 500)}`);
+    }
+
+    let event: EventsPatchResponse;
+    try {
+      event = JSON.parse(bodyText) as EventsPatchResponse;
+    } catch {
+      log('update_calendar_event: 2xx response body was not valid JSON');
+      return err('The event may have been updated, but the response could not be read back.');
+    }
+
+    const lines = [`Event updated: ${event.summary ?? title ?? '(title unchanged)'}`];
+    if (event.start || event.end) {
+      lines.push(`When: ${formatEventTimeRange(event.start, event.end)}`);
+    }
+    if (event.location) lines.push(`Location: ${event.location}`);
+    if (event.description) lines.push(`Description: ${event.description}`);
+    if (event.htmlLink) lines.push(`Link: ${event.htmlLink}`);
+
+    log(`update_calendar_event: updated event ${targetEventId} on ${calendar}'s calendar`);
+    return ok(lines.join('\n'));
+  },
+};
+
+registerTools([createCalendarEvent, listCalendarEvents, updateCalendarEvent]);
