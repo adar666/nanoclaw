@@ -153,7 +153,7 @@ Operational prerequisite (not code, and — post-pivot — not blocking): Devora
 
 ## Deferred
 
-- No idempotency/duplicate-request guard on `create_calendar_event` — a relayed create and a locally-initiated create hitting the same calendar near-simultaneously from two different chat surfaces could in principle double-book. Not fixed now: a build-time overlap-check-before-insert is a reasonable future hardening, but low real-world likelihood at this system's scale (one household, not a booking platform) doesn't justify the added complexity now.
+- No idempotency/duplicate-request guard on `create_calendar_event` — two near-simultaneous create calls from two different chat surfaces (household, dm-with-uriel, dm-with-partner) could in principle double-book the same calendar. Not fixed now: a build-time overlap-check-before-insert is a reasonable future hardening, but low real-world likelihood at this system's scale (one household, not a booking platform) doesn't justify the added complexity now.
 - Exact `fetch()` request/response typing for the three Calendar API calls — implementation detail, not an invariant; the AD-6 `[ASSUMPTION]` covers whether raw fetch stays sufficient.
 - `oven-sh/bun#30381` (HTTPS-over-CONNECT proxy response-body edge case) — verify with one real end-to-end `fetch()` call through the actual OneCLI gateway at implementation time, before trusting the Stack table's AD-6 assumption in production.
 - Guest-email resolution when a named guest's address isn't already known (spec's own Open Question) — build-stage detail, not an architecture-level fork.

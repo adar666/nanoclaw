@@ -1,7 +1,7 @@
 ---
 name: calendar
 description: >-
-  Create, read, and update real events on Uriel's or Devora's Google
+  Create, read, and update real events on Uriel's or Devorah's Google
   Calendar via create_calendar_event, list_calendar_events, and
   update_calendar_event. Use whenever asked to schedule, book, put
   something on the calendar, check what's coming up, answer "when is X",
@@ -11,14 +11,14 @@ description: >-
   second-brain's own, unrelated Google OAuth (never disclose that one).
 metadata:
   author: nanoclaw
-  version: "1.1.0"
+  version: "1.1.1"
 ---
 
 # Calendar
 
-Three tools operate on **Uriel's or Devora's** real Google Calendar. Both
+Three tools operate on **Uriel's or Devorah's** real Google Calendar. Both
 calendars are reachable through the one Google account this system has
-connected — Devora's calendar isn't a separate connection, she shares it
+connected — Devorah's calendar isn't a separate connection, she shares it
 with the connected account (Google Calendar's own sharing feature), so
 every tool reaches it the same way it reaches Uriel's own.
 
@@ -66,7 +66,7 @@ Returns each matching event's real `id`, title, time, and location if set.
 Keep the `id` around if the next step is an update — passing it as
 `eventId` to `update_calendar_event` skips a redundant search. "No events
 found" is a real, plain answer — never paper over it with a guess. A
-request naming both people ("what's on mine and Devora's") is one call per
+request naming both people ("what's on mine and Devorah's") is one call per
 calendar — never a single combined call.
 
 ## update_calendar_event
@@ -96,7 +96,7 @@ just a restatement of the request — relay that, same as `create_calendar_event
 All three tools are reachable from household, dm-with-uriel, or
 dm-with-partner alike — there's no "wrong" chat to ask from, and no need to
 relay/forward a request anywhere. If a request names both people ("check
-mine and Devora's" / "put it on both calendars"), call the tool once per
+mine and Devorah's" / "put it on both calendars"), call the tool once per
 calendar named — never a single combined call, and never silently drop the
 second one.
 
@@ -129,7 +129,7 @@ for any not-connected app:
 
 Then let the user know you'll retry once they've connected.
 
-If a call targeting Devora's calendar specifically fails with an access
+If a call targeting Devorah's calendar specifically fails with an access
 error (not a "not connected" link, but a real permission error), the most
 likely cause is she hasn't shared her calendar with the connected account
 yet — say that plainly rather than implying the whole tool is broken.
