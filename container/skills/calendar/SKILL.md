@@ -7,13 +7,13 @@ description: >-
   schedule, book, put something on the calendar, check what's coming up,
   answer "when is X", reschedule/edit an existing event, or cancel/delete
   one — for either person, not just this agent's own identity. Also covers
-  the OneCLI connect-link flow for a not-yet-connected calendar (delete
-  blocks on its own built-in confirmation — nothing to orchestrate), and
-  the deliberate distinction from second-brain's own, unrelated Google
-  OAuth (never disclose that one).
+  the OneCLI connect-link flow for a not-yet-connected calendar (create and
+  delete each block on their own built-in confirmation — nothing to
+  orchestrate), and the deliberate distinction from second-brain's own,
+  unrelated Google OAuth (never disclose that one).
 metadata:
   author: nanoclaw
-  version: "1.2.1"
+  version: "1.3.1"
 ---
 
 # Calendar
@@ -52,6 +52,15 @@ A successful call returns the real event's details plus its Google-assigned
 `htmlLink`. Always relay that link and the details actually set back to the
 user — never invent or describe a confirmation of your own; the tool's
 response is the only source of truth for what was actually created.
+
+**May block on a "possible duplicate" confirmation first.** Before creating,
+the tool checks whether a non-recurring event with the same title and start
+time already exists on that calendar, created in roughly the last 10
+minutes — a retried or racing request must not silently double-book. If it
+finds one, it blocks (same yes/no-card mechanism as `delete_calendar_event`)
+asking whether to create anyway or skip. This is one call, not a flow you
+orchestrate — just call the tool; it either creates the event, or shows the
+user the possible duplicate and waits for their answer.
 
 ## list_calendar_events
 

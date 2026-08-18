@@ -1,14 +1,23 @@
 import { describe, it, expect, afterEach, mock } from 'bun:test';
 
-import { createCalendarEvent, listCalendarEvents, updateCalendarEvent, deleteCalendarEvent, deleteHooks } from './calendar.js';
+import {
+  createCalendarEvent,
+  listCalendarEvents,
+  updateCalendarEvent,
+  deleteCalendarEvent,
+  deleteHooks,
+  createHooks,
+} from './calendar.js';
 import { TIMEZONE, parseZonedToUtc, formatLocalTime } from '../timezone.js';
 
 const originalFetch = globalThis.fetch;
 const originalConfirmDeletion = deleteHooks.confirmDeletion;
+const originalConfirmCreation = createHooks.confirmCreation;
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
   deleteHooks.confirmDeletion = originalConfirmDeletion;
+  createHooks.confirmCreation = originalConfirmCreation;
 });
 
 /**
@@ -34,6 +43,17 @@ function stubConfirmDeletion(result: { confirmed: boolean } | { error: { content
     return result;
   });
   deleteHooks.confirmDeletion = fn as unknown as typeof deleteHooks.confirmDeletion;
+  return { fn, questions };
+}
+
+/** Mirrors stubConfirmDeletion — stubs create_calendar_event's idempotency-guard confirmation gate. */
+function stubConfirmCreation(result: { confirmed: boolean } | { error: { content: unknown; isError: true } }) {
+  const questions: string[] = [];
+  const fn = mock(async (question: string) => {
+    questions.push(question);
+    return result;
+  });
+  createHooks.confirmCreation = fn as unknown as typeof createHooks.confirmCreation;
   return { fn, questions };
 }
 
@@ -81,6 +101,9 @@ function stubFetchSequence(responses: Array<{ status: number; body: unknown }>) 
   return { fn, calls };
 }
 
+/** A pre-check GET response with no matching events — the common case, used to lead a stubFetchSequence for tests not exercising the duplicate guard itself. */
+const PRECHECK_EMPTY = { status: 200, body: { items: [] } };
+
 describe('create_calendar_event MCP tool', () => {
   it('declares calendar/title/start/end as required', () => {
     expect(createCalendarEvent.tool.name).toBe('create_calendar_event');
@@ -110,12 +133,18 @@ describe('create_calendar_event MCP tool', () => {
     expect(result.content[0].text).toContain('Unknown calendar');
   });
 
-  it('routes calendar: "devorah" to her calendar ID in the request URL', async () => {
-    const { calls } = stubFetch(200, {
-      summary: 'Her event',
-      start: { dateTime: '2026-08-20T12:00:00.000Z', timeZone: TIMEZONE },
-      end: { dateTime: '2026-08-20T13:00:00.000Z', timeZone: TIMEZONE },
-    });
+  it('routes calendar: "devorah" to her calendar ID in both the pre-check GET and the POST URL', async () => {
+    const { calls } = stubFetchSequence([
+      PRECHECK_EMPTY,
+      {
+        status: 200,
+        body: {
+          summary: 'Her event',
+          start: { dateTime: '2026-08-20T12:00:00.000Z', timeZone: TIMEZONE },
+          end: { dateTime: '2026-08-20T13:00:00.000Z', timeZone: TIMEZONE },
+        },
+      },
+    ]);
 
     await createCalendarEvent.handler({
       calendar: 'devorah',
@@ -125,14 +154,21 @@ describe('create_calendar_event MCP tool', () => {
     });
 
     expect(calls[0].url).toContain(encodeURIComponent('adardevora@gmail.com'));
+    expect(calls[1].url).toContain(encodeURIComponent('adardevora@gmail.com'));
   });
 
-  it('routes calendar: "uriel" to /calendars/primary/ in the request URL', async () => {
-    const { calls } = stubFetch(200, {
-      summary: 'His event',
-      start: { dateTime: '2026-08-20T12:00:00.000Z', timeZone: TIMEZONE },
-      end: { dateTime: '2026-08-20T13:00:00.000Z', timeZone: TIMEZONE },
-    });
+  it('routes calendar: "uriel" to /calendars/primary/ in the POST URL', async () => {
+    const { calls } = stubFetchSequence([
+      PRECHECK_EMPTY,
+      {
+        status: 200,
+        body: {
+          summary: 'His event',
+          start: { dateTime: '2026-08-20T12:00:00.000Z', timeZone: TIMEZONE },
+          end: { dateTime: '2026-08-20T13:00:00.000Z', timeZone: TIMEZONE },
+        },
+      },
+    ]);
 
     await createCalendarEvent.handler({
       calendar: 'uriel',
@@ -141,21 +177,28 @@ describe('create_calendar_event MCP tool', () => {
       end: '2026-08-20T16:00:00',
     });
 
-    expect(calls[0].url).toContain('/calendars/primary/events');
+    expect(calls[1].url).toContain('/calendars/primary/events');
+    expect(calls[1].init?.method).toBe('POST');
   });
 
   it('creates an event with full details and confirms with htmlLink', async () => {
     const start = '2026-08-20T15:00:00';
     const end = '2026-08-20T16:00:00';
-    const { fn, calls } = stubFetch(200, {
-      summary: 'Team sync',
-      start: { dateTime: parseZonedToUtc(start, TIMEZONE).toISOString(), timeZone: TIMEZONE },
-      end: { dateTime: parseZonedToUtc(end, TIMEZONE).toISOString(), timeZone: TIMEZONE },
-      location: 'Office',
-      description: 'Weekly sync',
-      attendees: [{ email: 'a@example.com' }, { email: 'b@example.com' }],
-      htmlLink: 'https://calendar.google.com/event?eid=abc123',
-    });
+    const { fn, calls } = stubFetchSequence([
+      PRECHECK_EMPTY,
+      {
+        status: 200,
+        body: {
+          summary: 'Team sync',
+          start: { dateTime: parseZonedToUtc(start, TIMEZONE).toISOString(), timeZone: TIMEZONE },
+          end: { dateTime: parseZonedToUtc(end, TIMEZONE).toISOString(), timeZone: TIMEZONE },
+          location: 'Office',
+          description: 'Weekly sync',
+          attendees: [{ email: 'a@example.com' }, { email: 'b@example.com' }],
+          htmlLink: 'https://calendar.google.com/event?eid=abc123',
+        },
+      },
+    ]);
 
     const result = await createCalendarEvent.handler({ calendar: 'uriel',
       title: 'Team sync',
@@ -167,15 +210,15 @@ describe('create_calendar_event MCP tool', () => {
     });
 
     expect(result.isError).toBeFalsy();
-    expect(fn).toHaveBeenCalledTimes(1);
-    expect(calls[0].url).toBe('https://www.googleapis.com/calendar/v3/calendars/primary/events');
-    expect(calls[0].init?.method).toBe('POST');
-    expect(calls[0].init?.headers).toMatchObject({ 'Content-Type': 'application/json' });
+    expect(fn).toHaveBeenCalledTimes(2); // pre-check GET, then the real POST
+    expect(calls[1].url).toBe('https://www.googleapis.com/calendar/v3/calendars/primary/events');
+    expect(calls[1].init?.method).toBe('POST');
+    expect(calls[1].init?.headers).toMatchObject({ 'Content-Type': 'application/json' });
     // A request timeout bound must be present (Patch 5) — a hung gateway/
     // upstream call must not block the tool call indefinitely.
-    expect(calls[0].init?.signal).toBeInstanceOf(AbortSignal);
+    expect(calls[1].init?.signal).toBeInstanceOf(AbortSignal);
 
-    const sentBody = JSON.parse(calls[0].init!.body as string);
+    const sentBody = JSON.parse(calls[1].init!.body as string);
     expect(sentBody.summary).toBe('Team sync');
     expect(sentBody.description).toBe('Weekly sync');
     expect(sentBody.location).toBe('Office');
@@ -189,12 +232,18 @@ describe('create_calendar_event MCP tool', () => {
   });
 
   it('creates an event with only required fields — no empty-string location/description/attendees sent', async () => {
-    const { fn, calls } = stubFetch(200, {
-      summary: 'Quick call',
-      start: { dateTime: '2026-08-20T12:00:00.000Z', timeZone: TIMEZONE },
-      end: { dateTime: '2026-08-20T13:00:00.000Z', timeZone: TIMEZONE },
-      htmlLink: 'https://calendar.google.com/event?eid=def456',
-    });
+    const { fn, calls } = stubFetchSequence([
+      PRECHECK_EMPTY,
+      {
+        status: 200,
+        body: {
+          summary: 'Quick call',
+          start: { dateTime: '2026-08-20T12:00:00.000Z', timeZone: TIMEZONE },
+          end: { dateTime: '2026-08-20T13:00:00.000Z', timeZone: TIMEZONE },
+          htmlLink: 'https://calendar.google.com/event?eid=def456',
+        },
+      },
+    ]);
 
     const result = await createCalendarEvent.handler({ calendar: 'uriel',
       title: 'Quick call',
@@ -203,9 +252,9 @@ describe('create_calendar_event MCP tool', () => {
     });
 
     expect(result.isError).toBeFalsy();
-    expect(fn).toHaveBeenCalledTimes(1);
+    expect(fn).toHaveBeenCalledTimes(2);
 
-    const sentBody = JSON.parse(calls[0].init!.body as string);
+    const sentBody = JSON.parse(calls[1].init!.body as string);
     expect(sentBody.summary).toBe('Quick call');
     expect(sentBody).not.toHaveProperty('description');
     expect(sentBody).not.toHaveProperty('location');
@@ -215,14 +264,14 @@ describe('create_calendar_event MCP tool', () => {
   it('constructs start/end dateTime + timeZone via parseZonedToUtc(input, TIMEZONE) — never a bare/UTC-only dateTime', async () => {
     const start = '2026-08-20T15:00:00';
     const end = '2026-08-20T16:00:00';
-    const { calls } = stubFetch(200, {
-      summary: 'Tz check',
-      htmlLink: 'https://calendar.google.com/event?eid=tz1',
-    });
+    const { calls } = stubFetchSequence([
+      PRECHECK_EMPTY,
+      { status: 200, body: { summary: 'Tz check', htmlLink: 'https://calendar.google.com/event?eid=tz1' } },
+    ]);
 
     await createCalendarEvent.handler({ calendar: 'uriel', title: 'Tz check', start, end });
 
-    const sentBody = JSON.parse(calls[0].init!.body as string);
+    const sentBody = JSON.parse(calls[1].init!.body as string);
     // Same conversion the tool must reuse unmodified (AD-13 / Design Notes):
     // this asserts the tool actually delegates to parseZonedToUtc(input, TIMEZONE)
     // rather than reimplementing timezone math, and that timeZone always
@@ -240,23 +289,29 @@ describe('create_calendar_event MCP tool', () => {
     // the timeZone field per AD-13 regardless of the input shape.
     const start = '2026-08-20T15:00:00Z';
     const end = '2026-08-20T19:00:00+02:00'; // 17:00 UTC — after start
-    const { calls } = stubFetch(200, { summary: 'Offset check', htmlLink: 'https://calendar.google.com/event?eid=off1' });
+    const { calls } = stubFetchSequence([
+      PRECHECK_EMPTY,
+      { status: 200, body: { summary: 'Offset check', htmlLink: 'https://calendar.google.com/event?eid=off1' } },
+    ]);
 
     const result = await createCalendarEvent.handler({ calendar: 'uriel', title: 'Offset check', start, end });
 
     expect(result.isError).toBeFalsy();
-    const sentBody = JSON.parse(calls[0].init!.body as string);
+    const sentBody = JSON.parse(calls[1].init!.body as string);
     expect(sentBody.start.dateTime).toBe(new Date(start).toISOString());
     expect(sentBody.start.timeZone).toBe(TIMEZONE);
     expect(sentBody.end.dateTime).toBe(new Date(end).toISOString());
     expect(sentBody.end.timeZone).toBe(TIMEZONE);
   });
 
-  it('surfaces the gateway connect_url when the calendar is not connected yet (401)', async () => {
-    stubFetch(401, {
-      error: 'app_not_connected',
-      connect_url: 'https://gateway.local/connect/google-calendar?agent=household',
-    });
+  it('surfaces the gateway connect_url when the calendar is not connected yet (401 on the POST)', async () => {
+    stubFetchSequence([
+      PRECHECK_EMPTY,
+      {
+        status: 401,
+        body: { error: 'app_not_connected', connect_url: 'https://gateway.local/connect/google-calendar?agent=household' },
+      },
+    ]);
 
     const result = await createCalendarEvent.handler({ calendar: 'uriel',
       title: 'Team sync',
@@ -269,11 +324,11 @@ describe('create_calendar_event MCP tool', () => {
     expect(text).toContain('https://gateway.local/connect/google-calendar?agent=household');
   });
 
-  it('surfaces manage_url when present and connect_url is absent (403)', async () => {
-    stubFetch(403, {
-      error: 'agent_lacks_access',
-      manage_url: 'https://gateway.local/manage/google-calendar',
-    });
+  it('surfaces manage_url when present and connect_url is absent (403 on the POST)', async () => {
+    stubFetchSequence([
+      PRECHECK_EMPTY,
+      { status: 403, body: { error: 'agent_lacks_access', manage_url: 'https://gateway.local/manage/google-calendar' } },
+    ]);
 
     const result = await createCalendarEvent.handler({ calendar: 'uriel',
       title: 'Team sync',
@@ -286,13 +341,16 @@ describe('create_calendar_event MCP tool', () => {
     expect(text).toContain('https://gateway.local/manage/google-calendar');
   });
 
-  it('does NOT relabel a 403 with no setup URL as "not connected" — surfaces the real error instead', async () => {
+  it('does NOT relabel a 403 with no setup URL as "not connected" — surfaces the real error instead (POST)', async () => {
     // A genuine Google 403 (insufficient scope, quota, read-only sharing,
     // domain policy, ...) carries no connect_url/secret_url/manage_url.
     // Blanket-treating any 401/403 as "reconnect your calendar" would
     // discard this real cause and mislead the user about an already-working
     // connection.
-    stubFetch(403, { error: { code: 403, message: 'Insufficient permission for this calendar' } });
+    stubFetchSequence([
+      PRECHECK_EMPTY,
+      { status: 403, body: { error: { code: 403, message: 'Insufficient permission for this calendar' } } },
+    ]);
 
     const result = await createCalendarEvent.handler({ calendar: 'uriel',
       title: 'Team sync',
@@ -307,8 +365,8 @@ describe('create_calendar_event MCP tool', () => {
     expect(text).not.toContain("isn't connected yet");
   });
 
-  it('returns an MCP error (not a crash) for a non-2xx response with no setup URL', async () => {
-    stubFetch(400, { error: { code: 400, message: 'Invalid request' } });
+  it('returns an MCP error (not a crash) for a non-2xx response with no setup URL (POST)', async () => {
+    stubFetchSequence([PRECHECK_EMPTY, { status: 400, body: { error: { code: 400, message: 'Invalid request' } } }]);
 
     const result = await createCalendarEvent.handler({ calendar: 'uriel',
       title: 'Bad event',
@@ -439,10 +497,10 @@ describe('create_calendar_event MCP tool', () => {
   });
 
   it('treats guests: [] the same as omitting guests entirely', async () => {
-    const { fn, calls } = stubFetch(200, {
-      summary: 'Quick call',
-      htmlLink: 'https://calendar.google.com/event?eid=empty-guests',
-    });
+    const { fn, calls } = stubFetchSequence([
+      PRECHECK_EMPTY,
+      { status: 200, body: { summary: 'Quick call', htmlLink: 'https://calendar.google.com/event?eid=empty-guests' } },
+    ]);
 
     const result = await createCalendarEvent.handler({ calendar: 'uriel',
       title: 'Quick call',
@@ -452,8 +510,8 @@ describe('create_calendar_event MCP tool', () => {
     });
 
     expect(result.isError).toBeFalsy();
-    expect(fn).toHaveBeenCalledTimes(1);
-    const sentBody = JSON.parse(calls[0].init!.body as string);
+    expect(fn).toHaveBeenCalledTimes(2);
+    const sentBody = JSON.parse(calls[1].init!.body as string);
     expect(sentBody).not.toHaveProperty('attendees');
   });
 
@@ -470,8 +528,13 @@ describe('create_calendar_event MCP tool', () => {
     expect(fn).not.toHaveBeenCalled();
   });
 
-  it('returns an MCP error (not a throw) when fetch itself rejects (network failure)', async () => {
+  it('returns an MCP error (not a throw) when the POST fetch itself rejects (pre-check GET already succeeded)', async () => {
+    let call = 0;
     globalThis.fetch = mock(async () => {
+      call += 1;
+      if (call === 1) {
+        return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
       throw new Error('network unreachable');
     }) as unknown as typeof fetch;
 
@@ -484,12 +547,17 @@ describe('create_calendar_event MCP tool', () => {
     expect(result.isError).toBe(true);
     const text = (result.content[0] as { text: string }).text;
     expect(text).toContain('network unreachable');
+    expect(call).toBe(2);
   });
 
-  it('surfaces a clear timeout message when the request aborts (30s bound)', async () => {
+  it('surfaces a clear timeout message when the POST request aborts (30s bound, pre-check GET already succeeded)', async () => {
+    let call = 0;
     globalThis.fetch = mock(async () => {
-      const e = new DOMException('The operation timed out.', 'TimeoutError');
-      throw e;
+      call += 1;
+      if (call === 1) {
+        return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      throw new DOMException('The operation timed out.', 'TimeoutError');
     }) as unknown as typeof fetch;
 
     const result = await createCalendarEvent.handler({ calendar: 'uriel',
@@ -501,16 +569,41 @@ describe('create_calendar_event MCP tool', () => {
     expect(result.isError).toBe(true);
     const text = (result.content[0] as { text: string }).text;
     expect(text.toLowerCase()).toContain('timed out');
+    expect(call).toBe(2);
+  });
+
+  it('surfaces the pre-check GET\'s own error and never attempts the POST when it fails / not connected', async () => {
+    const { fn } = stubFetch(401, {
+      error: 'app_not_connected',
+      connect_url: 'https://gateway.local/connect/google-calendar',
+    });
+
+    const result = await createCalendarEvent.handler({ calendar: 'uriel',
+      title: 'Team sync',
+      start: '2026-08-20T15:00:00',
+      end: '2026-08-20T16:00:00',
+    });
+
+    expect(result.isError).toBe(true);
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain('https://gateway.local/connect/google-calendar');
+    expect(fn).toHaveBeenCalledTimes(1); // pre-check GET only — no POST ever attempted
   });
 
   it('prefers attendees actually echoed back by Google over what was requested', async () => {
     // Google dropped one of the two requested guests (e.g. invalid/blocked)
     // — the confirmation must reflect that, not just restate the request.
-    stubFetch(200, {
-      summary: 'Team sync',
-      attendees: [{ email: 'a@example.com' }],
-      htmlLink: 'https://calendar.google.com/event?eid=partial-guests',
-    });
+    stubFetchSequence([
+      PRECHECK_EMPTY,
+      {
+        status: 200,
+        body: {
+          summary: 'Team sync',
+          attendees: [{ email: 'a@example.com' }],
+          htmlLink: 'https://calendar.google.com/event?eid=partial-guests',
+        },
+      },
+    ]);
 
     const result = await createCalendarEvent.handler({ calendar: 'uriel',
       title: 'Team sync',
@@ -526,7 +619,7 @@ describe('create_calendar_event MCP tool', () => {
   });
 
   it('produces a sensible confirmation when the 2xx response omits htmlLink', async () => {
-    stubFetch(200, { summary: 'Team sync' });
+    stubFetchSequence([PRECHECK_EMPTY, { status: 200, body: { summary: 'Team sync' } }]);
 
     const result = await createCalendarEvent.handler({ calendar: 'uriel',
       title: 'Team sync',
@@ -539,6 +632,261 @@ describe('create_calendar_event MCP tool', () => {
     expect(text).toContain('Team sync');
     expect(text).not.toContain('undefined');
     expect(text).not.toContain('Link:');
+  });
+
+  describe('idempotency guard (spec cal-2.1)', () => {
+    const start = '2026-08-20T15:00:00';
+    const end = '2026-08-20T16:00:00';
+    const startUtc = parseZonedToUtc(start, TIMEZONE);
+
+    /** A candidate event that matches on instant + title + recency, and isn't part of any recurring series. */
+    function baseDuplicateCandidate(overrides: Record<string, unknown> = {}) {
+      return {
+        id: 'evt-dup',
+        summary: '  Team Sync  ', // case/whitespace variance — must still match case-insensitive-trimmed
+        start: { dateTime: startUtc.toISOString(), timeZone: TIMEZONE },
+        end: { dateTime: new Date(startUtc.getTime() + 3_600_000).toISOString(), timeZone: TIMEZONE },
+        created: new Date(Date.now() - 5 * 60 * 1000).toISOString(), // 5 minutes ago — within the 10-min window
+        ...overrides,
+      };
+    }
+
+    it('proceeds normally when the pre-check GET finds no matching event', async () => {
+      const { fn: confirmFn } = stubConfirmCreation({ confirmed: true });
+      const { fn } = stubFetchSequence([PRECHECK_EMPTY, { status: 200, body: { summary: 'Team sync' } }]);
+
+      const result = await createCalendarEvent.handler({ calendar: 'uriel', title: 'Team sync', start, end });
+
+      expect(result.isError).toBeFalsy();
+      expect(confirmFn).not.toHaveBeenCalled();
+      expect(fn).toHaveBeenCalledTimes(2); // pre-check, then POST — no block
+    });
+
+    it('blocks on a possible-duplicate confirmation and proceeds when the user picks "create anyway"', async () => {
+      const { fn: confirmFn, questions } = stubConfirmCreation({ confirmed: true });
+      const { fn } = stubFetchSequence([
+        { status: 200, body: { items: [baseDuplicateCandidate()] } },
+        { status: 200, body: { summary: 'Team sync', htmlLink: 'https://calendar.google.com/event?eid=dup1' } },
+      ]);
+
+      const result = await createCalendarEvent.handler({ calendar: 'uriel', title: 'Team sync', start, end });
+
+      expect(confirmFn).toHaveBeenCalledTimes(1);
+      expect(questions[0]).toContain('Team Sync');
+      expect(questions[0]).toContain('5 minutes ago'); // real age, not a hardcoded "a few minutes ago"
+      expect(fn).toHaveBeenCalledTimes(2); // pre-check, then the POST still happens
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toContain('https://calendar.google.com/event?eid=dup1');
+    });
+
+    it('blocks on a possible-duplicate confirmation and skips (no POST) when the user declines', async () => {
+      const { fn: confirmFn, questions } = stubConfirmCreation({ confirmed: false });
+      const { fn } = stubFetchSequence([{ status: 200, body: { items: [baseDuplicateCandidate()] } }]);
+
+      const result = await createCalendarEvent.handler({ calendar: 'uriel', title: 'Team sync', start, end });
+
+      expect(confirmFn).toHaveBeenCalledTimes(1);
+      expect(questions[0]).toContain('5 minutes ago');
+      expect(fn).toHaveBeenCalledTimes(1); // pre-check only — no POST
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text.toLowerCase()).toContain('not created');
+      expect(result.content[0].text).toContain('Team sync');
+    });
+
+    it('confirmation gate itself errors (e.g. timeout) after a matching duplicate — surfaced as-is, no POST attempted', async () => {
+      const { fn } = stubFetchSequence([{ status: 200, body: { items: [baseDuplicateCandidate()] } }]);
+      stubConfirmCreation({ error: { content: [{ type: 'text', text: 'Error: Question timed out after 300s' }], isError: true } });
+
+      const result = await createCalendarEvent.handler({ calendar: 'uriel', title: 'Team sync', start, end });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('timed out');
+      expect(fn).toHaveBeenCalledTimes(1); // pre-check only, no POST
+    });
+
+    it('does not match a candidate representing a different real instant, even with the same title — POST proceeds, no confirmation', async () => {
+      const { fn: confirmFn } = stubConfirmCreation({ confirmed: true });
+      const differentInstantCandidate = baseDuplicateCandidate({
+        start: { dateTime: new Date(startUtc.getTime() + 3_600_000).toISOString(), timeZone: 'America/New_York' },
+      });
+      const { fn } = stubFetchSequence([
+        { status: 200, body: { items: [differentInstantCandidate] } },
+        { status: 200, body: { summary: 'Team sync' } },
+      ]);
+
+      const result = await createCalendarEvent.handler({ calendar: 'uriel', title: 'Team sync', start, end });
+
+      expect(confirmFn).not.toHaveBeenCalled();
+      expect(fn).toHaveBeenCalledTimes(2);
+      expect(result.isError).toBeFalsy();
+    });
+
+    it('matches a candidate whose instant is identical but expressed with an explicit offset instead of "Z" — never a raw string compare', async () => {
+      const { fn: confirmFn } = stubConfirmCreation({ confirmed: false });
+      const sameInstantDifferentFormat = baseDuplicateCandidate({
+        start: { dateTime: startUtc.toISOString().replace('Z', '+00:00'), timeZone: TIMEZONE },
+      });
+      const { fn } = stubFetchSequence([{ status: 200, body: { items: [sameInstantDifferentFormat] } }]);
+
+      const result = await createCalendarEvent.handler({ calendar: 'uriel', title: 'Team sync', start, end });
+
+      expect(confirmFn).toHaveBeenCalledTimes(1); // matched despite the differently-formatted (but identical) instant
+      expect(fn).toHaveBeenCalledTimes(1); // skipped — no POST
+      expect(result.content[0].text.toLowerCase()).toContain('not created');
+    });
+
+    it('excludes a recurring series master (recurrence set) from matching — POST proceeds, no confirmation', async () => {
+      const { fn: confirmFn } = stubConfirmCreation({ confirmed: true });
+      const masterCandidate = baseDuplicateCandidate({ recurrence: ['RRULE:FREQ=WEEKLY;COUNT=5'] });
+      const { fn } = stubFetchSequence([
+        { status: 200, body: { items: [masterCandidate] } },
+        { status: 200, body: { summary: 'Team sync' } },
+      ]);
+
+      const result = await createCalendarEvent.handler({ calendar: 'uriel', title: 'Team sync', start, end });
+
+      expect(confirmFn).not.toHaveBeenCalled();
+      expect(fn).toHaveBeenCalledTimes(2);
+      expect(result.isError).toBeFalsy();
+    });
+
+    it('excludes a recurring series instance (recurringEventId set, no recurrence — the realistic singleEvents=true shape) from matching', async () => {
+      const { fn: confirmFn } = stubConfirmCreation({ confirmed: true });
+      const instanceCandidate = baseDuplicateCandidate({ recurringEventId: 'master-evt-1' });
+      const { fn } = stubFetchSequence([
+        { status: 200, body: { items: [instanceCandidate] } },
+        { status: 200, body: { summary: 'Team sync' } },
+      ]);
+
+      const result = await createCalendarEvent.handler({ calendar: 'uriel', title: 'Team sync', start, end });
+
+      expect(confirmFn).not.toHaveBeenCalled();
+      expect(fn).toHaveBeenCalledTimes(2);
+      expect(result.isError).toBeFalsy();
+    });
+
+    it('does not treat a match outside the 10-minute recency window as a duplicate — POST proceeds', async () => {
+      const { fn: confirmFn } = stubConfirmCreation({ confirmed: true });
+      const staleCandidate = baseDuplicateCandidate({ created: new Date(Date.now() - 15 * 60 * 1000).toISOString() });
+      const { fn } = stubFetchSequence([
+        { status: 200, body: { items: [staleCandidate] } },
+        { status: 200, body: { summary: 'Team sync' } },
+      ]);
+
+      const result = await createCalendarEvent.handler({ calendar: 'uriel', title: 'Team sync', start, end });
+
+      expect(confirmFn).not.toHaveBeenCalled();
+      expect(fn).toHaveBeenCalledTimes(2);
+      expect(result.isError).toBeFalsy();
+    });
+
+    it('does not treat a candidate with a future `created` (clock skew) as a duplicate — negative age never matches', async () => {
+      const { fn: confirmFn } = stubConfirmCreation({ confirmed: true });
+      const futureCreatedCandidate = baseDuplicateCandidate({ created: new Date(Date.now() + 5 * 60 * 1000).toISOString() });
+      const { fn } = stubFetchSequence([
+        { status: 200, body: { items: [futureCreatedCandidate] } },
+        { status: 200, body: { summary: 'Team sync' } },
+      ]);
+
+      const result = await createCalendarEvent.handler({ calendar: 'uriel', title: 'Team sync', start, end });
+
+      expect(confirmFn).not.toHaveBeenCalled();
+      expect(fn).toHaveBeenCalledTimes(2);
+      expect(result.isError).toBeFalsy();
+    });
+
+    it('still runs the guard against a truncated pre-check page (best-effort) and proceeds when no match is on that page', async () => {
+      const { fn: confirmFn } = stubConfirmCreation({ confirmed: true });
+      const { fn } = stubFetchSequence([
+        { status: 200, body: { items: [], nextPageToken: 'more-results' } },
+        { status: 200, body: { summary: 'Team sync' } },
+      ]);
+
+      const result = await createCalendarEvent.handler({ calendar: 'uriel', title: 'Team sync', start, end });
+
+      expect(confirmFn).not.toHaveBeenCalled();
+      expect(fn).toHaveBeenCalledTimes(2); // guard ran against the returned page, then proceeded
+      expect(result.isError).toBeFalsy();
+    });
+
+    it('brackets the pre-check GET to the new event\'s own [startUtc, endUtc] window', async () => {
+      stubConfirmCreation({ confirmed: true });
+      const { calls } = stubFetchSequence([PRECHECK_EMPTY, { status: 200, body: { summary: 'Team sync' } }]);
+
+      await createCalendarEvent.handler({ calendar: 'uriel', title: 'Team sync', start, end });
+
+      const url = new URL(calls[0].url);
+      expect(url.searchParams.get('timeMin')).toBe(startUtc.toISOString());
+      expect(url.searchParams.get('timeMax')).toBe(new Date(startUtc.getTime() + 3_600_000).toISOString());
+    });
+
+    it('surfaces the pre-check GET failing at the network layer (throw/timeout) — no POST attempted, not connected wording says "create the event"', async () => {
+      stubConfirmCreation({ confirmed: true });
+      const fn = stubFetchThrows();
+
+      const result = await createCalendarEvent.handler({ calendar: 'uriel', title: 'Team sync', start, end });
+
+      expect(result.isError).toBe(true);
+      expect(fn).toHaveBeenCalledTimes(1); // pre-check only — throws before any POST is attempted
+    });
+
+    it('surfaces a not-connected pre-check error with "create the event" wording, not the generic "list events" phrasing', async () => {
+      stubConfirmCreation({ confirmed: true });
+      const { fn } = stubFetch(401, {
+        error: 'app_not_connected',
+        connect_url: 'https://gateway.local/connect/google-calendar',
+      });
+
+      const result = await createCalendarEvent.handler({ calendar: 'uriel', title: 'Team sync', start, end });
+
+      expect(result.isError).toBe(true);
+      const text = (result.content[0] as { text: string }).text;
+      expect(text).toContain('create the event');
+      expect(text).not.toContain('list events');
+      expect(fn).toHaveBeenCalledTimes(1);
+    });
+
+    it('scans past an earlier non-matching candidate to find the real duplicate later in the list', async () => {
+      const { fn: confirmFn } = stubConfirmCreation({ confirmed: false });
+      const unrelated = baseDuplicateCandidate({ id: 'evt-unrelated', summary: 'Totally different meeting' });
+      const { fn } = stubFetchSequence([{ status: 200, body: { items: [unrelated, baseDuplicateCandidate()] } }]);
+
+      const result = await createCalendarEvent.handler({ calendar: 'uriel', title: 'Team sync', start, end });
+
+      expect(confirmFn).toHaveBeenCalledTimes(1);
+      expect(fn).toHaveBeenCalledTimes(1); // matched on the second candidate — no POST
+      expect(result.content[0].text.toLowerCase()).toContain('not created');
+    });
+
+    it('never matches a candidate with no summary at all', async () => {
+      const { fn: confirmFn } = stubConfirmCreation({ confirmed: true });
+      const noSummary = baseDuplicateCandidate({ summary: undefined });
+      const { fn } = stubFetchSequence([
+        { status: 200, body: { items: [noSummary] } },
+        { status: 200, body: { summary: 'Team sync' } },
+      ]);
+
+      const result = await createCalendarEvent.handler({ calendar: 'uriel', title: 'Team sync', start, end });
+
+      expect(confirmFn).not.toHaveBeenCalled();
+      expect(fn).toHaveBeenCalledTimes(2);
+      expect(result.isError).toBeFalsy();
+    });
+
+    it('never matches a candidate with an unparseable `created` timestamp (NaN age must not bypass the recency bounds)', async () => {
+      const { fn: confirmFn } = stubConfirmCreation({ confirmed: true });
+      const badCreated = baseDuplicateCandidate({ created: 'not-a-real-timestamp' });
+      const { fn } = stubFetchSequence([
+        { status: 200, body: { items: [badCreated] } },
+        { status: 200, body: { summary: 'Team sync' } },
+      ]);
+
+      const result = await createCalendarEvent.handler({ calendar: 'uriel', title: 'Team sync', start, end });
+
+      expect(confirmFn).not.toHaveBeenCalled();
+      expect(fn).toHaveBeenCalledTimes(2);
+      expect(result.isError).toBeFalsy();
+    });
   });
 });
 

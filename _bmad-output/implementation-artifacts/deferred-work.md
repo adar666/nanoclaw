@@ -1,5 +1,24 @@
 > **Superseded (epic-1 retro action item AI-5):** these items were merged into `_bmad-output/planning-artifacts/architecture/architecture-nanoclaw-v2-2026-08-16/ARCHITECTURE-SPINE.md`'s own Deferred section, which is the single source of truth going forward. Kept here only for the append-only history this file's format assumes.
 
+- source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-1-idempotency-guard-on-event-creation.md`
+  summary: A zero-duration existing duplicate (start === end === the new event's own start) lands exactly on the pre-check's exclusive `timeMin` bound and would be excluded from the returned page, missing the guard entirely.
+  evidence: Blind-hunter review loop-1 finding; genuinely rare (a real zero-duration Google Calendar event is unusual) and a real fix (padding the window) would slightly change matching semantics, not purely mechanical — worth a deliberate look, not a blind patch.
+- source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-1-idempotency-guard-on-event-creation.md`
+  summary: The idempotency-guard's title match trims leading/trailing whitespace but doesn't collapse internal whitespace ("Team  Sync" vs "Team Sync" won't match).
+  evidence: Blind-hunter review finding; correctly implements the spec's stated "trimmed" rule, but a realistic copy/paste or agent-generated artifact could silently miss the guard.
+- source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-1-idempotency-guard-on-event-creation.md`
+  summary: The duplicate-confirmation card shows only the existing candidate's details, never the new event's own location/description/guests/times, so a user can't compare what they're creating against what's flagged as a likely duplicate.
+  evidence: Blind-hunter review finding; real UX gap, not required by any AC.
+- source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-1-idempotency-guard-on-event-creation.md`
+  summary: Every create_calendar_event call now issues two network round trips (pre-check GET + POST) instead of one, doubling latency/quota for the common no-duplicate case; not surfaced in the tool's user-facing description or flagged for a future opt-out.
+  evidence: Blind-hunter review finding; acceptable at this system's scale (one household), worth revisiting if quota/latency ever becomes a real complaint.
+- source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-1-idempotency-guard-on-event-creation.md`
+  summary: update_calendar_event has no analogous duplicate/collision guard — moving an existing event's start/end to collide with another event bypasses idempotency protection entirely, with no in-code comment pointing this out.
+  evidence: Blind-hunter review finding; out of this story's scope (create-only), not covered by any epic-2 story yet.
+- source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-1-idempotency-guard-on-event-creation.md`
+  summary: defaultConfirmCreation (and the pre-existing defaultConfirmDeletion it mirrors) has no try/catch around askUserQuestion.handler — a thrown rejection (vs. a returned isError) would propagate unhandled instead of surfacing as a clean MCP error.
+  evidence: Edge-case-hunter review finding; pre-existing pattern inherited unchanged from defaultConfirmDeletion, not introduced by this story.
+
 - source_spec: `_bmad-output/implementation-artifacts/spec-1-1-save-a-word-pdf-document-to-memory.md`
   summary: No size limits / decompression-bomb protection on docx unzip or PDF read (whole-file reads, only a 64MB unzip output cap).
   evidence: Blind-hunter review finding; robustness hardening, not blocking for a trusted single-operator use case.

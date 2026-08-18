@@ -206,6 +206,46 @@ export const createCalendarEvent: McpToolDefinition = {
       eventBody.attendees = guestEmails.map((email) => ({ email }));
     }
 
+    // Idempotency guard (spec cal-2.1): a retried/racing call must not
+    // silently double-book. Reuses fetchEvents — same AD-8 gateway-error
+    // handling + 30s timeout as the POST below — bracketed tightly around
+    // this event's own [startUtc, endUtc] window (Design Notes: local JS
+    // match logic, never Google's own unreliable `q` search). Best-effort
+    // only: two genuinely-simultaneous calls can both pass this check
+    // before either POST lands.
+    const precheck = await fetchEvents(calendarId, {
+      timeMinIso: startUtc.toISOString(),
+      timeMaxIso: endUtc.toISOString(),
+      notConnectedAction: 'create the event',
+    });
+    if ('error' in precheck) return precheck.error;
+
+    if (precheck.truncated) {
+      // Best-effort: a duplicate past the returned page's cutoff can be
+      // missed. Logged for diagnosability, not surfaced to the user — the
+      // guard still runs against whatever page was returned.
+      log(
+        `create_calendar_event: pre-check GET truncated (nextPageToken present) for "${title}" on ${calendar}'s calendar — duplicate guard is best-effort`,
+      );
+    }
+
+    const duplicate = findDuplicateCandidate(precheck.events, title, startUtc, new Date());
+    if (duplicate) {
+      const ageDesc = formatAgeDesc(duplicate.ageMs);
+      const confirmResult = await createHooks.confirmCreation(
+        `This looks like it might already be on ${calendar}'s calendar — created ${ageDesc}:\n` +
+          `${formatConfirmationSummary(duplicate.event)}\n\nCreate "${title}" anyway?`,
+      );
+      if ('error' in confirmResult) return confirmResult.error;
+      if (!confirmResult.confirmed) {
+        log(`create_calendar_event: possible duplicate of "${title}" on ${calendar}'s calendar — user skipped`);
+        return ok(
+          `Not created — "${title}" looks like a duplicate of an event already on ${calendar}'s calendar (created ${ageDesc}).`,
+        );
+      }
+      log(`create_calendar_event: possible duplicate of "${title}" on ${calendar}'s calendar — user confirmed create anyway`);
+    }
+
     let response: Response;
     try {
       response = await fetch(eventsUrl(calendarId), {
@@ -289,6 +329,21 @@ interface CalendarEventItem {
   end?: EventTimePoint;
   location?: string;
   description?: string;
+  created?: string;
+  /**
+   * Present only on a *master* recurring event, absent on an expanded
+   * instance. `fetchEvents` sets `singleEvents=true`, so this call path
+   * only ever returns instances — this field alone is a no-op as a
+   * recurring-series exclusion here; see `recurringEventId` below, and
+   * `findDuplicateCandidate`'s guard checks both.
+   */
+  recurrence?: string[];
+  /**
+   * Present on every expanded recurring *instance* (absent on a master).
+   * The realistic field to check given `singleEvents=true` — see the note
+   * on `recurrence` above (spec cal-2.1 review loop 1 correction).
+   */
+  recurringEventId?: string;
 }
 
 interface EventsListApiResponse {
@@ -401,7 +456,7 @@ function formatRangeDesc(timeMin: Date, timeMax: Date): string {
  */
 async function fetchEvents(
   calendarId: string,
-  params: { timeMinIso: string; timeMaxIso: string; q?: string },
+  params: { timeMinIso: string; timeMaxIso: string; q?: string; notConnectedAction?: string },
 ): Promise<{ events: CalendarEventItem[]; truncated: boolean } | { error: CallToolResult }> {
   const url = new URL(eventsUrl(calendarId));
   url.searchParams.set('timeMin', params.timeMinIso);
@@ -430,7 +485,7 @@ async function fetchEvents(
   if (!response.ok) {
     log(`calendar events list: gateway/API returned ${response.status}`);
     const setupUrl = extractSetupUrl(bodyText);
-    if (setupUrl) return { error: err(notConnectedMessage('list events', setupUrl)) };
+    if (setupUrl) return { error: err(notConnectedMessage(params.notConnectedAction ?? 'list events', setupUrl)) };
     return { error: err(`Google Calendar API returned ${response.status}: ${bodyText.slice(0, 500)}`) };
   }
 
@@ -443,6 +498,54 @@ async function fetchEvents(
   }
 
   return { events: parsed.items ?? [], truncated: Boolean(parsed.nextPageToken) };
+}
+
+/** create_calendar_event's idempotency guard (spec cal-2.1): a candidate must have been created within this window to count as a possible duplicate. */
+const DUPLICATE_RECENCY_WINDOW_MS = 10 * 60 * 1000;
+
+/**
+ * Find a pre-check candidate that looks like the same event `create_calendar_event`
+ * is about to create. A match requires: `start.dateTime` resolving to the same
+ * real instant as the new event's own `startUtc` (dateTime always carries its
+ * own offset/Z per the Calendar API, so a plain `Date` comparison is already
+ * timezone-normalized — never a raw string compare, and never fooled by a
+ * candidate sharing the same local numerals but a different `timeZone`) +
+ * case-insensitive-trimmed title match + not part of any recurring series
+ * (excludes both a master, which carries `recurrence`, and an expanded
+ * instance, which carries `recurringEventId` instead — `fetchEvents` sets
+ * `singleEvents=true`, so only instances are ever returned here, but both
+ * are excluded for correctness) + `created` within the last 10 minutes,
+ * with a clock-skew-safe lower bound (a `created` timestamp in the future
+ * yields a negative age, which never matches). A candidate with no `created`
+ * field can't have its recency verified and is never treated as a match.
+ */
+function findDuplicateCandidate(
+  events: CalendarEventItem[],
+  title: string,
+  startUtc: Date,
+  now: Date,
+): { event: CalendarEventItem; ageMs: number } | undefined {
+  const normalizedTitle = title.trim().toLowerCase();
+  for (const ev of events) {
+    if (ev.recurrence || ev.recurringEventId) continue; // part of a recurring series — never a match
+    if (!ev.start?.dateTime) continue; // all-day or malformed — no instant to compare
+    if (new Date(ev.start.dateTime).getTime() !== startUtc.getTime()) continue;
+    if ((ev.summary ?? '').trim().toLowerCase() !== normalizedTitle) continue;
+    if (!ev.created) continue; // can't verify recency — not treated as a match
+    const ageMs = now.getTime() - new Date(ev.created).getTime();
+    // Number.isNaN guards an unparseable `created` string: NaN fails both the
+    // `< 0` and `> window` comparisons, which would otherwise silently pass
+    // the check instead of correctly excluding an unverifiable candidate.
+    if (Number.isNaN(ageMs) || ageMs < 0 || ageMs > DUPLICATE_RECENCY_WINDOW_MS) continue;
+    return { event: ev, ageMs };
+  }
+  return undefined;
+}
+
+/** "created N minute(s) ago" for the confirmation text — states the candidate's actual age, never a hardcoded guess. */
+function formatAgeDesc(ageMs: number): string {
+  const minutes = Math.floor(ageMs / 60_000);
+  return minutes < 1 ? 'less than a minute ago' : `${minutes} minute${minutes === 1 ? '' : 's'} ago`;
 }
 
 /**
@@ -815,7 +918,7 @@ function formatEventTimeRange24h(start?: EventTimePoint, end?: EventTimePoint): 
  * above — the id showed up verbatim in a real confirmation card).
  */
 function formatConfirmationSummary(ev: CalendarEventItem): string {
-  const title = ev.summary ?? '(no title)';
+  const title = ev.summary?.trim() || '(no title)';
   let line = `${title} — ${formatEventTimeRange24h(ev.start, ev.end)}`;
   if (ev.location) line += ` @ ${ev.location}`;
   return line;
@@ -868,6 +971,35 @@ async function fetchSingleEvent(
   }
   return { event };
 }
+
+const CONFIRM_CREATE_LABEL = 'Create anyway';
+const SKIP_CREATE_LABEL = 'Skip, likely already exists';
+
+/**
+ * Mirrors defaultConfirmDeletion below exactly (same in-process
+ * askUserQuestion.handler call, same testability seam) — create_calendar_event's
+ * idempotency guard (spec cal-2.1) blocks on a real yes/no card the same way
+ * delete's confirmation does, never a `confirm: boolean` argument the agent
+ * could self-authorize past.
+ */
+async function defaultConfirmCreation(question: string): Promise<{ confirmed: boolean } | { error: CallToolResult }> {
+  const result = await askUserQuestion.handler({
+    title: 'Possible duplicate event',
+    question,
+    options: [CONFIRM_CREATE_LABEL, SKIP_CREATE_LABEL],
+  });
+  if (result.isError) return { error: result };
+  const answer = (result.content[0] as { text?: string } | undefined)?.text;
+  return { confirmed: answer === CONFIRM_CREATE_LABEL };
+}
+
+/**
+ * Exported so tests can substitute the confirmation gate — same rationale
+ * and pattern as deleteHooks below. Production code never overrides this.
+ */
+export const createHooks = {
+  confirmCreation: defaultConfirmCreation,
+};
 
 const CONFIRM_DELETE_LABEL = 'Yes, delete it';
 const CANCEL_DELETE_LABEL = 'No, cancel';
