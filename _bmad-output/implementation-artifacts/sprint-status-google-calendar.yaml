@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 08-17-2026
-last_updated: 08-18-2026 22:06
+last_updated: 08-18-2026 22:42
 project: nanoclaw-v2
 project_key: NOKEY
 tracking_system: file-system
@@ -47,7 +47,7 @@ development_status:
   2-2-recurring-events: done
   2-3-calendars-beyond-uriel-s-and-devorah-s: done
   2-4-automatic-guest-list-validation-against-household-memory: done
-  epic-2-retrospective: optional
+  epic-2-retrospective: done
 action_items:
   - id: "epic-1-retro-item-1-reword-architecture-spine-md-deferred-se"
     epic: 1
@@ -71,3 +71,28 @@ action_items:
     owner: "dev"
     status: done
     ref: "_bmad-output/implementation-artifacts/epic-1-retro-2026-08-18.md"
+  - id: "epic-2-retro-item-4-decide-explicitly-whether-update_calenda"
+    epic: 2
+    action: "Decide explicitly whether update_calendar_event/delete_calendar_event
+      should refuse a recurring-instance eventId (or warn, or remain silent by design)
+      -- the confirmation the architecture spine asked for before Story 2.2 shipped,
+      never actually resolved"
+    owner: "spec-owner"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-2-retro-2026-08-18.md"
+  - id: "epic-2-retro-item-5-when-a-spec-deferred-boundaries-section"
+    epic: 2
+    action: "When a spec Deferred/Boundaries section says confirm X before shipping
+      Y, make that confirmation a checklist item in whichever later story ships Y,
+      not something left to be remembered"
+    owner: "spec-owner"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-2-retro-2026-08-18.md"
+  - id: "epic-2-retro-item-6-live-verify-epic-2s-four-behaviors-idemp"
+    epic: 2
+    action: "Live-verify epic-2s four behaviors (idempotency guard, recurrence, calendar
+      registry, guest resolution) against the real Google Calendar API at least once
+      each, matching epic-1s live-verification rigor -- currently mocked-fetch-only"
+    owner: "dev"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-2-retro-2026-08-18.md"
