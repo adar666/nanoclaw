@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 08-16-2026 12:00
-last_updated: 08-17-2026
+last_updated: 08-18-2026 15:39
 project: nanoclaw-v2
 project_key: NOKEY
 tracking_system: file-system
@@ -45,6 +45,13 @@ development_status:
   1-7-stamp-a-saved-signature-into-a-saved-pdf: done
   1-8-stamp-a-saved-signature-into-a-saved-docx: done
   epic-1-retrospective: done
+
+  epic-2: backlog
+  2-1-ocr-fallback-for-scanned-pdfs: backlog
+  2-2-multi-file-batch-fill-operations: backlog
+  2-3-version-history-undo-for-edited-documents: backlog
+  2-4-auto-refresh-stored-raw-extracted-text-after-an-edit: backlog
+  epic-2-retrospective: optional
 action_items:
   - id: "epic-1-retro-item-1-add-log-calls-to-list_documents-fill_doc"
     epic: 1

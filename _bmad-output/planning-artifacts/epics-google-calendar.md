@@ -69,8 +69,11 @@ N/A — no UX design contract exists and none is needed. This feature has no UI 
 ## Epic List
 
 ### Epic 1: Google Calendar Read/Write
-Users can ask the agent to create, read, and update events on either of two Google Calendars (Uriel's, Devorah's) from any of three chat surfaces (household, dm-with-uriel, dm-with-partner) — both reachable through one connected Google account, Devorah's via her own calendar-sharing grant.
+Users can ask the agent to create, read, and update events on either of two Google Calendars (Uriel's, Devorah's) from any of three chat surfaces (household, dm-with-uriel, dm-with-partner) — both reachable through one connected Google account, Devorah's via her own calendar-sharing grant. Also covers Story 1.7 (delete), built later as a bounded change, not a new FR.
 **FRs covered:** FR1, FR2, FR3
+
+### Epic 2: Calendar Hardening & Extensions — backlog
+Story stubs only (idempotency guard, recurring events, calendars beyond Uriel's/Devorah's, automatic guest validation) — no FRs assigned yet, not spec'd. See the epic's own section below.
 
 ### FR Coverage Map
 
@@ -180,3 +183,55 @@ So that I can fix a mistake or reschedule without recreating the event.
 Originally: the hardest orchestration case in the epic — relay an update request, disambiguate cross-person, relay the pick back. Superseded for the same reason as Story 1.4: no relay needed. Folded into Story 1.5.
 
 </details>
+
+### Story 1.7: Delete an Event on Uriel's or Devorah's Calendar
+
+**Status: done, 2026-08-18** — built as a bounded change outside the original story sequence (added retroactively here for a complete epic record; see this file's own Deferred-list note above and `ARCHITECTURE-SPINE.md`'s Deferred section for the full history, including two same-day live-incident fixes). `delete_calendar_event`: targets by `eventId` or `eventQuery` (same disambiguation as Story 1.5), blocks on a real, tool-internal confirmation (`ask_user_question`, called directly by the handler) before ever issuing the `DELETE` — no `confirm` argument for the agent to set itself. The confirmation card shows a human-facing summary (title, 24h time, location; no raw event id) built separately from the agent-facing result text. See `container/agent-runner/src/mcp-tools/calendar.ts`.
+
+## Epic 2: Calendar Hardening & Extensions
+
+**Status: backlog** — story stubs only, sourced from this epic's own Deferred list (above) and `SPEC-google-calendar/SPEC.md`'s Non-goals. Not yet spec'd or estimated; pick one and run `bmad-spec` (or hand it to `bmad-build` for a lighter touch) in a fresh session before implementing. None of these block anything already shipped in Epic 1.
+
+### Story 2.1: Idempotency Guard on Event Creation
+
+As a NanoClaw user,
+I want a duplicate or retried `create_calendar_event` call to never double-book the same event,
+So that a retried request (network hiccup, agent retry, two chat surfaces racing) can't silently create two copies of the same meeting.
+
+**Acceptance Criteria (stub — not yet elaborated):**
+- Given a create request that closely matches one already created moments ago on the same calendar, when `create_calendar_event` runs, then it declines, dedupes, or asks — rather than silently creating a second event.
+
+Source: `ARCHITECTURE-SPINE.md`'s Deferred section ("No idempotency/`iCalUID` dedup key on `create_calendar_event`").
+
+### Story 2.2: Recurring Events
+
+As a NanoClaw user,
+I want to create a recurring event ("every Thursday at 3pm"),
+So that I don't have to ask the agent to create the same event by hand every week.
+
+**Acceptance Criteria (stub):**
+- Given a request naming a recurrence pattern, when the create tool runs, then a real recurring Google Calendar event is created with a correct `RRULE`, confirmed back with the pattern actually set.
+
+Source: `SPEC-google-calendar/SPEC.md`'s Non-goals ("Recurring-event creation... single-occurrence events only for v1").
+
+### Story 2.3: Calendars Beyond Uriel's and Devorah's
+
+As a NanoClaw user,
+I want to reach a third calendar (e.g. a shared family calendar) from the same tools,
+So that the agent isn't hard-limited to exactly two named people.
+
+**Acceptance Criteria (stub):**
+- Given a request naming a calendar outside `{uriel, devorah}`, when any of the four calendar tools runs, then that calendar is reachable the same way, without a code change per newly-added calendar (a config/mapping change is fine).
+
+Source: `SPEC-google-calendar/SPEC.md`'s Non-goals ("Calendars other than Uriel's and Devorah's").
+
+### Story 2.4: Automatic Guest-List Validation Against Household Memory
+
+As a NanoClaw user,
+I want an unresolved guest named by first name only to be checked against household memory automatically,
+So that I don't have to spell out an email address the agent could already know.
+
+**Acceptance Criteria (stub):**
+- Given a create/update request naming a guest by first name only (not an email), when the tool resolves `guests`, then it looks up `groups/household/memory/household/people.md` automatically, rather than only when the agent already happens to have it in context.
+
+Source: `ARCHITECTURE-SPINE.md`'s Open Questions ("Whether `create_calendar_event`/`update_calendar_event` should validate a resolved guest list against `groups/household/memory/household/people.md` automatically...").

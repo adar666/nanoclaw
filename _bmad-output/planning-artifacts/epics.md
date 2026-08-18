@@ -81,6 +81,9 @@ N/A — no UX design contract exists and none is needed. This feature has no UI 
 Users can send a Word or PDF file, have the agent remember it (file + extracted content, recallable later), and ask the agent to fill a named row/field/line with a value and get back an updated document — all through one new MCP-tool surface sharing one library stack and one storage shape.
 **FRs covered:** FR1, FR2, FR3, FR4, FR5, FR6
 
+### Epic 2: Document Memory Hardening & Extensions — backlog
+Story stubs only (OCR fallback, batch fill, version history/undo, auto-refresh on edit) — no FRs assigned yet, not spec'd. See the epic's own section below.
+
 ### FR Coverage Map
 
 FR1: Epic 1 - Save a Word/PDF attachment to agent memory (file + extracted content + index summary)
@@ -338,3 +341,51 @@ So that I get back a signed document the same way I already can for a PDF.
 **Given** the produced `.docx` after a signature stamp
 **When** it's inspected (`word/document.xml`, `word/media/`, `word/_rels/document.xml.rels`, `[Content_Types].xml`)
 **Then** it opens as a well-formed, valid `.docx` — the new relationship and content-type entries are present and correctly reference the new media part, and any pre-existing image relationships/media parts in the source document are untouched
+
+## Epic 2: Document Memory Hardening & Extensions
+
+**Status: backlog** — story stubs only, sourced from `deferred-work.md` / `ARCHITECTURE-SPINE.md`'s Deferred section (epic-1 retro action item AI-5 merged these into one canonical list). Not yet spec'd or estimated; pick one and run `bmad-spec` (or hand it to `bmad-build` for a lighter touch) in a fresh session before implementing. None of these block anything already shipped in Epic 1.
+
+### Story 2.1: OCR Fallback for Scanned PDFs
+
+As a NanoClaw user,
+I want a scanned (image-only) PDF page read via OCR when the current page-1-only, agent-vision-based reading isn't enough,
+So that `save_document`/`fill_document_field` work on scanned documents too, not just ones with a real text layer.
+
+**Acceptance Criteria (stub — not yet elaborated):**
+- Given a scanned PDF with no extractable text layer, when `save_document` runs, then real OCR'd text is captured and recallable — not just a rendered-page image with no searchable content.
+
+Source: `deferred-work.md` / epic-1 retrospective ("Full multi-page scanned-PDF support... genuine multi-page support is a larger feature").
+
+### Story 2.2: Multi-File / Batch Fill Operations
+
+As a NanoClaw user,
+I want to fill the same field across several saved documents in one request,
+So that I don't have to repeat a `fill_document_field` call once per file when the same value applies to many.
+
+**Acceptance Criteria (stub):**
+- Given a fill request naming multiple saved documents (or "all documents matching X"), when the tool runs, then each is filled and returned, with a clear per-file success/failure report — never a silent partial batch.
+
+Source: `epics-google-calendar.md`'s sibling epic uses the same "de-risk hardest capability first" precedent this deferred item cites; original mention in `spec-document-memory`'s own Open Questions.
+
+### Story 2.3: Version History / Undo for Edited Documents
+
+As a NanoClaw user,
+I want to see or revert a document's prior fill/edit,
+So that a wrong fill doesn't require redoing the whole document by hand from the original.
+
+**Acceptance Criteria (stub):**
+- Given a document that's been filled/edited more than once, when the user asks to undo the last change (or see prior versions), then a real prior version is recoverable — not just the current state.
+
+Source: `SPEC.md`'s original Open Questions (no version history was ever in scope for Epic 1).
+
+### Story 2.4: Auto-Refresh Stored Raw/Extracted Text After an Edit
+
+As a NanoClaw user,
+I want a re-save after editing to refresh what's remembered about a document,
+So that a later recall reflects the edited version, not the original one saved before the fill.
+
+**Acceptance Criteria (stub):**
+- Given a document that's been filled via `fill_document_field`, when the user later asks `list_documents`/recall about it, then the answer reflects the filled version — currently a re-save is a separate, unspecified action, and recall silently still describes the original.
+
+Source: `epics.md`'s own Story 1.2/1.3 deferred note ("whether an edit refreshes the stored raw copy and/or stored extracted text (default: neither) — a re-save is a separate, unspecified action").
