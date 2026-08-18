@@ -7,6 +7,7 @@ import {
   deleteCalendarEvent,
   deleteHooks,
   createHooks,
+  calendarConfigHooks,
 } from './calendar.js';
 import { TIMEZONE, parseZonedToUtc, formatLocalTime } from '../timezone.js';
 
@@ -14,10 +15,29 @@ const originalFetch = globalThis.fetch;
 const originalConfirmDeletion = deleteHooks.confirmDeletion;
 const originalConfirmCreation = createHooks.confirmCreation;
 
+/**
+ * Suite-wide default calendar registry: empty, matching a fresh migration
+ * (spec cal-2.3 I/O Matrix row 1) — every pre-existing test in this file
+ * exercises only the built-in "uriel"/"devorah" names and must keep passing
+ * unmodified. Deliberately NOT the real `calendarConfigHooks.getCalendarRegistry`
+ * (which calls `getConfig()` — this test file never calls `loadConfig()`, so
+ * the real implementation would throw "Config not loaded" on every call).
+ * Tests that care about the registry stub this per-test via
+ * `stubCalendarRegistry` and afterEach resets back to this default.
+ */
+const DEFAULT_CALENDAR_REGISTRY: Array<{ name: string; calendarId: string }> = [];
+calendarConfigHooks.getCalendarRegistry = () => DEFAULT_CALENDAR_REGISTRY;
+
+/** Stub the calendar-registry source for one test — mirrors stubConfirmDeletion/stubConfirmCreation. */
+function stubCalendarRegistry(registry: Array<{ name: string; calendarId: string }>) {
+  calendarConfigHooks.getCalendarRegistry = () => registry;
+}
+
 afterEach(() => {
   globalThis.fetch = originalFetch;
   deleteHooks.confirmDeletion = originalConfirmDeletion;
   createHooks.confirmCreation = originalConfirmCreation;
+  calendarConfigHooks.getCalendarRegistry = () => DEFAULT_CALENDAR_REGISTRY;
 });
 
 /**
@@ -2047,5 +2067,115 @@ describe('delete_calendar_event MCP tool', () => {
 
     expect(result.isError).toBe(true);
     expect((result.content[0] as { text: string }).text.toLowerCase()).toContain('timed out');
+  });
+});
+
+// spec cal-2.3: config-driven calendar registry — resolveCalendarIds() merges
+// the built-in CALENDAR_IDS with calendarConfigHooks.getCalendarRegistry(),
+// config entries winning on a name collision. Uses list_calendar_events as
+// the representative tool (single fetch, no confirmation gate) since all
+// four tools share the exact same resolution triplet.
+describe('calendar registry resolution (spec cal-2.3)', () => {
+  // I/O Matrix row 5 ("remove-calendar on a name that was never added") is
+  // CLI-level behavior with no calendar.ts involvement — covered in
+  // src/cli/resources/groups.test.ts's 'groups config add-calendar /
+  // remove-calendar' block instead, not duplicated here.
+  it('I/O Matrix row 1: empty registry (fresh migration) — built-in "uriel"/"devorah" resolve exactly as before this story', async () => {
+    stubCalendarRegistry([]);
+    const { calls: urielCalls } = stubFetch(200, { items: [] });
+    await listCalendarEvents.handler({ calendar: 'uriel' });
+    expect(urielCalls[0].url).toContain('/calendars/primary/events');
+
+    const { calls: devorahCalls } = stubFetch(200, { items: [] });
+    await listCalendarEvents.handler({ calendar: 'devorah' });
+    expect(devorahCalls[0].url).toContain(encodeURIComponent('adardevora@gmail.com'));
+  });
+
+  it('I/O Matrix row 2: a config-added third calendar resolves and works the same as a built-in name', async () => {
+    stubCalendarRegistry([{ name: 'family', calendarId: 'family-cal@group.calendar.google.com' }]);
+    const { calls } = stubFetch(200, { items: [] });
+
+    const result = await listCalendarEvents.handler({ calendar: 'family' });
+
+    expect(result.isError).toBeFalsy();
+    expect(calls[0].url).toContain(encodeURIComponent('family-cal@group.calendar.google.com'));
+  });
+
+  it('I/O Matrix row 3: a registry entry reusing a built-in name ("uriel") overrides the built-in — config wins', async () => {
+    stubCalendarRegistry([{ name: 'uriel', calendarId: 'override@group.calendar.google.com' }]);
+    const { calls } = stubFetch(200, { items: [] });
+
+    const result = await listCalendarEvents.handler({ calendar: 'uriel' });
+
+    expect(result.isError).toBeFalsy();
+    expect(calls[0].url).toContain(encodeURIComponent('override@group.calendar.google.com'));
+    expect(calls[0].url).not.toContain('/calendars/primary/');
+  });
+
+  it('I/O Matrix row 4: an unresolvable calendar name declines, listing every currently-resolvable name (built-ins + registry)', async () => {
+    stubCalendarRegistry([{ name: 'family', calendarId: 'family-cal@group.calendar.google.com' }]);
+    const fn = stubFetchThrows();
+
+    const result = await listCalendarEvents.handler({ calendar: 'not-added-yet' });
+
+    expect(result.isError).toBe(true);
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain('Unknown calendar');
+    expect(text).toContain('uriel');
+    expect(text).toContain('devorah');
+    expect(text).toContain('family');
+    expect(fn).not.toHaveBeenCalled();
+  });
+
+  it('I/O Matrix row 6: a registry entry not yet reflected in the loaded config (stale container.json) declines exactly like a genuinely-unknown name', async () => {
+    // Simulates a registry entry that exists in the DB but hasn't been
+    // materialized into this container's container.json yet — from
+    // resolveCalendarIds()'s perspective this is indistinguishable from a
+    // name that was never added at all (restart is required, same as every
+    // other config change).
+    stubCalendarRegistry([]); // pre-restart snapshot — "family" not present yet
+    const fn = stubFetchThrows();
+
+    const result = await listCalendarEvents.handler({ calendar: 'family' });
+
+    expect(result.isError).toBe(true);
+    const text = (result.content[0] as { text: string }).text;
+    // The requested (unresolved) name is echoed once in the "Unknown calendar
+    // "family"" preamble — the assertion below is about the RESOLVABLE-set
+    // listing that follows "must be one of:", which must not include it.
+    expect(text).toContain('Unknown calendar "family"');
+    const resolvableSet = text.split('must be one of:')[1] ?? '';
+    expect(resolvableSet).toContain('uriel');
+    expect(resolvableSet).toContain('devorah');
+    expect(resolvableSet).not.toContain('family');
+    expect(fn).not.toHaveBeenCalled();
+  });
+
+  it('every one of the four tools resolves a config-added calendar name, not just list_calendar_events', async () => {
+    stubCalendarRegistry([{ name: 'family', calendarId: 'family-cal@group.calendar.google.com' }]);
+
+    // create_calendar_event
+    stubFetchSequence([PRECHECK_EMPTY, { status: 200, body: { summary: 'x' } }]);
+    const createResult = await createCalendarEvent.handler({
+      calendar: 'family',
+      title: 'x',
+      start: '2026-08-20T15:00:00',
+      end: '2026-08-20T16:00:00',
+    });
+    expect(createResult.isError).toBeFalsy();
+
+    // update_calendar_event (direct eventId — no search)
+    stubFetchSequence([{ status: 200, body: { summary: 'x' } }]);
+    const updateResult = await updateCalendarEvent.handler({ calendar: 'family', eventId: 'evt-1', title: 'y' });
+    expect(updateResult.isError).toBeFalsy();
+
+    // delete_calendar_event (direct eventId — lookup, confirm, delete)
+    stubFetchSequence([
+      { status: 200, body: { id: 'evt-1', summary: 'x', start: {}, end: {} } },
+      { status: 204, body: {} },
+    ]);
+    stubConfirmDeletion({ confirmed: true });
+    const deleteResult = await deleteCalendarEvent.handler({ calendar: 'family', eventId: 'evt-1' });
+    expect(deleteResult.isError).toBeFalsy();
   });
 });

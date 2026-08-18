@@ -277,3 +277,127 @@ describe('groups config add-mount / remove-mount (host-only)', () => {
     ]);
   });
 });
+
+// spec cal-2.3: `ncl groups config add-calendar` / `config remove-calendar`,
+// mirroring add-mcp-server/remove-mcp-server's exact shape.
+describe('groups config add-calendar / remove-calendar', () => {
+  beforeEach(() => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+    runMigrations(initTestDb());
+  });
+  afterEach(() => {
+    closeDb();
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  });
+
+  it('starts with an empty calendar_registry by default (fresh migration — no hardcoded personal data)', () => {
+    const GID = 'ag-cal-default';
+    createAgentGroup({ id: GID, name: 'c', folder: 'c', agent_provider: null, created_at: now() });
+    ensureContainerConfig(GID);
+    expect(JSON.parse(getContainerConfig(GID)!.calendar_registry)).toEqual([]);
+  });
+
+  it('adds a calendar and removes it (host caller)', async () => {
+    const GID = 'ag-cal';
+    createAgentGroup({ id: GID, name: 'c', folder: 'c', agent_provider: null, created_at: now() });
+    ensureContainerConfig(GID);
+    const args = { id: GID, name: 'family', 'calendar-id': 'family-cal@group.calendar.google.com' };
+
+    const add = await dispatch({ id: 'r1', command: 'groups-config-add-calendar', args }, { caller: 'host' });
+    expect(add.ok).toBe(true);
+    expect(JSON.parse(getContainerConfig(GID)!.calendar_registry)).toEqual([
+      { name: 'family', calendarId: 'family-cal@group.calendar.google.com' },
+    ]);
+
+    const rm = await dispatch(
+      { id: 'r2', command: 'groups-config-remove-calendar', args: { id: GID, name: 'family' } },
+      { caller: 'host' },
+    );
+    expect(rm.ok).toBe(true);
+    expect(JSON.parse(getContainerConfig(GID)!.calendar_registry)).toEqual([]);
+  });
+
+  it('re-adding the same name replaces the entry (dedupe by name), not appends a duplicate', async () => {
+    const GID = 'ag-cal-dedupe';
+    createAgentGroup({ id: GID, name: 'c', folder: 'c', agent_provider: null, created_at: now() });
+    ensureContainerConfig(GID);
+
+    await dispatch(
+      {
+        id: 'r1',
+        command: 'groups-config-add-calendar',
+        args: { id: GID, name: 'family', 'calendar-id': 'old-cal@group.calendar.google.com' },
+      },
+      { caller: 'host' },
+    );
+    await dispatch(
+      {
+        id: 'r2',
+        command: 'groups-config-add-calendar',
+        args: { id: GID, name: 'family', 'calendar-id': 'new-cal@group.calendar.google.com' },
+      },
+      { caller: 'host' },
+    );
+
+    expect(JSON.parse(getContainerConfig(GID)!.calendar_registry)).toEqual([
+      { name: 'family', calendarId: 'new-cal@group.calendar.google.com' },
+    ]);
+  });
+
+  it('an entry reusing a built-in name ("uriel") is stored as an explicit override, not rejected', async () => {
+    const GID = 'ag-cal-override';
+    createAgentGroup({ id: GID, name: 'c', folder: 'c', agent_provider: null, created_at: now() });
+    ensureContainerConfig(GID);
+
+    const add = await dispatch(
+      {
+        id: 'r1',
+        command: 'groups-config-add-calendar',
+        args: { id: GID, name: 'uriel', 'calendar-id': 'something-else@group.calendar.google.com' },
+      },
+      { caller: 'host' },
+    );
+    expect(add.ok).toBe(true);
+    expect(JSON.parse(getContainerConfig(GID)!.calendar_registry)).toEqual([
+      { name: 'uriel', calendarId: 'something-else@group.calendar.google.com' },
+    ]);
+  });
+
+  it('remove-calendar on a name that was never added declines clearly — no silent no-op', async () => {
+    const GID = 'ag-cal-remove-missing';
+    createAgentGroup({ id: GID, name: 'c', folder: 'c', agent_provider: null, created_at: now() });
+    ensureContainerConfig(GID);
+
+    const rm = await dispatch(
+      { id: 'r1', command: 'groups-config-remove-calendar', args: { id: GID, name: 'doesnotexist' } },
+      { caller: 'host' },
+    );
+    expect(rm.ok).toBe(false);
+    expect((rm as { error?: { message?: string } }).error?.message ?? '').toContain('not found');
+    // Registry stays empty — no accidental mutation on the decline path.
+    expect(JSON.parse(getContainerConfig(GID)!.calendar_registry)).toEqual([]);
+  });
+
+  it('add-calendar requires --name and --calendar-id', async () => {
+    const GID = 'ag-cal-validate';
+    createAgentGroup({ id: GID, name: 'c', folder: 'c', agent_provider: null, created_at: now() });
+    ensureContainerConfig(GID);
+
+    const noName = await dispatch(
+      {
+        id: 'r1',
+        command: 'groups-config-add-calendar',
+        args: { id: GID, 'calendar-id': 'x@group.calendar.google.com' },
+      },
+      { caller: 'host' },
+    );
+    expect(noName.ok).toBe(false);
+
+    const noCalendarId = await dispatch(
+      { id: 'r2', command: 'groups-config-add-calendar', args: { id: GID, name: 'family' } },
+      { caller: 'host' },
+    );
+    expect(noCalendarId.ok).toBe(false);
+  });
+});

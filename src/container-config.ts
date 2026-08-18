@@ -45,6 +45,7 @@ export interface ContainerConfig {
   model?: string;
   effort?: string;
   timezone?: string;
+  calendarRegistry: Array<{ name: string; calendarId: string }>;
 }
 
 /**
@@ -77,6 +78,7 @@ export function configFromDb(row: ContainerConfigRow, group: AgentGroup): Contai
     model: row.model ?? undefined,
     effort: row.effort ?? undefined,
     timezone: row.timezone && isValidTimezone(row.timezone) ? row.timezone : undefined,
+    calendarRegistry: JSON.parse(row.calendar_registry) as Array<{ name: string; calendarId: string }>,
   };
 }
 

@@ -468,6 +468,7 @@ describe('container configs', () => {
       cli_scope: 'global',
       timezone: null,
       idle_timeout_minutes: null,
+      calendar_registry: '[]',
       updated_at: now(),
     });
     const row = getContainerConfig('ag-full');

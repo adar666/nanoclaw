@@ -321,6 +321,8 @@ CREATE TABLE container_configs (
   additional_mounts      TEXT NOT NULL DEFAULT '[]',
   cli_scope              TEXT NOT NULL DEFAULT 'group',   -- disabled | group | global
   timezone               TEXT,                            -- IANA id; NULL = install-global TZ (added by migration 20)
+  idle_timeout_minutes   INTEGER,                         -- NULL = follow the instance-global ceiling (added by migration 22)
+  calendar_registry      TEXT NOT NULL DEFAULT '[]',       -- [{name, calendarId}]; config-driven calendar names beyond the built-in uriel/devorah (added by migration 24)
   updated_at             TEXT NOT NULL
 );
 ```
@@ -430,6 +432,8 @@ Several early migrations were later renamed/retired and replaced by "module" fil
 | 18 | `approvals-approver-user-id` | `018-approvals-approver-user-id.ts` | `pending_approvals.approver_user_id` — names a single required approver for a2a message-gate policies |
 | 19 | `wiring-threads-override` | `019-wiring-threads.ts` | `messaging_group_agents.threads` — per-wiring thread-policy override (NULL = adapter default) |
 | 20 | `container-config-timezone` | `020-container-config-timezone.ts` | `container_configs.timezone` — per-agent-group timezone override (NULL = install-global) |
+| 22 | `container-config-idle-timeout` | `022-container-config-idle-timeout.ts` | `container_configs.idle_timeout_minutes` — per-agent-group idle-timeout override (NULL = instance-global ceiling) |
+| 24 | `container-config-calendar-registry` | `024-container-config-calendar-registry.ts` | `container_configs.calendar_registry` — config-driven `{name, calendarId}` list, merged with the built-in uriel/devorah at read time (config wins on a name collision) |
 
 Numbers 5 and 6 are intentionally absent — migrations were renumbered during early development.
 

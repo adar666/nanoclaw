@@ -1,5 +1,24 @@
 > **Superseded (epic-1 retro action item AI-5):** these items were merged into `_bmad-output/planning-artifacts/architecture/architecture-nanoclaw-v2-2026-08-16/ARCHITECTURE-SPINE.md`'s own Deferred section, which is the single source of truth going forward. Kept here only for the append-only history this file's format assumes.
 
+- source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-3-calendars-beyond-uriel-and-devorah.md`
+  summary: Concurrent `ncl groups config add-calendar`/`remove-calendar` calls on the same group can lose an update (read-then-write, not transactional) — same class of race as every other `config add-X`/`remove-X` JSON-column CLI verb on this table (mounts, MCP servers, packages), not new to this story.
+  evidence: Edge-case-hunter review finding; pre-existing systemic pattern across the whole `config add-X` family, surfaced incidentally by this story rather than introduced by it.
+- source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-3-calendars-beyond-uriel-and-devorah.md`
+  summary: `configFromDb()`/`presentConfig()`'s `JSON.parse(row.calendar_registry)` (and every other JSON column on that same function) has no try/catch — a hand-corrupted DB row throws uncaught instead of falling back to empty.
+  evidence: Edge-case-hunter review finding; pre-existing pattern across every JSON column on `container_configs`, not unique to `calendar_registry`.
+- source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-3-calendars-beyond-uriel-and-devorah.md`
+  summary: Adding a calendar today is a bare CLI CRUD verb with no restart-reminder automation or on-wake notification — unlike `install_packages`/`add_mcp_server`'s self-mod MCP-tool flow (admin approval → auto image rebuild/restart → on-wake chat notification, `src/modules/self-mod/apply.ts`). An approved `config add-calendar` still requires a human to remember `ncl groups restart`.
+  evidence: Blind-hunter review finding; a real, valuable enhancement (agent-initiated calendar registry changes with the same auto-restart+notify UX as package/MCP-server self-mod) but a separate, bigger feature — extending `self-mod.ts`'s action set — not this story's scope.
+- source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-3-calendars-beyond-uriel-and-devorah.md`
+  summary: `config add-calendar --calendar-id` has no format/plausibility validation (contrast `install_packages`'s explicit apt/npm name regexes) — a typo'd calendar ID surfaces only as an opaque Google API error much later, at call time.
+  evidence: Blind-hunter review finding; consistent with this story's own "no RRULE validation" precedent (spec cal-2.2) and this file's existing "let Google's API be the validator" pattern for description/location — not fixed now.
+- source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-3-calendars-beyond-uriel-and-devorah.md`
+  summary: A duplicate `name` in a hand-edited/corrupted `calendar_registry` JSON array silently lets the last entry win in `resolveCalendarIds()`'s merge, with no diagnostic.
+  evidence: Blind-hunter review finding; low-likelihood (the CLI write path already dedupes by name), not worth defensive read-time validation now.
+- source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-3-calendars-beyond-uriel-and-devorah.md`
+  summary: The built-in `CALENDAR_IDS` constant in `calendar.ts` still hardcodes a real personal email address (`adardevora@gmail.com`) directly in trunk source — pre-existing since Story 1.2, unchanged by this story's own migration-default design (which deliberately avoids adding *more* hardcoded personal data, but doesn't retroactively scrub what was already there).
+  evidence: Blind-hunter review finding; a deliberate call for the repo owner to make (whether/how to move this to per-install config), not something to silently patch mid-story.
+
 - source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-2-recurring-events.md`
   summary: update_calendar_event silently drops a recurrence argument if one is passed to it (no schema entry, not destructured, no error) rather than rejecting it clearly — there is no way to add/change/remove recurrence on an existing event short of delete-and-recreate.
   evidence: Blind-hunter review finding; out of this story's scope (spec explicitly said don't touch update_calendar_event), but worth a real decision before someone assumes update supports it.

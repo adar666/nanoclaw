@@ -28,19 +28,65 @@ import { TIMEZONE, parseZonedToUtc, formatLocalTime } from '../timezone.js';
 import type { McpToolDefinition } from './types.js';
 import { registerTools } from './server.js';
 import { askUserQuestion } from './interactive.js';
+import { getConfig } from '../config.js';
 
 /**
- * The only two calendars in scope (spec non-goal: no others). "uriel" maps
- * to the connected account's own calendar; "devorah" to her calendar,
- * reachable because she shares it with the connected account (AD-3) — not
- * a second OAuth connection. Matches `groups/household/memory/household/
- * people.md`'s recorded email for Devora. Shared by all three tools in this
- * file (create/list/update) — do not duplicate this mapping.
+ * The two built-in calendars (spec cal-2.3: these stay hardcoded defaults,
+ * unchanged behavior, no migration-time personal data). "uriel" maps to the
+ * connected account's own calendar; "devorah" to her calendar, reachable
+ * because she shares it with the connected account (AD-3) — not a second
+ * OAuth connection. Matches `groups/household/memory/household/people.md`'s
+ * recorded email for Devora.
+ *
+ * Do NOT reference this constant directly in a tool handler — call
+ * `resolveCalendarIds()` instead, which merges this with the per-group
+ * config registry (config entries win on a name collision).
  */
 const CALENDAR_IDS: Record<string, string> = {
   uriel: 'primary',
   devorah: 'adardevora@gmail.com',
 };
+
+/**
+ * Exported so tests can substitute the calendar-registry source without
+ * going through a real `loadConfig()` file read (`calendar.test.ts` never
+ * mounts a real `container.json` and calling `getConfig()` there would throw
+ * "Config not loaded") — same testability pattern as `createHooks`/
+ * `deleteHooks` below. Production code never overrides this.
+ */
+export const calendarConfigHooks = {
+  getCalendarRegistry: (): Array<{ name: string; calendarId: string }> => getConfig().calendarRegistry,
+};
+
+/**
+ * Effective calendar name → calendarId map: the built-in `CALENDAR_IDS`
+ * merged with this group's config-driven `calendarRegistry`, config entries
+ * taking precedence on a name collision (spec cal-2.3 — this is what makes
+ * "no code change, ever, for the common case" true).
+ *
+ * Deliberately called INSIDE each handler body, never at module top level or
+ * inside a static `inputSchema` object literal: `getConfig()` throws until
+ * `loadConfig()` runs in `main()` (container/agent-runner/src/index.ts),
+ * which happens AFTER this module's own top-level `registerTools([...])`
+ * call already ran (`index.ts` imports the providers barrel — which
+ * transitively imports this file — before calling `loadConfig()`). Calling
+ * this at module scope would throw before the container ever starts polling.
+ */
+function resolveCalendarIds(): Record<string, string> {
+  // Object.create(null) — never a plain {} — so a registry entry named
+  // "__proto__"/"constructor" (however unlikely, a hand-edited/corrupted
+  // row is still possible) can't silently reach Object.prototype instead
+  // of becoming a real own property (review finding).
+  const merged: Record<string, string> = Object.create(null);
+  for (const [name, calendarId] of Object.entries(CALENDAR_IDS)) merged[name] = calendarId;
+  for (const entry of calendarConfigHooks.getCalendarRegistry()) {
+    // An empty calendarId would list the name as "resolvable" (error text
+    // would offer it) yet still fail as "Unknown calendar" when chosen —
+    // skip it instead (review finding).
+    if (entry.calendarId) merged[entry.name] = entry.calendarId;
+  }
+  return merged;
+}
 
 function log(msg: string): void {
   console.error(`[mcp-tools] ${msg}`);
@@ -134,15 +180,18 @@ export const createCalendarEvent: McpToolDefinition = {
   tool: {
     name: 'create_calendar_event',
     description:
-      'Create a real event on Uriel\'s or Devora\'s Google Calendar (both reachable through one connected ' +
-      'account — Devora\'s via calendar sharing, not a separate connection).',
+      'Create a real event on one of this group\'s configured Google Calendars (at minimum Uriel\'s and ' +
+      'Devora\'s; an operator may add more) — all reachable through one connected account, each other ' +
+      'calendar via sharing, not a separate connection.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         calendar: {
           type: 'string',
-          enum: ['uriel', 'devorah'],
-          description: 'Which calendar to create the event on.',
+          description:
+            "Which calendar to create the event on — one of this group's resolvable calendar names: the " +
+            'built-in "uriel"/"devorah" plus any names added to this group\'s calendar registry ' +
+            '(`ncl groups config add-calendar`).',
         },
         title: { type: 'string', description: 'Event title/summary.' },
         start: {
@@ -182,10 +231,11 @@ export const createCalendarEvent: McpToolDefinition = {
     const recurrence = args.recurrence as string | undefined;
     const guests = args.guests as unknown;
 
-    if (!calendar) return err(`calendar is required — one of: ${Object.keys(CALENDAR_IDS).join(', ')}`);
-    const calendarId = CALENDAR_IDS[calendar];
+    const calendarIds = resolveCalendarIds();
+    if (!calendar) return err(`calendar is required — one of: ${Object.keys(calendarIds).join(', ')}`);
+    const calendarId = calendarIds[calendar];
     if (!calendarId) {
-      return err(`Unknown calendar "${calendar}" — must be one of: ${Object.keys(CALENDAR_IDS).join(', ')}`);
+      return err(`Unknown calendar "${calendar}" — must be one of: ${Object.keys(calendarIds).join(', ')}`);
     }
     if (!title) return err('title is required');
     if (!start) return err('start is required');
@@ -611,16 +661,18 @@ export const listCalendarEvents: McpToolDefinition = {
   tool: {
     name: 'list_calendar_events',
     description:
-      "List real events on Uriel's or Devora's Google Calendar (both reachable through one connected " +
-      'account — Devora\'s via calendar sharing, not a separate connection). Use for "what\'s on my/their ' +
-      'calendar" or "when is X" questions — never answer those from memory or a guess.',
+      "List real events on one of this group's configured Google Calendars (at minimum Uriel's and " +
+      "Devora's; an operator may add more) — all reachable through one connected account. Use for " +
+      '"what\'s on my/their calendar" or "when is X" questions — never answer those from memory or a guess.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         calendar: {
           type: 'string',
-          enum: ['uriel', 'devorah'],
-          description: 'Which calendar to list events from.',
+          description:
+            "Which calendar to list events from — one of this group's resolvable calendar names: the " +
+            'built-in "uriel"/"devorah" plus any names added to this group\'s calendar registry ' +
+            '(`ncl groups config add-calendar`).',
         },
         from: {
           type: 'string',
@@ -646,10 +698,11 @@ export const listCalendarEvents: McpToolDefinition = {
     const to = args.to as string | undefined;
     const query = args.query as string | undefined;
 
-    if (!calendar) return err(`calendar is required — one of: ${Object.keys(CALENDAR_IDS).join(', ')}`);
-    const calendarId = CALENDAR_IDS[calendar];
+    const calendarIds = resolveCalendarIds();
+    if (!calendar) return err(`calendar is required — one of: ${Object.keys(calendarIds).join(', ')}`);
+    const calendarId = calendarIds[calendar];
     if (!calendarId) {
-      return err(`Unknown calendar "${calendar}" — must be one of: ${Object.keys(CALENDAR_IDS).join(', ')}`);
+      return err(`Unknown calendar "${calendar}" — must be one of: ${Object.keys(calendarIds).join(', ')}`);
     }
 
     const result = await searchEvents(calendarId, { query, from, to });
@@ -740,7 +793,8 @@ export const updateCalendarEvent: McpToolDefinition = {
   tool: {
     name: 'update_calendar_event',
     description:
-      "Update a real event on Uriel's or Devora's Google Calendar. Target it either by a known eventId " +
+      "Update a real event on one of this group's configured Google Calendars (at minimum Uriel's and " +
+      "Devora's; an operator may add more). Target it either by a known eventId " +
       '(e.g. from a prior list_calendar_events call) or by eventQuery free-text search. Never deletes/cancels ' +
       'an event — use delete_calendar_event for that.',
     inputSchema: {
@@ -748,8 +802,10 @@ export const updateCalendarEvent: McpToolDefinition = {
       properties: {
         calendar: {
           type: 'string',
-          enum: ['uriel', 'devorah'],
-          description: 'Which calendar the event is on.',
+          description:
+            "Which calendar the event is on — one of this group's resolvable calendar names: the built-in " +
+            '"uriel"/"devorah" plus any names added to this group\'s calendar registry ' +
+            '(`ncl groups config add-calendar`).',
         },
         eventId: {
           type: 'string',
@@ -793,10 +849,11 @@ export const updateCalendarEvent: McpToolDefinition = {
     const description = args.description as string | undefined;
     const location = args.location as string | undefined;
 
-    if (!calendar) return err(`calendar is required — one of: ${Object.keys(CALENDAR_IDS).join(', ')}`);
-    const calendarId = CALENDAR_IDS[calendar];
+    const calendarIds = resolveCalendarIds();
+    if (!calendar) return err(`calendar is required — one of: ${Object.keys(calendarIds).join(', ')}`);
+    const calendarId = calendarIds[calendar];
     if (!calendarId) {
-      return err(`Unknown calendar "${calendar}" — must be one of: ${Object.keys(CALENDAR_IDS).join(', ')}`);
+      return err(`Unknown calendar "${calendar}" — must be one of: ${Object.keys(calendarIds).join(', ')}`);
     }
 
     if (!eventId && !eventQuery) {
@@ -1070,7 +1127,8 @@ export const deleteCalendarEvent: McpToolDefinition = {
   tool: {
     name: 'delete_calendar_event',
     description:
-      "Delete a real event from Uriel's or Devora's Google Calendar. This cannot be undone. The tool itself " +
+      "Delete a real event from one of this group's configured Google Calendars (at minimum Uriel's and " +
+      "Devora's; an operator may add more). This cannot be undone. The tool itself " +
       "blocks and asks the user to confirm (a real yes/no card, same mechanism as ask_user_question) before " +
       'issuing the actual delete — there is nothing else to orchestrate, one call resolves the target, gets a ' +
       'real confirmation, and deletes (or does not) in sequence. Target the event either by a known eventId or ' +
@@ -1080,8 +1138,10 @@ export const deleteCalendarEvent: McpToolDefinition = {
       properties: {
         calendar: {
           type: 'string',
-          enum: ['uriel', 'devorah'],
-          description: 'Which calendar the event is on.',
+          description:
+            "Which calendar the event is on — one of this group's resolvable calendar names: the built-in " +
+            '"uriel"/"devorah" plus any names added to this group\'s calendar registry ' +
+            '(`ncl groups config add-calendar`).',
         },
         eventId: {
           type: 'string',
@@ -1114,10 +1174,11 @@ export const deleteCalendarEvent: McpToolDefinition = {
     const from = args.from as string | undefined;
     const to = args.to as string | undefined;
 
-    if (!calendar) return err(`calendar is required — one of: ${Object.keys(CALENDAR_IDS).join(', ')}`);
-    const calendarId = CALENDAR_IDS[calendar];
+    const calendarIds = resolveCalendarIds();
+    if (!calendar) return err(`calendar is required — one of: ${Object.keys(calendarIds).join(', ')}`);
+    const calendarId = calendarIds[calendar];
     if (!calendarId) {
-      return err(`Unknown calendar "${calendar}" — must be one of: ${Object.keys(CALENDAR_IDS).join(', ')}`);
+      return err(`Unknown calendar "${calendar}" — must be one of: ${Object.keys(calendarIds).join(', ')}`);
     }
 
     if (!eventId && !eventQuery) {
