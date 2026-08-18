@@ -2,7 +2,7 @@
 title: "Read Uriel's or Devorah's Calendar"
 type: 'feature'
 created: '2026-08-18'
-status: 'in-progress'
+status: 'done'
 review_loop_iteration: 0
 context: []
 baseline_commit: '794087f'
@@ -57,9 +57,9 @@ baseline_commit: '794087f'
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `container/agent-runner/src/mcp-tools/calendar.ts` -- `list_calendar_events` tool; shared `CALENDAR_IDS` factored out
-- [ ] `container/agent-runner/src/mcp-tools/calendar.test.ts` -- bun:test coverage for the I/O matrix (mocked `fetch`)
-- [ ] `container/skills/calendar/SKILL.md` -- document the new tool
+- [x] `container/agent-runner/src/mcp-tools/calendar.ts` -- `list_calendar_events` tool; shared `CALENDAR_IDS` factored out
+- [x] `container/agent-runner/src/mcp-tools/calendar.test.ts` -- bun:test coverage for the I/O matrix (mocked `fetch`)
+- [x] `container/skills/calendar/SKILL.md` -- document the new tool
 
 **Acceptance Criteria:**
 - Given the story is complete, when `cd container/agent-runner && bun test` runs, then all tests pass using mocked `fetch`.
@@ -67,7 +67,7 @@ baseline_commit: '794087f'
 
 ## Spec Change Log
 
-(none yet)
+- 2026-08-18 (code review — blind-hunter/edge-case-hunter/verification-gap, applied jointly with spec-cal-1-5's patches since both tools share `searchEvents`): the search window is now resolved once per call (`searchEvents` returns `{timeMin, timeMax}` alongside results) instead of `list_calendar_events` independently re-resolving it a second time to build its range description — closes a real, if currently harmless, risk of the displayed range and the actually-queried range diverging at a midnight boundary (two separate `new Date()` calls). Results-capped disclosure and per-event line formatting (`formatEventLine`, now shared with `update_calendar_event`'s candidate list) are unchanged in behavior, just factored to avoid duplication. **Verified independently**: re-ran `cd container/agent-runner && bun test` three times (390 pass, 8 skip, 0 fail every run) and `pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit` (clean) myself after the patch round.
 
 ## Design Notes
 
@@ -82,4 +82,11 @@ Google's `events.list` real endpoint: `GET https://www.googleapis.com/calendar/v
 
 ## Suggested Review Order
 
-(filled in at story completion)
+- Start here -- the handler.
+  [`calendar.ts:477`](../../container/agent-runner/src/mcp-tools/calendar.ts#L477)
+- Shared search + window resolution (used by `update_calendar_event` too).
+  [`calendar.ts:459`](../../container/agent-runner/src/mcp-tools/calendar.ts#L459)
+- Shared line/range formatting.
+  [`calendar.ts:382`](../../container/agent-runner/src/mcp-tools/calendar.ts#L382), [`calendar.ts:390`](../../container/agent-runner/src/mcp-tools/calendar.ts#L390)
+- Test suite.
+  [`calendar.test.ts:517`](../../container/agent-runner/src/mcp-tools/calendar.test.ts#L517)

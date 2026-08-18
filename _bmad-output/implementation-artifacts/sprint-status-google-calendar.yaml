@@ -37,6 +37,6 @@ story_location: _bmad-output/implementation-artifacts
 development_status:
   epic-1: backlog
   1-2-create-an-event-on-uriel-s-or-devorah-s-calendar: done
-  1-3-read-your-own-calendar: in-progress
-  1-5-update-an-event-on-uriel-s-or-devorah-s-calendar: in-progress
+  1-3-read-your-own-calendar: done
+  1-5-update-an-event-on-uriel-s-or-devorah-s-calendar: done
   epic-1-retrospective: optional

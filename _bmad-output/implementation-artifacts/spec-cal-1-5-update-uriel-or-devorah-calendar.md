@@ -2,7 +2,7 @@
 title: "Update an Event on Uriel's or Devorah's Calendar"
 type: 'feature'
 created: '2026-08-18'
-status: 'in-progress'
+status: 'done'
 review_loop_iteration: 0
 context: []
 baseline_commit: '794087f'
@@ -59,9 +59,9 @@ baseline_commit: '794087f'
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `container/agent-runner/src/mcp-tools/calendar.ts` -- `update_calendar_event` tool; shared search helper factored out of `list_calendar_events`
-- [ ] `container/agent-runner/src/mcp-tools/calendar.test.ts` -- bun:test coverage for the I/O matrix (mocked `fetch`)
-- [ ] `container/skills/calendar/SKILL.md` -- document the new tool
+- [x] `container/agent-runner/src/mcp-tools/calendar.ts` -- `update_calendar_event` tool; shared search helper factored out of `list_calendar_events`
+- [x] `container/agent-runner/src/mcp-tools/calendar.test.ts` -- bun:test coverage for the I/O matrix (mocked `fetch`)
+- [x] `container/skills/calendar/SKILL.md` -- document the new tool
 
 **Acceptance Criteria:**
 - Given the story is complete, when `cd container/agent-runner && bun test` runs, then all tests pass using mocked `fetch`.
@@ -69,7 +69,7 @@ baseline_commit: '794087f'
 
 ## Spec Change Log
 
-(none yet)
+- 2026-08-18 (code review — blind-hunter/edge-case-hunter/verification-gap, 7 patch findings applied, rest deferred): an explicit empty string (`title: ''`, `description: ''`, `location: ''`) meant to clear a field was previously silently dropped from the PATCH body (truthy-check bug) — worse, if it was the only argument given, the tool wrongly declined with "Nothing to update" even though a field genuinely was supplied. Fixed by switching both the field-inclusion checks and the "nothing to update" gate from truthy to `!== undefined`. The multi-match candidate list hand-rolled its own line formatting (dropping `location`, a real disambiguation regression for two same-title/same-time events differing only by location) and never checked/disclosed a truncated search — both now share `list_calendar_events`' own line-formatting and truncation-disclosure logic (`formatEventLine`, `searchEvents`'s `truncated` flag) rather than duplicating it. Neither the zero-match nor multi-match message stated the search window, making "no events found" indistinguishable from "outside the default 7-day window" — both now include the resolved range via a shared `formatRangeDesc` helper. The inverted-window error interpolated raw (possibly-`undefined`) args instead of resolved values — fixed. Added the previously-missing symmetric `end`-only PATCH test (only `start`-only existed) and an explicit test + schema-description note for the `eventId`+`eventQuery`-both-given case (`eventId` wins, now documented rather than silently true). **Deferred, not fixed** (logged to `ARCHITECTURE-SPINE.md`'s Deferred section): all-day (`date`) vs. timed (`dateTime`) event shape mismatch on a single-sided PATCH of an originally all-day event; no aggregate timeout bound across the search-then-PATCH call pair (each independently capped at 30s, worst case ~60s for one tool call); whether Google's real API genuinely accepts a single-sided `start`-only/`end`-only PATCH without requiring the other field — the code sends only the changed field per this spec's own documented default, but the live semantic question needs a real credentialed test, not something resolvable in this sandbox. **Verified independently**, not just self-reported: re-ran `cd container/agent-runner && bun test` three times (390 pass, 8 skip, 0 fail every run) and `pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit` (clean) myself after the patch round, before accepting the implementer's report.
 
 ## Design Notes
 
@@ -84,4 +84,9 @@ Google's `events.patch`: `PATCH https://www.googleapis.com/calendar/v3/calendars
 
 ## Suggested Review Order
 
-(filled in at story completion)
+- Start here -- the handler, target resolution (eventId vs. eventQuery), disambiguation.
+  [`calendar.ts:554`](../../container/agent-runner/src/mcp-tools/calendar.ts#L554)
+- Shared search (with `update_calendar_event`) and PATCH body construction -- the review-round fixes live here.
+  [`calendar.ts:459`](../../container/agent-runner/src/mcp-tools/calendar.ts#L459)
+- Test suite -- start with the empty-string-clear and `end`-only PATCH blocks, the two review-round additions worth the closest look.
+  [`calendar.test.ts:715`](../../container/agent-runner/src/mcp-tools/calendar.test.ts#L715)
