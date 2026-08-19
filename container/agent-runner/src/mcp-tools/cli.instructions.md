@@ -41,6 +41,8 @@ Additional resources (available under `global` scope only): messaging-groups, wi
 
 Read commands (list, get) are open. Most write commands (create, update, delete, restart, config update, add, remove) require admin approval — the request is held until an admin approves it. `ncl tasks` is the exception: an agent can manage its own group tasks without approval.
 
+**Before using `ncl groups config add-X`/`remove-X` for something, check whether a purpose-built self-mod tool already exists for it** (`install_packages`, `add_mcp_server`, `add_calendar` — see their own instructions if loaded). Both routes reach the same underlying config, but only the tool call auto-restarts your container and notifies you once approved; the `ncl` route leaves the change pending until someone remembers `ncl groups restart` manually. Use `ncl config add-X` only when no matching tool exists.
+
 ### Approval flow
 
 Write commands require admin approval. Here's what happens:
