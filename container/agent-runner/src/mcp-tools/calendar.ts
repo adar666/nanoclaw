@@ -68,12 +68,17 @@ export const calendarConfigHooks = {
  * "no code change, ever, for the common case" true).
  *
  * Deliberately called INSIDE each handler body, never at module top level or
- * inside a static `inputSchema` object literal: `getConfig()` throws until
- * `loadConfig()` runs in `main()` (container/agent-runner/src/index.ts),
- * which happens AFTER this module's own top-level `registerTools([...])`
- * call already ran (`index.ts` imports the providers barrel — which
- * transitively imports this file — before calling `loadConfig()`). Calling
- * this at module scope would throw before the container ever starts polling.
+ * inside a static `inputSchema` object literal — `getConfig()` throws until
+ * `loadConfig()` has run.
+ *
+ * CORRECTED (live incident, 2026-08-19): this module runs inside the MCP
+ * tools stdio-server subprocess (`mcp-tools/index.ts`), a SEPARATE process
+ * from `index.ts`'s own `main()` — not the same process as originally
+ * assumed here. `main()`'s `loadConfig()` call has no effect in this
+ * process; `mcp-tools/index.ts` now calls `loadConfig()` itself for exactly
+ * this reason. Before that fix, every calendar tool call failed in
+ * production with "Config not loaded" — deterministically, not
+ * intermittently, since this subprocess never populated `_config` at all.
  */
 function resolveCalendarIds(): Record<string, string> {
   // Object.create(null) — never a plain {} — so a registry entry named
