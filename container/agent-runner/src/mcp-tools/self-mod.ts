@@ -1,16 +1,18 @@
 /**
- * Self-modification MCP tools: install_packages, add_mcp_server.
+ * Self-modification MCP tools: install_packages, add_mcp_server, add_calendar.
  *
- * Both are fire-and-forget — the tool writes a system action row and returns
- * immediately. The host processes the request (including admin approval)
- * and notifies the agent via a chat message when complete. Admin approval
- * is approval to apply the change: `install_packages` auto-rebuilds the
- * per-agent image and restarts the container; `add_mcp_server` just
- * updates `container.json` and restarts (bun runs TS directly — no build
- * step needed for a pure MCP wiring change).
+ * All three are fire-and-forget — the tool writes a system action row and
+ * returns immediately. The host processes the request (including admin
+ * approval) and notifies the agent via a chat message when complete. Admin
+ * approval is approval to apply the change: `install_packages` auto-rebuilds
+ * the per-agent image and restarts the container; `add_mcp_server` and
+ * `add_calendar` just update `container.json` and restart (bun runs TS
+ * directly — no build step needed for a pure config wiring change,
+ * deferred-work.md finding resolved 2026-08-19 — `add_calendar` gets the
+ * same auto-restart+notify UX `ncl groups config add-calendar` never had).
  *
- * Package names are sanitized here at the tool boundary AND re-validated on
- * the host side (defense in depth).
+ * Package names / calendar ids are sanitized here at the tool boundary AND
+ * re-validated on the host side (defense in depth).
  */
 import { writeMessageOut } from '../db/messages-out.js';
 import { registerTools } from './server.js';
@@ -117,4 +119,60 @@ export const addMcpServer: McpToolDefinition = {
   },
 };
 
-registerTools([installPackages, addMcpServer]);
+// Mirrors src/cli/resources/groups.ts's CALENDAR_ID_RE exactly — same
+// plausibility-only check ("primary" or an email-shaped id), same rationale
+// (catch an obvious typo before it becomes an opaque Google API error much
+// later, at call time — not a full format validator).
+const CALENDAR_ID_RE = /^(primary|[^\s@]+@[^\s@]+\.[^\s@]+)$/;
+
+export const addCalendar: McpToolDefinition = {
+  tool: {
+    name: 'add_calendar',
+    description:
+      'Add (or override) a calendar name in YOUR per-agent group\'s calendar registry — extends the built-in ' +
+      '"uriel" name (or overrides an existing registry entry) so create_calendar_event/list_calendar_events/' +
+      'update_calendar_event/delete_calendar_event can target it by name. Requires admin approval; ' +
+      'fire-and-forget.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        name: { type: 'string', description: 'Calendar name to register (e.g. "family").' },
+        calendarId: {
+          type: 'string',
+          description: 'Real Google Calendar id — "primary" or an email-shaped id (e.g. "user@gmail.com" or "...@group.calendar.google.com").',
+        },
+        reason: { type: 'string', description: 'Why this calendar is needed' },
+      },
+      required: ['name', 'calendarId'],
+    },
+  },
+  async handler(args) {
+    const name = (args.name as string | undefined)?.trim();
+    const calendarId = (args.calendarId as string | undefined)?.trim();
+    if (!name) return err('name is required');
+    if (!calendarId) return err('calendarId is required');
+    if (!CALENDAR_ID_RE.test(calendarId)) {
+      return err(
+        `calendarId "${calendarId}" doesn't look like a real Google Calendar id — expected "primary" or an ` +
+          'email-shaped id (e.g. "user@gmail.com" or "...@group.calendar.google.com")',
+      );
+    }
+
+    const requestId = generateId();
+    writeMessageOut({
+      id: requestId,
+      kind: 'system',
+      content: JSON.stringify({
+        action: 'add_calendar',
+        name,
+        calendarId,
+        reason: (args.reason as string) || '',
+      }),
+    });
+
+    log(`add_calendar: ${requestId} → "${name}" (${calendarId})`);
+    return ok(`Calendar registry request submitted. You will be notified when admin approves or rejects.`);
+  },
+};
+
+registerTools([installPackages, addMcpServer, addCalendar]);

@@ -48,6 +48,7 @@ describe('guard conformance', () => {
       'a2a.send',
       'self_mod.install_packages',
       'self_mod.add_mcp_server',
+      'self_mod.add_calendar',
       'senders.admit',
       'channels.register',
     ]) {

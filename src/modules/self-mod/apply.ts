@@ -10,6 +10,7 @@
  *
  * install_packages: update DB + rebuild image + kill container + on_wake.
  * add_mcp_server: update DB + kill container + on_wake.
+ * add_calendar: update DB (calendar_registry) + kill container + on_wake.
  */
 import { buildAgentGroupImage, killContainer, wakeContainer } from '../../container-runner.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
@@ -126,4 +127,49 @@ export async function applyAddMcpServer(payload: Record<string, unknown>, sessio
     if (s) wakeContainer(s);
   });
   log.info('MCP server add approved', { agentGroupId: session.agent_group_id });
+}
+
+export async function applyAddCalendar(payload: Record<string, unknown>, session: Session): Promise<void> {
+  const agentGroup = getAgentGroup(session.agent_group_id);
+  if (!agentGroup) {
+    notifyAgent(session, 'add_calendar approved but agent group missing.');
+    return;
+  }
+
+  const configRow = getContainerConfig(agentGroup.id);
+  if (!configRow) {
+    notifyAgent(session, 'add_calendar approved but container config missing.');
+    return;
+  }
+
+  // payload.name is already trimmed+lowercased (request.ts's
+  // requestAddCalendarHold, before the payload was ever stored) — same
+  // write-path normalization as the CLI verb (config add-calendar).
+  const name = payload.name as string;
+  const calendarId = payload.calendarId as string;
+
+  const registry = JSON.parse(configRow.calendar_registry) as Array<{ name: string; calendarId: string }>;
+  const filtered = registry.filter((e) => e.name !== name);
+  filtered.push({ name, calendarId });
+  updateContainerConfigJson(agentGroup.id, 'calendar_registry', filtered);
+
+  writeSessionMessage(session.agent_group_id, session.id, {
+    id: `appr-note-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    kind: 'chat',
+    timestamp: new Date().toISOString(),
+    platformId: session.agent_group_id,
+    channelType: 'agent',
+    threadId: null,
+    content: JSON.stringify({
+      text: `Calendar "${name}" added to your registry. Verify it resolves (e.g. try list_calendar_events with calendar: "${name}") and report the result to the user.`,
+      sender: 'system',
+      senderId: 'system',
+    }),
+    onWake: 1,
+  });
+  killContainer(session.id, 'calendar registry updated', () => {
+    const s = getSession(session.id);
+    if (s) wakeContainer(s);
+  });
+  log.info('Calendar registry add approved', { agentGroupId: session.agent_group_id });
 }

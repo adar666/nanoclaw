@@ -15,7 +15,7 @@ description: >-
   unrelated Google OAuth (never disclose that one).
 metadata:
   author: nanoclaw
-  version: "1.10.0"
+  version: "1.11.0"
 ---
 
 # Calendar
@@ -219,15 +219,18 @@ drop any of them.
 `"uriel"` (the connected account's own calendar) is the only calendar name
 built into every install. Every other name — including `"devorah"` — is
 config-added, the same mechanism, whether it's the first additional
-calendar or the fifth: `ncl groups config add-calendar --id <group-id>
---name <name> --calendar-id <calendar-id>`, followed by a group restart to
-pick it up. This is operator-facing config, not something to run
-unprompted — but the command itself is approval-gated (same access level as
-`config add-mcp-server`), so if a user explicitly asks you to add a
-calendar, you can request it via `ncl` and it will go through the normal
-approval flow rather than being something only a human at a terminal can
-do. Once added, the new name works exactly like `"uriel"` in every one of
-these four tools — same resolution, same sharing mechanism, nothing special
+calendar or the fifth. If a user explicitly asks you to add a calendar,
+call the `add_calendar` self-mod tool directly (`add_calendar({ name:
+"family", calendarId: "family-cal@group.calendar.google.com", reason:
+"..." })`) — same admin-approval flow as `install_packages`/`add_mcp_server`
+(see the `self-customize` skill), and once approved the container restarts
+itself automatically, no manual follow-up needed. This is not something to
+run unprompted, only in direct response to a user's own request. The older
+`ncl groups config add-calendar --id <group-id> --name <name> --calendar-id
+<calendar-id>` path (followed by a group restart) still works too, but
+requires a human at a terminal — `add_calendar` doesn't. Once added, the
+new name works exactly like `"uriel"` in every one of these four tools —
+same resolution, same sharing mechanism, nothing special
 about it being a later addition. If a call names a calendar that doesn't
 resolve (not added, added but the group hasn't been restarted yet, or —
 for `"devorah"` specifically — simply not configured on this install),

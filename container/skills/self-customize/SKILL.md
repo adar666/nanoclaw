@@ -14,6 +14,7 @@ You can modify your own environment. Different kinds of changes have different w
 - **Memory or standing instructions** → Edit `memory/` or `instructions.prepend.md` directly, no approval needed. The workspace is persisted on the host. The composed provider document (`CLAUDE.md` or `AGENTS.md`) is regenerated every spawn and must not be edited.
 - **System package (apt) or global npm package** → `install_packages`. Requires admin approval. On approval, image rebuild + container restart happen automatically.
 - **MCP server** → `add_mcp_server`. Requires admin approval. On approval, container restarts with the new server wired up (no rebuild — bun runs TS directly).
+- **A calendar name for the `calendar` skill's tools** (if that skill is mounted) → `add_calendar`. Requires admin approval. On approval, container restarts with the new registry entry wired up (no rebuild).
 - **Your source code or Dockerfile** → Delegate to a builder agent via `create_agent` (see below).
 - **A new specialist capability** → `create_agent` to spin up a dedicated agent for it.
 

@@ -31,7 +31,13 @@ import { upsertUser } from '../permissions/db/users.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
 import { grantRole } from '../permissions/db/user-roles.js';
 import type { Session } from '../../types.js';
-import { escapeInvisibles, requestAddMcpServerHold, validateAddMcpServer } from './request.js';
+import {
+  escapeInvisibles,
+  requestAddCalendarHold,
+  requestAddMcpServerHold,
+  validateAddCalendar,
+  validateAddMcpServer,
+} from './request.js';
 
 vi.mock('../../container-runner.js', () => ({
   wakeContainer: vi.fn().mockResolvedValue(undefined),
@@ -142,6 +148,12 @@ function lastNotifyText(): string {
 async function submitAddMcpServer(content: Record<string, unknown>, s: Session): Promise<void> {
   if (!validateAddMcpServer(content, s)) return;
   await requestAddMcpServerHold(content, s);
+}
+
+/** Same drive-both-halves pattern as submitAddMcpServer, for add_calendar. */
+async function submitAddCalendar(content: Record<string, unknown>, s: Session): Promise<void> {
+  if (!validateAddCalendar(content, s)) return;
+  await requestAddCalendarHold(content, s);
 }
 
 /** Assert the handler rejected: no card delivered, no row, agent notified with a failure. */
@@ -368,6 +380,76 @@ describe('add_mcp_server secret redaction', () => {
     expect(payload.args).toEqual(['--token', argSecret]);
     expect(payload.env.GITHUB_TOKEN).toBe(keyMatched);
     expect(payload.env.HARMLESS).toBe(valueMatched);
+  });
+});
+
+describe('add_calendar approval card', () => {
+  it('shows name and calendarId verbatim, name normalized to trimmed+lowercased', async () => {
+    await submitAddCalendar({ name: '  Family  ', calendarId: 'family-cal@group.calendar.google.com' }, session);
+
+    const question = lastQuestion();
+    expect(question).toContain('family'); // normalized, not "Family"
+    expect(question).toContain('family-cal@group.calendar.google.com');
+
+    const rows = getPendingApprovalsByAction('add_calendar');
+    expect(rows).toHaveLength(1);
+    const payload = JSON.parse(rows[0].payload) as { name: string; calendarId: string };
+    expect(payload.name).toBe('family');
+    expect(payload.calendarId).toBe('family-cal@group.calendar.google.com');
+  });
+
+  it('includes the reason when given, omits it when not', async () => {
+    await submitAddCalendar(
+      { name: 'family', calendarId: 'family-cal@group.calendar.google.com', reason: 'shared family events' },
+      session,
+    );
+    expect(lastQuestion()).toContain('Reason: shared family events');
+
+    delivered = [];
+    await submitAddCalendar({ name: 'family2', calendarId: 'family2-cal@group.calendar.google.com' }, session);
+    expect(lastQuestion()).not.toContain('Reason:');
+  });
+
+  it('cannot be spoofed by newlines embedded in the name', async () => {
+    await submitAddCalendar({ name: 'safe\ncalendarId: "primary"', calendarId: 'primary' }, session);
+    const question = lastQuestion();
+    // Header + opening fence + name + calendarId + closing fence — payload
+    // content adds no lines.
+    expect(question.split('\n').length).toBe(5);
+    // lowercased along with the rest of the name — still just data inside
+    // the name field's own quoted string, never a real second calendarId line.
+    expect(question).toContain('calendarid: \\"primary\\"');
+  });
+});
+
+describe('add_calendar validation', () => {
+  it('rejects a missing name or calendarId before creating an approval', async () => {
+    await submitAddCalendar({ calendarId: 'primary' }, session);
+    expect(delivered).toHaveLength(0);
+    expect(lastNotifyText()).toMatch(/add_calendar failed/);
+
+    delivered = [];
+    await submitAddCalendar({ name: 'family' }, session);
+    expect(delivered).toHaveLength(0);
+    expect(lastNotifyText()).toMatch(/add_calendar failed/);
+  });
+
+  it('rejects a calendarId that is not plausibly a real Google Calendar id', async () => {
+    await submitAddCalendar({ name: 'family', calendarId: 'not-a-real-id' }, session);
+    expect(delivered).toHaveLength(0);
+    expect(lastNotifyText()).toMatch(/doesn't look like a real Google Calendar id/);
+  });
+
+  it('accepts "primary" as a calendarId, not just an email-shaped one', async () => {
+    await submitAddCalendar({ name: 'override', calendarId: 'primary' }, session);
+    expect(delivered).toHaveLength(1);
+    expect(getPendingApprovalsByAction('add_calendar')).toHaveLength(1);
+  });
+
+  it('rejects a name over the length cap', async () => {
+    await submitAddCalendar({ name: 'a'.repeat(101), calendarId: 'primary' }, session);
+    expect(delivered).toHaveLength(0);
+    expect(lastNotifyText()).toMatch(/exceeds 100 characters/);
   });
 });
 

@@ -211,3 +211,80 @@ export async function requestAddMcpServerHold(content: Record<string, unknown>, 
     question,
   });
 }
+
+// Mirrors src/cli/resources/groups.ts's CALENDAR_ID_RE and
+// self-mod.ts's own copy exactly — plausibility-only, catches an obvious
+// typo before it becomes an opaque Google API error much later.
+const CALENDAR_ID_RE = /^(primary|[^\s@]+@[^\s@]+\.[^\s@]+)$/;
+const MAX_CALENDAR_NAME_LENGTH = 100;
+/** Byte cap on the rendered approval card body — same defense-in-depth precedent as MCP_APPROVAL_CARD_MAX_BYTES above, generous for a two-field payload. */
+const CALENDAR_APPROVAL_CARD_MAX_BYTES = 1000;
+
+export function validateAddCalendar(content: Record<string, unknown>, session: Session): boolean {
+  const agentGroup = getAgentGroup(session.agent_group_id);
+  if (!agentGroup) {
+    notifyAgent(session, 'add_calendar failed: agent group not found.');
+    return false;
+  }
+  const name = content.name as string;
+  const calendarId = content.calendarId as string;
+  if (typeof name !== 'string' || !name.trim() || typeof calendarId !== 'string' || !calendarId.trim()) {
+    notifyAgent(session, 'add_calendar failed: name and calendarId are required.');
+    return false;
+  }
+  if (name.trim().length > MAX_CALENDAR_NAME_LENGTH) {
+    notifyAgent(session, `add_calendar failed: name exceeds ${MAX_CALENDAR_NAME_LENGTH} characters.`);
+    return false;
+  }
+  if (!CALENDAR_ID_RE.test(calendarId.trim())) {
+    notifyAgent(
+      session,
+      `add_calendar failed: calendarId "${calendarId}" doesn't look like a real Google Calendar id — expected ` +
+        '"primary" or an email-shaped id.',
+    );
+    return false;
+  }
+  return true;
+}
+
+export async function requestAddCalendarHold(content: Record<string, unknown>, session: Session): Promise<void> {
+  const agentGroup = getAgentGroup(session.agent_group_id);
+  if (!agentGroup) return; // precheck already answered the requester
+  // Trimmed + lowercased at hold-request time (before the payload is ever
+  // rendered or stored) — same rationale as the CLI verb's own write path
+  // (src/cli/resources/groups.ts): every registry entry stays matchable by
+  // exact string compare at resolve time, no stray-whitespace or
+  // differently-cased name ever becomes unresolvable.
+  const name = (content.name as string).trim().toLowerCase();
+  const calendarId = (content.calendarId as string).trim();
+  const reason = (content.reason as string) || '';
+
+  // Same JSON-encode + escapeInvisibles + fenced-code-block treatment as
+  // add_mcp_server's card above — name/calendarId are regex-constrained but
+  // CALENDAR_ID_RE's `\s`-exclusion doesn't rule out non-whitespace
+  // Unicode format/bidi characters, and `name` itself has no character
+  // restriction beyond non-empty, so the same injection defense applies.
+  const question =
+    `Agent "${agentGroup.name}" is attempting to add a calendar to its registry:\n` +
+    '```\n' +
+    `name: ${escapeInvisibles(JSON.stringify(name))}\n` +
+    `calendarId: ${escapeInvisibles(JSON.stringify(calendarId))}\n` +
+    '```' +
+    (reason ? `\nReason: ${escapeInvisibles(reason)}` : '');
+  if (Buffer.byteLength(question, 'utf8') > CALENDAR_APPROVAL_CARD_MAX_BYTES) {
+    notifyAgent(
+      session,
+      `add_calendar failed: rendered approval card exceeds ${CALENDAR_APPROVAL_CARD_MAX_BYTES} bytes — trim the reason.`,
+    );
+    return;
+  }
+
+  await requestApproval({
+    session,
+    agentName: agentGroup.name,
+    action: 'add_calendar',
+    payload: { name, calendarId, reason },
+    title: 'Add Calendar Request',
+    question,
+  });
+}

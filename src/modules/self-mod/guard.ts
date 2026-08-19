@@ -30,3 +30,9 @@ export const selfModAddMcpServer = defineGuardedAction({
   grantActionName: 'add_mcp_server',
   decide: selfModDecide('add_mcp_server'),
 });
+
+export const selfModAddCalendar = defineGuardedAction({
+  action: 'self_mod.add_calendar',
+  grantActionName: 'add_calendar',
+  decide: selfModDecide('add_calendar'),
+});
