@@ -15,7 +15,7 @@ description: >-
   unrelated Google OAuth (never disclose that one).
 metadata:
   author: nanoclaw
-  version: "1.6.0"
+  version: "1.7.0"
 ---
 
 # Calendar
@@ -36,15 +36,40 @@ the same way it reaches Uriel's own.
 - `delete_calendar_event` — cancel/remove an event. Irreversible — always
   requires an explicit confirmation step first, see below.
 
+**If a user names a calendar you don't recognize, try the tool anyway —
+don't assume it doesn't exist and don't refuse from memory.** This
+group's actual calendar set is config-driven (see "More than two
+calendars" below) and can change without you knowing — the only source
+of truth is the tool call itself, which validates the name for real and
+tells you the current full set if it's wrong. Declining or asking "are
+you sure?" before even trying is worse than just calling the tool: a
+real "Unknown calendar" error (with the real list) is more useful to the
+user than your guess about what's configured.
+
+## Household people (names, emails)
+
+Sender identity and guest-email resolution (below) both read from the same
+household people file — its actual path **depends on which group is
+asking**, since each group's memory is isolated:
+
+- The `household` group has it natively, at its own
+  `/workspace/agent/memory/household/people.md`.
+- `dm-with-uriel` and `dm-with-partner` don't have their own copy — they get
+  a **read-only mount** of the same file, at
+  `/workspace/extra/household-shared/people.md`.
+- Check whichever of the two paths actually exists in *your* workspace. If
+  neither does, this group has no way to resolve names to emails — say so
+  rather than guessing.
+
 ## create_calendar_event
 
 - `calendar` (required) — one of this group's configured calendar names
   (at minimum `"uriel"` or `"devorah"`; see "More than two calendars" below
   for any others). Pick based on who the event is actually for, not who's
   asking — an unqualified "my calendar" in the shared household chat must
-  be resolved against the real sender's identity (see
-  `groups/household/memory/household/people.md`), never defaulted to Uriel.
-  If it's genuinely unclear whose calendar is meant, ask — don't guess.
+  be resolved against the real sender's identity (see "Household people"
+  above), never defaulted to Uriel. If it's genuinely unclear whose
+  calendar is meant, ask — don't guess.
 - `title` (required) — event title.
 - `start` / `end` (required) — naive local wall-clock time, no offset or
   `Z`, e.g. `"2026-08-20T15:00:00"`. This is interpreted in this group's own
@@ -67,10 +92,11 @@ the same way it reaches Uriel's own.
   names a guest by first name, nickname, or Hebrew name only (not an
   email) — this group's own memory file records people by whichever name
   form they actually use, not a canonical English first name — resolve it
-  yourself against `groups/household/memory/household/people.md` *before*
-  calling this tool, the same resolve-yourself approach as the
-  sender-identity rule above, never a hardcoded name. (If this group has
-  no such memory file, skip straight to asking for the email.) A clear
+  yourself against the household people file ("Household people" above)
+  *before* calling this tool, the same resolve-yourself approach as the
+  sender-identity rule above, never a hardcoded name. (If neither path
+  exists in this group's workspace, skip straight to asking for the
+  email.) A clear
   single match resolves to that person's known email with no extra turn
   spent. A recognized person with *no* email recorded (this file doesn't
   guarantee one for everyone) — treat the same as no match: ask directly,
