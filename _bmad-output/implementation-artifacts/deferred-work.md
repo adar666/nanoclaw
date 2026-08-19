@@ -1,5 +1,57 @@
 > **Superseded (epic-1 retro action item AI-5):** these items were merged into `_bmad-output/planning-artifacts/architecture/architecture-nanoclaw-v2-2026-08-16/ARCHITECTURE-SPINE.md`'s own Deferred section, which is the single source of truth going forward. Kept here only for the append-only history this file's format assumes.
 
+- source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-4-guest-list-validation.md`
+  summary: SKILL.md's new guest-resolution instructions (and AD-5's pre-existing sender-identity resolution, same pattern) are unfalsifiable persona-level behavioral claims — no eval harness or persona-behavior test exists anywhere in this repo to check whether the agent actually resolves proactively, asks on ambiguity, or asks when unmatched, versus e.g. guessing a plausible-looking (but wrong) email that would still pass the tool's EMAIL_RE shape check silently.
+  evidence: Verification-gap review finding; an inherent limitation of persona-level instructions in this codebase, not something this story introduces or could fix alone — worth a real eval-harness investment if this class of bug ever bites in practice.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-3-calendars-beyond-uriel-and-devorah.md`
+  summary: Concurrent `ncl groups config add-calendar`/`remove-calendar` calls on the same group can lose an update (read-then-write, not transactional) — same class of race as every other `config add-X`/`remove-X` JSON-column CLI verb on this table (mounts, MCP servers, packages), not new to this story.
+  evidence: Edge-case-hunter review finding; pre-existing systemic pattern across the whole `config add-X` family, surfaced incidentally by this story rather than introduced by it.
+- source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-3-calendars-beyond-uriel-and-devorah.md`
+  summary: `configFromDb()`/`presentConfig()`'s `JSON.parse(row.calendar_registry)` (and every other JSON column on that same function) has no try/catch — a hand-corrupted DB row throws uncaught instead of falling back to empty.
+  evidence: Edge-case-hunter review finding; pre-existing pattern across every JSON column on `container_configs`, not unique to `calendar_registry`.
+- source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-3-calendars-beyond-uriel-and-devorah.md`
+  summary: Adding a calendar today is a bare CLI CRUD verb with no restart-reminder automation or on-wake notification — unlike `install_packages`/`add_mcp_server`'s self-mod MCP-tool flow (admin approval → auto image rebuild/restart → on-wake chat notification, `src/modules/self-mod/apply.ts`). An approved `config add-calendar` still requires a human to remember `ncl groups restart`.
+  evidence: Blind-hunter review finding; a real, valuable enhancement (agent-initiated calendar registry changes with the same auto-restart+notify UX as package/MCP-server self-mod) but a separate, bigger feature — extending `self-mod.ts`'s action set — not this story's scope.
+- source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-3-calendars-beyond-uriel-and-devorah.md`
+  summary: `config add-calendar --calendar-id` has no format/plausibility validation (contrast `install_packages`'s explicit apt/npm name regexes) — a typo'd calendar ID surfaces only as an opaque Google API error much later, at call time.
+  evidence: Blind-hunter review finding; consistent with this story's own "no RRULE validation" precedent (spec cal-2.2) and this file's existing "let Google's API be the validator" pattern for description/location — not fixed now.
+- source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-3-calendars-beyond-uriel-and-devorah.md`
+  summary: A duplicate `name` in a hand-edited/corrupted `calendar_registry` JSON array silently lets the last entry win in `resolveCalendarIds()`'s merge, with no diagnostic.
+  evidence: Blind-hunter review finding; low-likelihood (the CLI write path already dedupes by name), not worth defensive read-time validation now.
+- source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-3-calendars-beyond-uriel-and-devorah.md`
+  summary: The built-in `CALENDAR_IDS` constant in `calendar.ts` still hardcodes a real personal email address (`adardevora@gmail.com`) directly in trunk source — pre-existing since Story 1.2, unchanged by this story's own migration-default design (which deliberately avoids adding *more* hardcoded personal data, but doesn't retroactively scrub what was already there).
+  evidence: Blind-hunter review finding; a deliberate call for the repo owner to make (whether/how to move this to per-install config), not something to silently patch mid-story.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-2-recurring-events.md`
+  summary: update_calendar_event silently drops a recurrence argument if one is passed to it (no schema entry, not destructured, no error) rather than rejecting it clearly — there is no way to add/change/remove recurrence on an existing event short of delete-and-recreate.
+  evidence: Blind-hunter review finding; out of this story's scope (spec explicitly said don't touch update_calendar_event), but worth a real decision before someone assumes update supports it.
+- source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-2-recurring-events.md`
+  summary: list_calendar_events' output doesn't indicate whether a listed event is part of a recurring series, even though CalendarEventItem.recurrence/recurringEventId are already read internally.
+  evidence: Blind-hunter review finding; real UX gap, out of this story's scope (list wasn't touched).
+- source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-2-recurring-events.md`
+  summary: The idempotency guard's precheck only brackets the new event's own first-occurrence [startUtc, endUtc] window — a new recurring series' later occurrences are never checked against existing events, so a later occurrence could double-book with no warning.
+  evidence: Edge-case-hunter review finding; spec explicitly said don't touch the idempotency guard's existing exclusion logic for this story, and full recurrence-aware dedup is a materially bigger feature.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-1-idempotency-guard-on-event-creation.md`
+  summary: A zero-duration existing duplicate (start === end === the new event's own start) lands exactly on the pre-check's exclusive `timeMin` bound and would be excluded from the returned page, missing the guard entirely.
+  evidence: Blind-hunter review loop-1 finding; genuinely rare (a real zero-duration Google Calendar event is unusual) and a real fix (padding the window) would slightly change matching semantics, not purely mechanical — worth a deliberate look, not a blind patch.
+- source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-1-idempotency-guard-on-event-creation.md`
+  summary: The idempotency-guard's title match trims leading/trailing whitespace but doesn't collapse internal whitespace ("Team  Sync" vs "Team Sync" won't match).
+  evidence: Blind-hunter review finding; correctly implements the spec's stated "trimmed" rule, but a realistic copy/paste or agent-generated artifact could silently miss the guard.
+- source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-1-idempotency-guard-on-event-creation.md`
+  summary: The duplicate-confirmation card shows only the existing candidate's details, never the new event's own location/description/guests/times, so a user can't compare what they're creating against what's flagged as a likely duplicate.
+  evidence: Blind-hunter review finding; real UX gap, not required by any AC.
+- source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-1-idempotency-guard-on-event-creation.md`
+  summary: Every create_calendar_event call now issues two network round trips (pre-check GET + POST) instead of one, doubling latency/quota for the common no-duplicate case; not surfaced in the tool's user-facing description or flagged for a future opt-out.
+  evidence: Blind-hunter review finding; acceptable at this system's scale (one household), worth revisiting if quota/latency ever becomes a real complaint.
+- source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-1-idempotency-guard-on-event-creation.md`
+  summary: update_calendar_event has no analogous duplicate/collision guard — moving an existing event's start/end to collide with another event bypasses idempotency protection entirely, with no in-code comment pointing this out.
+  evidence: Blind-hunter review finding; out of this story's scope (create-only), not covered by any epic-2 story yet.
+- source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-1-idempotency-guard-on-event-creation.md`
+  summary: defaultConfirmCreation (and the pre-existing defaultConfirmDeletion it mirrors) has no try/catch around askUserQuestion.handler — a thrown rejection (vs. a returned isError) would propagate unhandled instead of surfacing as a clean MCP error.
+  evidence: Edge-case-hunter review finding; pre-existing pattern inherited unchanged from defaultConfirmDeletion, not introduced by this story.
+
 - source_spec: `_bmad-output/implementation-artifacts/spec-1-1-save-a-word-pdf-document-to-memory.md`
   summary: No size limits / decompression-bomb protection on docx unzip or PDF read (whole-file reads, only a 64MB unzip output cap).
   evidence: Blind-hunter review finding; robustness hardening, not blocking for a trusted single-operator use case.

@@ -1,28 +1,32 @@
 ---
 name: calendar
 description: >-
-  Create, read, update, and delete real events on Uriel's or Devorah's
-  Google Calendar via create_calendar_event, list_calendar_events,
+  Create, read, update, and delete real events on this group's configured
+  Google Calendars (at minimum Uriel's and Devorah's; an operator may add
+  more) via create_calendar_event, list_calendar_events,
   update_calendar_event, and delete_calendar_event. Use whenever asked to
   schedule, book, put something on the calendar, check what's coming up,
-  answer "when is X", reschedule/edit an existing event, or cancel/delete
-  one — for either person, not just this agent's own identity. Also covers
-  the OneCLI connect-link flow for a not-yet-connected calendar (delete
-  blocks on its own built-in confirmation — nothing to orchestrate), and
-  the deliberate distinction from second-brain's own, unrelated Google
-  OAuth (never disclose that one).
+  answer "when is X", reschedule/edit an existing event, cancel/delete
+  one, or set up a recurring/repeating event (e.g. a weekly standup) — for
+  any configured calendar, not just this agent's own identity. Also covers
+  the OneCLI connect-link flow for a not-yet-connected calendar (create and
+  delete each block on their own built-in confirmation — nothing to
+  orchestrate), and the deliberate distinction from second-brain's own,
+  unrelated Google OAuth (never disclose that one).
 metadata:
   author: nanoclaw
-  version: "1.2.1"
+  version: "1.6.0"
 ---
 
 # Calendar
 
-Four tools operate on **Uriel's or Devorah's** real Google Calendar. Both
-calendars are reachable through the one Google account this system has
-connected — Devorah's calendar isn't a separate connection, she shares it
-with the connected account (Google Calendar's own sharing feature), so
-every tool reaches it the same way it reaches Uriel's own.
+Four tools operate on **this group's configured calendars** — at minimum
+Uriel's and Devorah's, and possibly more if an operator has added any (see
+"More than two calendars" below). All configured calendars are reachable
+through the one Google account this system has connected — a non-Uriel
+calendar isn't a separate connection, it's shared with the connected
+account (Google Calendar's own sharing feature), so every tool reaches it
+the same way it reaches Uriel's own.
 
 - `create_calendar_event` — schedule something new.
 - `list_calendar_events` — answer "what's on my/their calendar" or
@@ -34,28 +38,77 @@ every tool reaches it the same way it reaches Uriel's own.
 
 ## create_calendar_event
 
-- `calendar` (required) — `"uriel"` or `"devorah"`. Pick based on who the
-  event is actually for, not who's asking — an unqualified "my calendar" in
-  the shared household chat must be resolved against the real sender's
-  identity (see `groups/household/memory/household/people.md`), never
-  defaulted to Uriel. If it's genuinely unclear whose calendar is meant,
-  ask — don't guess.
+- `calendar` (required) — one of this group's configured calendar names
+  (at minimum `"uriel"` or `"devorah"`; see "More than two calendars" below
+  for any others). Pick based on who the event is actually for, not who's
+  asking — an unqualified "my calendar" in the shared household chat must
+  be resolved against the real sender's identity (see
+  `groups/household/memory/household/people.md`), never defaulted to Uriel.
+  If it's genuinely unclear whose calendar is meant, ask — don't guess.
 - `title` (required) — event title.
 - `start` / `end` (required) — naive local wall-clock time, no offset or
   `Z`, e.g. `"2026-08-20T15:00:00"`. This is interpreted in this group's own
   configured timezone — write times the way a person would say them
   ("3pm Wednesday"), not converted to UTC yourself.
 - `description`, `location` (optional).
-- `guests` (optional) — array of email addresses to invite.
+- `recurrence` (optional) — a single RFC5545 `RRULE` line to make this a
+  repeating event, e.g. `"RRULE:FREQ=WEEKLY;BYDAY=TH"` for every Thursday.
+  Omit for a single, one-off event (the default, unchanged behavior). One
+  line only — don't combine it with `EXDATE`/`RDATE` lines, not supported.
+  If `start`'s day doesn't match the rule (e.g. `start` on a Monday with
+  `BYDAY=TH`), Google may shift the actual first occurrence — when relaying
+  the confirmation, translate the raw `RRULE:...` into plain language
+  ("every Thursday") rather than reading it back verbatim. No validation on
+  the shape beyond requiring a string — a malformed RRULE surfaces as a
+  real error from Google, not a client-side check. There is currently no
+  way to add/change/remove recurrence on an *existing* event via
+  `update_calendar_event` — recreate the event instead.
+- `guests` (optional) — array of email addresses to invite. If someone
+  names a guest by first name, nickname, or Hebrew name only (not an
+  email) — this group's own memory file records people by whichever name
+  form they actually use, not a canonical English first name — resolve it
+  yourself against `groups/household/memory/household/people.md` *before*
+  calling this tool, the same resolve-yourself approach as the
+  sender-identity rule above, never a hardcoded name. (If this group has
+  no such memory file, skip straight to asking for the email.) A clear
+  single match resolves to that person's known email with no extra turn
+  spent. A recognized person with *no* email recorded (this file doesn't
+  guarantee one for everyone) — treat the same as no match: ask directly,
+  don't invent one. More than one plausible match: present a numbered
+  candidate list — this is a persona-level judgment call against free
+  text, not the tool-backed candidate list `update_calendar_event`/
+  `delete_calendar_event` build from real Google data elsewhere in this
+  skill, but the same never-guess principle applies. No match at all: ask
+  for the email directly rather than guessing or silently dropping the
+  guest. More than one guest to resolve in one request: resolve each
+  independently, and if more than one needs a question, ask them together
+  in one turn rather than one at a time. Whatever you resolve, relay which
+  email each name mapped to along with the rest of the confirmation (see
+  below) — and remember a real guest invite emails that person, so this
+  isn't a no-consequence guess to get wrong. Only pass this tool a real
+  email address — it validates the shape and rejects anything else with a
+  clear error, which is the floor this behavior sits on top of, not a
+  substitute for resolving proactively. `update_calendar_event` has no
+  `guests` argument at all today — it can't add, change, or remove
+  attendees on an existing event.
 
 A successful call returns the real event's details plus its Google-assigned
 `htmlLink`. Always relay that link and the details actually set back to the
 user — never invent or describe a confirmation of your own; the tool's
 response is the only source of truth for what was actually created.
 
+**May block on a "possible duplicate" confirmation first.** Before creating,
+the tool checks whether a non-recurring event with the same title and start
+time already exists on that calendar, created in roughly the last 10
+minutes — a retried or racing request must not silently double-book. If it
+finds one, it blocks (same yes/no-card mechanism as `delete_calendar_event`)
+asking whether to create anyway or skip. This is one call, not a flow you
+orchestrate — just call the tool; it either creates the event, or shows the
+user the possible duplicate and waits for their answer.
+
 ## list_calendar_events
 
-- `calendar` (required) — same `"uriel"`/`"devorah"` resolution rule as above.
+- `calendar` (required) — same configured-calendar-name resolution rule as above.
 - `from` / `to` (optional) — same naive local wall-clock shape as
   create's `start`/`end`. Omit both for the default window: today through
   7 days out. Give just `from` to shift the window; give both for an exact
@@ -88,8 +141,10 @@ Two ways to target the event to change:
 At least one of `title`, `start`, `end`, `description`, `location` must be
 given — the tool declines if there's nothing to change. Only the field(s)
 given are changed; everything else about the event is left alone (a real
-partial update, not a recreate). This tool never deletes/cancels an event —
-use `delete_calendar_event` for that.
+partial update, not a recreate). No `guests` argument exists here — this
+tool can't add, change, or remove attendees on an existing event; say so
+if asked, rather than silently ignoring the request. This tool never
+deletes/cancels an event — use `delete_calendar_event` for that.
 
 The confirmation reflects what Google's response actually echoes back, not
 just a restatement of the request — relay that, same as `create_calendar_event`.
@@ -111,14 +166,32 @@ resolved event, and either deletes it or doesn't, depending on their
 answer. Relay the result — don't send your own extra "are you sure?"
 message first, the tool's card already is that question.
 
-## Two calendars, either one, from any chat
+## This group's configured calendars, any of them, from any chat
 
 All four tools are reachable from household, dm-with-uriel, or
 dm-with-partner alike — there's no "wrong" chat to ask from, and no need to
-relay/forward a request anywhere. If a request names both people ("check
-mine and Devorah's" / "put it on both calendars"), call the tool once per
-calendar named — never a single combined call, and never silently drop the
-second one.
+relay/forward a request anywhere. If a request names more than one calendar
+("check mine and Devorah's" / "put it on both calendars"), call the tool
+once per calendar named — never a single combined call, and never silently
+drop any of them.
+
+### More than two calendars
+
+Uriel's and Devorah's are the two calendars every install starts with, but
+more can be added — e.g. a shared family calendar — via
+`ncl groups config add-calendar --id <group-id> --name <name> --calendar-id
+<calendar-id>`, followed by a group restart to pick it up. This is
+operator-facing config, not something to run unprompted — but the command
+itself is approval-gated (same access level as `config add-mcp-server`), so
+if a user explicitly asks you to add a calendar, you can request it via
+`ncl` and it will go through the normal approval flow rather than being
+something only a human at a terminal can do. Once added, the
+new name works exactly like `"uriel"`/`"devorah"` in every one of these
+four tools — same resolution, same sharing mechanism, nothing special about
+it being a later addition. If a call names a calendar that doesn't
+resolve (not yet added, or added but the group hasn't been restarted yet),
+the tool declines clearly and lists every calendar name it currently
+recognizes — relay that list rather than guessing which name was meant.
 
 ## Two different Google connections — do not conflate them
 
@@ -149,7 +222,8 @@ for any not-connected app:
 
 Then let the user know you'll retry once they've connected.
 
-If a call targeting Devorah's calendar specifically fails with an access
-error (not a "not connected" link, but a real permission error), the most
-likely cause is she hasn't shared her calendar with the connected account
-yet — say that plainly rather than implying the whole tool is broken.
+If a call targeting a non-Uriel calendar (Devorah's, or any operator-added
+calendar) fails with an access error (not a "not connected" link, but a
+real permission error), the most likely cause is that calendar hasn't been
+shared with the connected account yet — say that plainly rather than
+implying the whole tool is broken.

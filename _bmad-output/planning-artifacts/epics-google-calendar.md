@@ -18,6 +18,10 @@ This document provides the complete epic and story breakdown for **Google Calend
 FR1: A user can ask the agent to create a new event (title, description, location, start/end time, guest emails) on a named calendar (Uriel's or Devorah's), from a natural-language chat request.
 FR2: A user can ask the agent what's on a named calendar for a time range or a specific question ("what's on today/tomorrow/this week", "when is X").
 FR3: A user can ask the agent to change an already-created event's details (time, location, guests, description) on a named calendar. If the target event is ambiguous, the agent presents a numbered candidate list and waits for a pick rather than guessing.
+FR4 (added 2026-08-18, Epic 2 spec revision): A duplicate or retried `create_calendar_event` call must not silently double-book — it declines, dedupes, or asks instead.
+FR5 (added 2026-08-18, Epic 2 spec revision): A user can ask the agent to create a recurring event ("every Thursday at 3pm").
+FR6 (added 2026-08-18, Epic 2 spec revision): A user can reach a calendar beyond Uriel's/Devorah's through the same tools, added via config, not code.
+FR7 (added 2026-08-18, Epic 2 spec revision): A guest named by first name only is checked against household memory automatically.
 
 ### NonFunctional Requirements
 
@@ -47,8 +51,12 @@ NFR6: All calendar writes are triggered by an explicit user chat instruction in 
 - **AD-14** `container/skills/calendar/SKILL.md` explicitly distinguishes "second-brain OAuth" (never disclose a link, existing rule) from "OneCLI Google Calendar app connection" (always disclose `connect_url`, AD-8) — named side by side so the agent can't conflate them.
 - **AD-15** `NODE_EXTRA_CA_CERTS ??= SSL_CERT_FILE` shim closes a real TLS-trust gap in `fetch()`'s CA handling for the gateway's MITM proxy — plus a critical, pre-existing sibling fix (the `nanoclaw` MCP server's spawn `env: {}` → `env: { ...process.env }`, found in the same review round) without which no calendar `fetch()` call could reach the gateway at all.
 - Operational prerequisite (not code, and not blocking): Devorah shares her Google Calendar with the connected account before her calendar is reachable — a one-time action in her own Google Calendar app.
-- Deferred (spine-acknowledged, not built now): no idempotency/duplicate-request guard on `create_calendar_event`; recurring events; calendars beyond Uriel's/Devorah's; automatic guest-list validation against household memory.
+- ~~Deferred (spine-acknowledged, not built now): no idempotency/duplicate-request guard on `create_calendar_event`; recurring events; calendars beyond Uriel's/Devorah's; automatic guest-list validation against household memory.~~ — **superseded 2026-08-18**: spec revised (CAP-4..CAP-7 added), architecture spine extended (AD-16..AD-19). See Epic 2 below.
 - ~~Deletion/cancellation~~ — **built, 2026-08-18**, bounded change (no new story number): `delete_calendar_event`, blocking on a real tool-internal confirmation (an initial `confirm: boolean`-argument design was replaced the same day after a live incident showed the agent could — and did — self-authorize past it; see `ARCHITECTURE-SPINE.md`'s Deferred section). See `SPEC-google-calendar`'s Non-goals section and `calendar.ts`.
+- **AD-16** (added 2026-08-18) Idempotency guard: before `create_calendar_event`'s `POST`, a `GET` bracketed by `timeMin`/`timeMax` checks for an existing event on the same `calendarId` at the same timezone-normalized instant, same title, `created` within 10 minutes, and not itself a recurring series. On a hit, blocks via `askUserQuestion` in-process ("create anyway" vs "skip") — never silently decides. Best-effort, not atomic under true concurrency (logged to spine Deferred).
+- **AD-17** (added 2026-08-18) Recurring events: `create_calendar_event` gains an optional `recurrence` argument (one RFC5545 `RRULE` string), wrapped as `recurrence: [arg]` in the API body (Google requires an array). Same tool, no new dependency. Editing/cancelling a single occurrence stays a non-goal — not yet structurally enforced (spine Deferred flags this for build-stage verification).
+- **AD-18** (added 2026-08-18) Calendars beyond two: the `calendar` argument becomes a DB-backed registry (`name → {calendarId, ownerEmail}`, `container_configs`-style — not a source file, which would need a rebuild). New calendar's owner grants access via the same native-sharing Devorah uses (AD-3). AD-2 revised to point here — `calendar` is no longer a closed `uriel`/`devorah` enum.
+- **AD-19** (added 2026-08-18) Guest auto-validation: every non-email guest token resolves against `groups/household/memory/household/people.md` automatically; ambiguous → numbered candidate list (AD-7 precedent); unmatched → asked directly, blocks rather than proceeding silently. Runs before AD-16's duplicate check; both asks are sequential, never simultaneous, in the same turn.
 
 ### UX Design Requirements
 
@@ -65,6 +73,10 @@ N/A — no UX design contract exists and none is needed. This feature has no UI 
 | NFR4 | CAP-1, CAP-2, CAP-3 | AD-8 |
 | NFR5 | CAP-1, CAP-2, CAP-3 | AD-5, AD-7 |
 | NFR6 | CAP-1, CAP-3 | (no autonomous-write guard needed — every call is a direct, same-turn tool call) |
+| FR4 | CAP-4 | AD-16, AD-13, AD-19 |
+| FR5 | CAP-5 | AD-17, AD-16 |
+| FR6 | CAP-6 | AD-18, AD-2 |
+| FR7 | CAP-7 | AD-19, AD-5, AD-16 |
 
 ## Epic List
 
@@ -72,14 +84,19 @@ N/A — no UX design contract exists and none is needed. This feature has no UI 
 Users can ask the agent to create, read, and update events on either of two Google Calendars (Uriel's, Devorah's) from any of three chat surfaces (household, dm-with-uriel, dm-with-partner) — both reachable through one connected Google account, Devorah's via her own calendar-sharing grant. Also covers Story 1.7 (delete), built later as a bounded change, not a new FR.
 **FRs covered:** FR1, FR2, FR3
 
-### Epic 2: Calendar Hardening & Extensions — backlog
-Story stubs only (idempotency guard, recurring events, calendars beyond Uriel's/Devorah's, automatic guest validation) — no FRs assigned yet, not spec'd. See the epic's own section below.
+### Epic 2: Calendar Hardening & Extensions — ready-for-dev
+Idempotency guard, recurring events, calendars beyond Uriel's/Devorah's, automatic guest validation — spec'd (CAP-4..CAP-7) and architected (AD-16..AD-19). See the epic's own section below.
+**FRs covered:** FR4, FR5, FR6, FR7
 
 ### FR Coverage Map
 
 FR1: Epic 1 - Create a calendar event, on either named calendar
 FR2: Epic 1 - Read/query a calendar's contents
 FR3: Epic 1 - Update an existing event, on either named calendar
+FR4: Epic 2 - Idempotency guard on event creation
+FR5: Epic 2 - Recurring events
+FR6: Epic 2 - Calendars beyond Uriel's and Devorah's
+FR7: Epic 2 - Automatic guest-list validation against household memory
 
 ## Epic 1: Google Calendar Read/Write
 
@@ -190,7 +207,7 @@ Originally: the hardest orchestration case in the epic — relay an update reque
 
 ## Epic 2: Calendar Hardening & Extensions
 
-**Status: backlog** — story stubs only, sourced from this epic's own Deferred list (above) and `SPEC-google-calendar/SPEC.md`'s Non-goals. Not yet spec'd or estimated; pick one and run `bmad-spec` (or hand it to `bmad-build` for a lighter touch) in a fresh session before implementing. None of these block anything already shipped in Epic 1.
+**Status: ready-for-dev** (elaborated 2026-08-18) — spec'd (`SPEC-google-calendar/SPEC.md` CAP-4..CAP-7) and architected (`ARCHITECTURE-SPINE.md` AD-16..AD-19, reviewer-gated: lint clean, web-verified, adversarially reviewed with fixes applied). Story order follows the spine's own dependency shape: idempotency first (touches the same `create_calendar_event` path every other story in this epic also touches), then recurrence, then the registry, then guest validation (lowest-risk, most independent). None of these block anything already shipped in Epic 1.
 
 ### Story 2.1: Idempotency Guard on Event Creation
 
@@ -198,10 +215,27 @@ As a NanoClaw user,
 I want a duplicate or retried `create_calendar_event` call to never double-book the same event,
 So that a retried request (network hiccup, agent retry, two chat surfaces racing) can't silently create two copies of the same meeting.
 
-**Acceptance Criteria (stub — not yet elaborated):**
-- Given a create request that closely matches one already created moments ago on the same calendar, when `create_calendar_event` runs, then it declines, dedupes, or asks — rather than silently creating a second event.
+**Acceptance Criteria:**
 
-Source: `ARCHITECTURE-SPINE.md`'s Deferred section ("No idempotency/`iCalUID` dedup key on `create_calendar_event`").
+**Given** a create request whose `calendarId`, timezone-normalized start instant, and case-insensitive-trimmed title all match an event already on that calendar, `created` within the last 10 minutes
+**When** `create_calendar_event` runs
+**Then** it does not silently `POST` a second event — it calls `askUserQuestion` in-process, offering "create anyway" vs "skip, likely already exists," and only proceeds on an explicit answer (FR4, AD-16)
+
+**Given** the match check compares start times
+**When** two events carry the same local numerals but different `timeZone` values (per AD-13)
+**Then** they are correctly treated as different instants, never false-matched (AD-16, AD-13)
+
+**Given** the candidate event has a `recurrence` field set (i.e. is part of a recurring series)
+**When** the match check runs
+**Then** it is excluded from matching entirely — a recurring series' later occurrence never false-matches a coincidentally same-titled one-off (AD-16, cross-ref AD-17)
+
+**Given** a request also needed AD-19's guest-resolution question
+**When** both AD-19 and AD-16 need to ask something in the same turn
+**Then** AD-19's question resolves first, AD-16's duplicate check runs second — never simultaneously (AD-16 Ordering rule)
+
+**Known limit (not an AC, recorded so it isn't silently assumed fixed):** this check is best-effort, not atomic — two genuinely-concurrent `create_calendar_event` calls can both pass the pre-check before either `POST` lands. No server-side idempotency-key primitive exists to close this fully (spine Deferred).
+
+Source: `ARCHITECTURE-SPINE.md` AD-16; `SPEC-google-calendar/SPEC.md` CAP-4.
 
 ### Story 2.2: Recurring Events
 
@@ -209,10 +243,21 @@ As a NanoClaw user,
 I want to create a recurring event ("every Thursday at 3pm"),
 So that I don't have to ask the agent to create the same event by hand every week.
 
-**Acceptance Criteria (stub):**
-- Given a request naming a recurrence pattern, when the create tool runs, then a real recurring Google Calendar event is created with a correct `RRULE`, confirmed back with the pattern actually set.
+**Acceptance Criteria:**
 
-Source: `SPEC-google-calendar/SPEC.md`'s Non-goals ("Recurring-event creation... single-occurrence events only for v1").
+**Given** a request naming a recurrence pattern ("every Thursday at 3pm")
+**When** `create_calendar_event` runs with a `recurrence` argument (one RFC5545 `RRULE` string, e.g. `RRULE:FREQ=WEEKLY;BYDAY=TH`)
+**Then** the handler wraps it as `recurrence: [recurrenceArg]` in the API request body (Google's `Event.recurrence` is an array of strings, web-verified against `developers.google.com/workspace/calendar/api/v3/reference/events`) and a real recurring event is created, confirmed back with the pattern actually set (FR5, AD-17)
+
+**Given** no recurrence argument is given
+**When** `create_calendar_event` runs
+**Then** behavior is unchanged from Story 1.2 — a single-occurrence event, exactly as before (AD-17 is additive, no regression)
+
+**Given** a recurring series already exists
+**When** a user asks to edit or cancel a single occurrence of it
+**Then** this is out of scope for this story (spec non-goal) — **not yet structurally enforced**; before shipping, confirm whether `list_calendar_events` surfaces individual occurrence `eventId`s (`singleEvents=true` semantics) and, if so, decide explicitly whether `update_calendar_event`/`delete_calendar_event` should refuse them (spine Deferred, flagged from the delete-confirmation precedent — don't repeat that trust-only mistake silently)
+
+Source: `ARCHITECTURE-SPINE.md` AD-17; `SPEC-google-calendar/SPEC.md` CAP-5.
 
 ### Story 2.3: Calendars Beyond Uriel's and Devorah's
 
@@ -220,10 +265,21 @@ As a NanoClaw user,
 I want to reach a third calendar (e.g. a shared family calendar) from the same tools,
 So that the agent isn't hard-limited to exactly two named people.
 
-**Acceptance Criteria (stub):**
-- Given a request naming a calendar outside `{uriel, devorah}`, when any of the four calendar tools runs, then that calendar is reachable the same way, without a code change per newly-added calendar (a config/mapping change is fine).
+**Acceptance Criteria:**
 
-Source: `SPEC-google-calendar/SPEC.md`'s Non-goals ("Calendars other than Uriel's and Devorah's").
+**Given** a calendar registry stored in a new DB table (`container_configs`-style, mirroring `src/db/container-configs.ts` — not a source file, which would need a rebuild)
+**When** an operator adds a `name → {calendarId, ownerEmail}` row for a third calendar
+**Then** all four calendar tools (`create`/`list`/`update`/`delete_calendar_event`) resolve that `calendar` argument value the same way they resolve `uriel`/`devorah`, with no code change (FR6, AD-18)
+
+**Given** the new calendar's owner hasn't shared it yet
+**When** a tool call targets it
+**Then** the same AD-8 not-connected/permissions-error handling applies — a real Google 403 surfaces clearly, not silently mislabeled (AD-18, AD-8)
+
+**Given** existing code/persona text hardcodes `uriel`/`devorah` as the only two valid values (AD-2's original wording)
+**When** this story ships
+**Then** every such reference is updated to reflect the open registry — AD-2 is already marked `[REVISED]` pointing here; sweep `calendar.ts`, `container/skills/calendar/SKILL.md`, and any validation/enum code for the same assumption (AD-18, AD-2)
+
+Source: `ARCHITECTURE-SPINE.md` AD-18 (supersedes AD-2's original closed enum); `SPEC-google-calendar/SPEC.md` CAP-6.
 
 ### Story 2.4: Automatic Guest-List Validation Against Household Memory
 
@@ -231,7 +287,24 @@ As a NanoClaw user,
 I want an unresolved guest named by first name only to be checked against household memory automatically,
 So that I don't have to spell out an email address the agent could already know.
 
-**Acceptance Criteria (stub):**
-- Given a create/update request naming a guest by first name only (not an email), when the tool resolves `guests`, then it looks up `groups/household/memory/household/people.md` automatically, rather than only when the agent already happens to have it in context.
+> **Correction, 2026-08-18** (spec-stage discovery ahead of this story's build — see `ARCHITECTURE-SPINE.md`'s AD-19 revision): `people.md` is free-form prose (mixed Hebrew/English, no fixed schema) — a `calendar.ts` code-level parser would be fragile and break on any hand-edit. AD-5 already established the correct precedent for this exact class of resolution: persona-level, the agent reads its own memory context, never a tool-code parser. This story is therefore a **`container/skills/calendar/SKILL.md`-only change** — the existing `EMAIL_RE`/`validateGuestEmails` in `calendar.ts` already structurally rejects a non-email guest string with a clear error (the "never silently guess" floor); what's missing is an explicit persona instruction to resolve proactively, before the tool call, not only reactively after that rejection.
 
-Source: `ARCHITECTURE-SPINE.md`'s Open Questions ("Whether `create_calendar_event`/`update_calendar_event` should validate a resolved guest list against `groups/household/memory/household/people.md` automatically...").
+**Acceptance Criteria:**
+
+**Given** a create/update request naming a guest by a token that isn't a valid email address (e.g. a first name)
+**When** the agent prepares to call `create_calendar_event`/`update_calendar_event`
+**Then** it looks up `groups/household/memory/household/people.md` itself, proactively, before the call — not only after the tool rejects a bad guest string — and a matched name resolves to its known email with no extra user turn (FR7, AD-19, AD-5)
+
+**Given** more than one household-memory entry plausibly matches the named guest
+**When** the agent resolves it
+**Then** it presents a numbered candidate list and waits for a pick — same disambiguation precedent as AD-7, never guessed (AD-19)
+
+**Given** no household-memory entry matches at all
+**When** the agent resolves it
+**Then** it asks the user for the email directly and blocks rather than silently proceeding without it, or calling the tool with a guess (AD-19)
+
+**Given** the agent forgets or skips this persona instruction and calls the tool with a non-email guest string anyway
+**When** `create_calendar_event`/`update_calendar_event` runs
+**Then** the existing `EMAIL_RE`/`validateGuestEmails` check still rejects it with a clear error — the structural floor holds regardless of persona compliance (unchanged `calendar.ts` behavior, not part of this story's diff)
+
+Source: `ARCHITECTURE-SPINE.md` AD-19 (revised); `SPEC-google-calendar/SPEC.md` CAP-7.

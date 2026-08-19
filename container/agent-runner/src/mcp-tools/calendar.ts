@@ -1,17 +1,20 @@
 /**
- * create_calendar_event / list_calendar_events / update_calendar_event —
- * read and write real events on one of two Google Calendars via direct
- * `fetch()` calls routed through the container's already-injected
- * `HTTPS_PROXY` — no Google API client library (AD-6).
+ * create_calendar_event / list_calendar_events / update_calendar_event /
+ * delete_calendar_event — read and write real events on this group's
+ * configured Google Calendars via direct `fetch()` calls routed through
+ * the container's already-injected `HTTPS_PROXY` — no Google API client
+ * library (AD-6).
  *
  * [2026-08-17 pivot — see ARCHITECTURE-SPINE.md AD-2/AD-3] Google Calendar
  * OAuth in OneCLI is one connection per *project*, not per agent identity —
  * live-verified via `onecli apps get --provider google-calendar` (no
  * per-agent scoping exists in the CLI at all). So there is exactly one
  * connected Google account, and which calendar a call targets is picked by
- * the `calendar` argument (`"uriel"` | `"devorah"`), resolved to a
- * `calendarId` here — never by which container/identity happens to be
- * calling. Devora's calendar is reachable because she shares it with the
+ * the `calendar` argument, resolved to a `calendarId` via `resolveCalendarIds()`
+ * below — **not** a closed `"uriel"`/`"devorah"` set (AD-18, Story 2.3: a
+ * config-driven registry extends it) — never by which container/identity
+ * happens to be calling. Each configured calendar is reachable because its
+ * owner shares it with the
  * connected account (Google Calendar's own sharing, not a second OAuth
  * grant) — the already-granted `calendar.events` scope covers editing
  * events on any calendar the connected account can access, not just its
@@ -28,19 +31,70 @@ import { TIMEZONE, parseZonedToUtc, formatLocalTime } from '../timezone.js';
 import type { McpToolDefinition } from './types.js';
 import { registerTools } from './server.js';
 import { askUserQuestion } from './interactive.js';
+import { getConfig } from '../config.js';
 
 /**
- * The only two calendars in scope (spec non-goal: no others). "uriel" maps
- * to the connected account's own calendar; "devorah" to her calendar,
- * reachable because she shares it with the connected account (AD-3) — not
- * a second OAuth connection. Matches `groups/household/memory/household/
- * people.md`'s recorded email for Devora. Shared by all three tools in this
- * file (create/list/update) — do not duplicate this mapping.
+ * The two built-in calendars (spec cal-2.3: these stay hardcoded defaults,
+ * unchanged behavior, no migration-time personal data). "uriel" maps to the
+ * connected account's own calendar; "devorah" to her calendar, reachable
+ * because she shares it with the connected account (AD-3) — not a second
+ * OAuth connection. Matches `groups/household/memory/household/people.md`'s
+ * recorded email for Devora.
+ *
+ * Do NOT reference this constant directly in a tool handler — call
+ * `resolveCalendarIds()` instead, which merges this with the per-group
+ * config registry (config entries win on a name collision).
  */
 const CALENDAR_IDS: Record<string, string> = {
   uriel: 'primary',
   devorah: 'adardevora@gmail.com',
 };
+
+/**
+ * Exported so tests can substitute the calendar-registry source without
+ * going through a real `loadConfig()` file read (`calendar.test.ts` never
+ * mounts a real `container.json` and calling `getConfig()` there would throw
+ * "Config not loaded") — same testability pattern as `createHooks`/
+ * `deleteHooks` below. Production code never overrides this.
+ */
+export const calendarConfigHooks = {
+  getCalendarRegistry: (): Array<{ name: string; calendarId: string }> => getConfig().calendarRegistry,
+};
+
+/**
+ * Effective calendar name → calendarId map: the built-in `CALENDAR_IDS`
+ * merged with this group's config-driven `calendarRegistry`, config entries
+ * taking precedence on a name collision (spec cal-2.3 — this is what makes
+ * "no code change, ever, for the common case" true).
+ *
+ * Deliberately called INSIDE each handler body, never at module top level or
+ * inside a static `inputSchema` object literal — `getConfig()` throws until
+ * `loadConfig()` has run.
+ *
+ * CORRECTED (live incident, 2026-08-19): this module runs inside the MCP
+ * tools stdio-server subprocess (`mcp-tools/index.ts`), a SEPARATE process
+ * from `index.ts`'s own `main()` — not the same process as originally
+ * assumed here. `main()`'s `loadConfig()` call has no effect in this
+ * process; `mcp-tools/index.ts` now calls `loadConfig()` itself for exactly
+ * this reason. Before that fix, every calendar tool call failed in
+ * production with "Config not loaded" — deterministically, not
+ * intermittently, since this subprocess never populated `_config` at all.
+ */
+function resolveCalendarIds(): Record<string, string> {
+  // Object.create(null) — never a plain {} — so a registry entry named
+  // "__proto__"/"constructor" (however unlikely, a hand-edited/corrupted
+  // row is still possible) can't silently reach Object.prototype instead
+  // of becoming a real own property (review finding).
+  const merged: Record<string, string> = Object.create(null);
+  for (const [name, calendarId] of Object.entries(CALENDAR_IDS)) merged[name] = calendarId;
+  for (const entry of calendarConfigHooks.getCalendarRegistry()) {
+    // An empty calendarId would list the name as "resolvable" (error text
+    // would offer it) yet still fail as "Unknown calendar" when chosen —
+    // skip it instead (review finding).
+    if (entry.calendarId) merged[entry.name] = entry.calendarId;
+  }
+  return merged;
+}
 
 function log(msg: string): void {
   console.error(`[mcp-tools] ${msg}`);
@@ -111,6 +165,12 @@ interface EventBody {
   description?: string;
   location?: string;
   attendees?: Array<{ email: string }>;
+  // Google's actual wire shape is always an array (RFC5545 lines), even
+  // though the tool's own `recurrence` argument is a single RRULE string
+  // (spec cal-2.2) — the handler wraps it as `[recurrence]` when building
+  // this body. Don't widen the input schema to an array to "match" this;
+  // the asymmetry is deliberate (one line is the supported shape for now).
+  recurrence?: string[];
 }
 
 interface EventsInsertResponse {
@@ -121,21 +181,25 @@ interface EventsInsertResponse {
   location?: string;
   description?: string;
   attendees?: Array<{ email?: string }>;
+  recurrence?: string[]; // see EventBody.recurrence's comment — same array-vs-single-string asymmetry
 }
 
 export const createCalendarEvent: McpToolDefinition = {
   tool: {
     name: 'create_calendar_event',
     description:
-      'Create a real event on Uriel\'s or Devora\'s Google Calendar (both reachable through one connected ' +
-      'account — Devora\'s via calendar sharing, not a separate connection).',
+      'Create a real event on one of this group\'s configured Google Calendars (at minimum Uriel\'s and ' +
+      'Devora\'s; an operator may add more) — all reachable through one connected account, each other ' +
+      'calendar via sharing, not a separate connection.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         calendar: {
           type: 'string',
-          enum: ['uriel', 'devorah'],
-          description: 'Which calendar to create the event on.',
+          description:
+            "Which calendar to create the event on — one of this group's resolvable calendar names: the " +
+            'built-in "uriel"/"devorah" plus any names added to this group\'s calendar registry ' +
+            '(`ncl groups config add-calendar`).',
         },
         title: { type: 'string', description: 'Event title/summary.' },
         start: {
@@ -150,6 +214,12 @@ export const createCalendarEvent: McpToolDefinition = {
         },
         description: { type: 'string', description: 'Optional event description.' },
         location: { type: 'string', description: 'Optional event location.' },
+        recurrence: {
+          type: 'string',
+          description:
+            'Optional recurrence rule to make this a repeating event — a single RFC5545 RRULE line, ' +
+            'e.g. "RRULE:FREQ=WEEKLY;BYDAY=TH" for every Thursday. Omit for a single-occurrence event.',
+        },
         guests: {
           type: 'array',
           items: { type: 'string' },
@@ -166,18 +236,23 @@ export const createCalendarEvent: McpToolDefinition = {
     const end = args.end as string | undefined;
     const description = args.description as string | undefined;
     const location = args.location as string | undefined;
+    const recurrence = args.recurrence as string | undefined;
     const guests = args.guests as unknown;
 
-    if (!calendar) return err(`calendar is required — one of: ${Object.keys(CALENDAR_IDS).join(', ')}`);
-    const calendarId = CALENDAR_IDS[calendar];
+    const calendarIds = resolveCalendarIds();
+    if (!calendar) return err(`calendar is required — one of: ${Object.keys(calendarIds).join(', ')}`);
+    const calendarId = calendarIds[calendar];
     if (!calendarId) {
-      return err(`Unknown calendar "${calendar}" — must be one of: ${Object.keys(CALENDAR_IDS).join(', ')}`);
+      return err(`Unknown calendar "${calendar}" — must be one of: ${Object.keys(calendarIds).join(', ')}`);
     }
     if (!title) return err('title is required');
     if (!start) return err('start is required');
     if (!end) return err('end is required');
     if (guests !== undefined && !Array.isArray(guests)) {
       return err('guests must be an array of email address strings');
+    }
+    if (recurrence !== undefined && typeof recurrence !== 'string') {
+      return err('recurrence must be a single RFC5545 RRULE string');
     }
 
     let guestEmails: string[] = [];
@@ -202,8 +277,53 @@ export const createCalendarEvent: McpToolDefinition = {
     };
     if (description) eventBody.description = description;
     if (location) eventBody.location = location;
+    if (recurrence && recurrence.trim()) eventBody.recurrence = [recurrence.trim()];
     if (guestEmails.length > 0) {
       eventBody.attendees = guestEmails.map((email) => ({ email }));
+    }
+
+    // Idempotency guard (spec cal-2.1): a retried/racing call must not
+    // silently double-book. Reuses fetchEvents — same AD-8 gateway-error
+    // handling + 30s timeout as the POST below — bracketed tightly around
+    // this event's own [startUtc, endUtc] window (Design Notes: local JS
+    // match logic, never Google's own unreliable `q` search). Best-effort
+    // only: two genuinely-simultaneous calls can both pass this check
+    // before either POST lands.
+    const precheck = await fetchEvents(calendarId, {
+      timeMinIso: startUtc.toISOString(),
+      timeMaxIso: endUtc.toISOString(),
+      notConnectedAction: 'create the event',
+    });
+    if ('error' in precheck) return precheck.error;
+
+    if (precheck.truncated) {
+      // Best-effort: a duplicate past the returned page's cutoff can be
+      // missed. Logged for diagnosability, not surfaced to the user — the
+      // guard still runs against whatever page was returned.
+      log(
+        `create_calendar_event: pre-check GET truncated (nextPageToken present) for "${title}" on ${calendar}'s calendar — duplicate guard is best-effort`,
+      );
+    }
+
+    const duplicate = findDuplicateCandidate(precheck.events, title, startUtc, new Date(), Boolean(eventBody.recurrence));
+    if (duplicate) {
+      const ageDesc = formatAgeDesc(duplicate.ageMs);
+      // A recurring create has a bigger blast radius than a one-off (an
+      // entire series, not a single event) — say so, since "anyway?" reads
+      // identically for both otherwise (spec cal-2.2 review finding).
+      const recurringNote = eventBody.recurrence ? ' This would create a recurring series, not a single event.' : '';
+      const confirmResult = await createHooks.confirmCreation(
+        `This looks like it might already be on ${calendar}'s calendar — created ${ageDesc}:\n` +
+          `${formatConfirmationSummary(duplicate.event)}\n\nCreate "${title}" anyway?${recurringNote}`,
+      );
+      if ('error' in confirmResult) return confirmResult.error;
+      if (!confirmResult.confirmed) {
+        log(`create_calendar_event: possible duplicate of "${title}" on ${calendar}'s calendar — user skipped`);
+        return ok(
+          `Not created — "${title}" looks like a duplicate of an event already on ${calendar}'s calendar (created ${ageDesc}).`,
+        );
+      }
+      log(`create_calendar_event: possible duplicate of "${title}" on ${calendar}'s calendar — user confirmed create anyway`);
     }
 
     let response: Response;
@@ -263,6 +383,13 @@ export const createCalendarEvent: McpToolDefinition = {
     const confirmedAttendees = event.attendees?.length ? event.attendees : eventBody.attendees;
     const confirmedEmails = confirmedAttendees?.map((a) => a.email).filter((e): e is string => !!e);
     if (confirmedEmails && confirmedEmails.length > 0) lines.push(`Guests: ${confirmedEmails.join(', ')}`);
+    // Same echo-preference as attendees above: Google's own response is the
+    // source of truth for what recurrence was actually set, falling back to
+    // what was sent only if the response happens to omit the field.
+    const confirmedRecurrence = Array.isArray(event.recurrence) && event.recurrence.length ? event.recurrence : eventBody.recurrence;
+    if (confirmedRecurrence && confirmedRecurrence.length > 0) {
+      lines.push(`Recurrence: ${confirmedRecurrence.join(', ')}`);
+    }
     if (event.htmlLink) lines.push(`Link: ${event.htmlLink}`);
 
     log(`create_calendar_event: created "${title}" on ${calendar}'s calendar`);
@@ -289,6 +416,21 @@ interface CalendarEventItem {
   end?: EventTimePoint;
   location?: string;
   description?: string;
+  created?: string;
+  /**
+   * Present only on a *master* recurring event, absent on an expanded
+   * instance. `fetchEvents` sets `singleEvents=true`, so this call path
+   * only ever returns instances — this field alone is a no-op as a
+   * recurring-series exclusion here; see `recurringEventId` below, and
+   * `findDuplicateCandidate`'s guard checks both.
+   */
+  recurrence?: string[];
+  /**
+   * Present on every expanded recurring *instance* (absent on a master).
+   * The realistic field to check given `singleEvents=true` — see the note
+   * on `recurrence` above (spec cal-2.1 review loop 1 correction).
+   */
+  recurringEventId?: string;
 }
 
 interface EventsListApiResponse {
@@ -401,7 +543,7 @@ function formatRangeDesc(timeMin: Date, timeMax: Date): string {
  */
 async function fetchEvents(
   calendarId: string,
-  params: { timeMinIso: string; timeMaxIso: string; q?: string },
+  params: { timeMinIso: string; timeMaxIso: string; q?: string; notConnectedAction?: string },
 ): Promise<{ events: CalendarEventItem[]; truncated: boolean } | { error: CallToolResult }> {
   const url = new URL(eventsUrl(calendarId));
   url.searchParams.set('timeMin', params.timeMinIso);
@@ -430,7 +572,7 @@ async function fetchEvents(
   if (!response.ok) {
     log(`calendar events list: gateway/API returned ${response.status}`);
     const setupUrl = extractSetupUrl(bodyText);
-    if (setupUrl) return { error: err(notConnectedMessage('list events', setupUrl)) };
+    if (setupUrl) return { error: err(notConnectedMessage(params.notConnectedAction ?? 'list events', setupUrl)) };
     return { error: err(`Google Calendar API returned ${response.status}: ${bodyText.slice(0, 500)}`) };
   }
 
@@ -443,6 +585,69 @@ async function fetchEvents(
   }
 
   return { events: parsed.items ?? [], truncated: Boolean(parsed.nextPageToken) };
+}
+
+/** create_calendar_event's idempotency guard (spec cal-2.1): a candidate must have been created within this window to count as a possible duplicate. */
+const DUPLICATE_RECENCY_WINDOW_MS = 10 * 60 * 1000;
+
+/**
+ * Find a pre-check candidate that looks like the same event `create_calendar_event`
+ * is about to create. A match requires: `start.dateTime` resolving to the same
+ * real instant as the new event's own `startUtc` (dateTime always carries its
+ * own offset/Z per the Calendar API, so a plain `Date` comparison is already
+ * timezone-normalized — never a raw string compare, and never fooled by a
+ * candidate sharing the same local numerals but a different `timeZone`) +
+ * case-insensitive-trimmed title match + `created` within the last 10
+ * minutes, with a clock-skew-safe lower bound (a `created` timestamp in
+ * the future yields a negative age, which never matches). A candidate with
+ * no `created` field can't have its recency verified and is never treated
+ * as a match.
+ *
+ * A candidate that's part of a recurring series (a master, carrying
+ * `recurrence`, or an expanded instance, carrying `recurringEventId` —
+ * `fetchEvents` sets `singleEvents=true`, so only instances are ever
+ * returned here) is excluded from matching **only when the new request
+ * itself is a one-off** — that's the case AD-16 originally wrote this
+ * exclusion for: stop an unrelated pre-existing series' occurrence from
+ * false-matching a coincidentally same-titled one-off create. Once AD-17
+ * added `recurrence` as a `create_calendar_event` argument, applying that
+ * same exclusion unconditionally silently defeated the whole guard for the
+ * exact case it exists to catch: a retried/racing *recurring* create would
+ * always find "no duplicate", because every real candidate (the series it
+ * just created) carries `recurringEventId`/`recurrence` and got skipped
+ * regardless of what's being created. Retrospective finding (epic-2,
+ * cross-story boundary pass) — fixed by keying the exclusion on whether
+ * `newRecurrence` is set, not on the candidate alone.
+ */
+function findDuplicateCandidate(
+  events: CalendarEventItem[],
+  title: string,
+  startUtc: Date,
+  now: Date,
+  newRecurrence: boolean,
+): { event: CalendarEventItem; ageMs: number } | undefined {
+  const normalizedTitle = title.trim().toLowerCase();
+  for (const ev of events) {
+    const candidateIsRecurring = Boolean(ev.recurrence || ev.recurringEventId);
+    if (candidateIsRecurring && !newRecurrence) continue; // one-off create — an unrelated series is never a match
+    if (!ev.start?.dateTime) continue; // all-day or malformed — no instant to compare
+    if (new Date(ev.start.dateTime).getTime() !== startUtc.getTime()) continue;
+    if ((ev.summary ?? '').trim().toLowerCase() !== normalizedTitle) continue;
+    if (!ev.created) continue; // can't verify recency — not treated as a match
+    const ageMs = now.getTime() - new Date(ev.created).getTime();
+    // Number.isNaN guards an unparseable `created` string: NaN fails both the
+    // `< 0` and `> window` comparisons, which would otherwise silently pass
+    // the check instead of correctly excluding an unverifiable candidate.
+    if (Number.isNaN(ageMs) || ageMs < 0 || ageMs > DUPLICATE_RECENCY_WINDOW_MS) continue;
+    return { event: ev, ageMs };
+  }
+  return undefined;
+}
+
+/** "created N minute(s) ago" for the confirmation text — states the candidate's actual age, never a hardcoded guess. */
+function formatAgeDesc(ageMs: number): string {
+  const minutes = Math.floor(ageMs / 60_000);
+  return minutes < 1 ? 'less than a minute ago' : `${minutes} minute${minutes === 1 ? '' : 's'} ago`;
 }
 
 /**
@@ -479,16 +684,18 @@ export const listCalendarEvents: McpToolDefinition = {
   tool: {
     name: 'list_calendar_events',
     description:
-      "List real events on Uriel's or Devora's Google Calendar (both reachable through one connected " +
-      'account — Devora\'s via calendar sharing, not a separate connection). Use for "what\'s on my/their ' +
-      'calendar" or "when is X" questions — never answer those from memory or a guess.',
+      "List real events on one of this group's configured Google Calendars (at minimum Uriel's and " +
+      "Devora's; an operator may add more) — all reachable through one connected account. Use for " +
+      '"what\'s on my/their calendar" or "when is X" questions — never answer those from memory or a guess.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         calendar: {
           type: 'string',
-          enum: ['uriel', 'devorah'],
-          description: 'Which calendar to list events from.',
+          description:
+            "Which calendar to list events from — one of this group's resolvable calendar names: the " +
+            'built-in "uriel"/"devorah" plus any names added to this group\'s calendar registry ' +
+            '(`ncl groups config add-calendar`).',
         },
         from: {
           type: 'string',
@@ -514,10 +721,11 @@ export const listCalendarEvents: McpToolDefinition = {
     const to = args.to as string | undefined;
     const query = args.query as string | undefined;
 
-    if (!calendar) return err(`calendar is required — one of: ${Object.keys(CALENDAR_IDS).join(', ')}`);
-    const calendarId = CALENDAR_IDS[calendar];
+    const calendarIds = resolveCalendarIds();
+    if (!calendar) return err(`calendar is required — one of: ${Object.keys(calendarIds).join(', ')}`);
+    const calendarId = calendarIds[calendar];
     if (!calendarId) {
-      return err(`Unknown calendar "${calendar}" — must be one of: ${Object.keys(CALENDAR_IDS).join(', ')}`);
+      return err(`Unknown calendar "${calendar}" — must be one of: ${Object.keys(calendarIds).join(', ')}`);
     }
 
     const result = await searchEvents(calendarId, { query, from, to });
@@ -608,7 +816,8 @@ export const updateCalendarEvent: McpToolDefinition = {
   tool: {
     name: 'update_calendar_event',
     description:
-      "Update a real event on Uriel's or Devora's Google Calendar. Target it either by a known eventId " +
+      "Update a real event on one of this group's configured Google Calendars (at minimum Uriel's and " +
+      "Devora's; an operator may add more). Target it either by a known eventId " +
       '(e.g. from a prior list_calendar_events call) or by eventQuery free-text search. Never deletes/cancels ' +
       'an event — use delete_calendar_event for that.',
     inputSchema: {
@@ -616,8 +825,10 @@ export const updateCalendarEvent: McpToolDefinition = {
       properties: {
         calendar: {
           type: 'string',
-          enum: ['uriel', 'devorah'],
-          description: 'Which calendar the event is on.',
+          description:
+            "Which calendar the event is on — one of this group's resolvable calendar names: the built-in " +
+            '"uriel"/"devorah" plus any names added to this group\'s calendar registry ' +
+            '(`ncl groups config add-calendar`).',
         },
         eventId: {
           type: 'string',
@@ -661,10 +872,11 @@ export const updateCalendarEvent: McpToolDefinition = {
     const description = args.description as string | undefined;
     const location = args.location as string | undefined;
 
-    if (!calendar) return err(`calendar is required — one of: ${Object.keys(CALENDAR_IDS).join(', ')}`);
-    const calendarId = CALENDAR_IDS[calendar];
+    const calendarIds = resolveCalendarIds();
+    if (!calendar) return err(`calendar is required — one of: ${Object.keys(calendarIds).join(', ')}`);
+    const calendarId = calendarIds[calendar];
     if (!calendarId) {
-      return err(`Unknown calendar "${calendar}" — must be one of: ${Object.keys(CALENDAR_IDS).join(', ')}`);
+      return err(`Unknown calendar "${calendar}" — must be one of: ${Object.keys(calendarIds).join(', ')}`);
     }
 
     if (!eventId && !eventQuery) {
@@ -815,7 +1027,7 @@ function formatEventTimeRange24h(start?: EventTimePoint, end?: EventTimePoint): 
  * above — the id showed up verbatim in a real confirmation card).
  */
 function formatConfirmationSummary(ev: CalendarEventItem): string {
-  const title = ev.summary ?? '(no title)';
+  const title = ev.summary?.trim() || '(no title)';
   let line = `${title} — ${formatEventTimeRange24h(ev.start, ev.end)}`;
   if (ev.location) line += ` @ ${ev.location}`;
   return line;
@@ -869,6 +1081,35 @@ async function fetchSingleEvent(
   return { event };
 }
 
+const CONFIRM_CREATE_LABEL = 'Create anyway';
+const SKIP_CREATE_LABEL = 'Skip, likely already exists';
+
+/**
+ * Mirrors defaultConfirmDeletion below exactly (same in-process
+ * askUserQuestion.handler call, same testability seam) — create_calendar_event's
+ * idempotency guard (spec cal-2.1) blocks on a real yes/no card the same way
+ * delete's confirmation does, never a `confirm: boolean` argument the agent
+ * could self-authorize past.
+ */
+async function defaultConfirmCreation(question: string): Promise<{ confirmed: boolean } | { error: CallToolResult }> {
+  const result = await askUserQuestion.handler({
+    title: 'Possible duplicate event',
+    question,
+    options: [CONFIRM_CREATE_LABEL, SKIP_CREATE_LABEL],
+  });
+  if (result.isError) return { error: result };
+  const answer = (result.content[0] as { text?: string } | undefined)?.text;
+  return { confirmed: answer === CONFIRM_CREATE_LABEL };
+}
+
+/**
+ * Exported so tests can substitute the confirmation gate — same rationale
+ * and pattern as deleteHooks below. Production code never overrides this.
+ */
+export const createHooks = {
+  confirmCreation: defaultConfirmCreation,
+};
+
 const CONFIRM_DELETE_LABEL = 'Yes, delete it';
 const CANCEL_DELETE_LABEL = 'No, cancel';
 
@@ -909,7 +1150,8 @@ export const deleteCalendarEvent: McpToolDefinition = {
   tool: {
     name: 'delete_calendar_event',
     description:
-      "Delete a real event from Uriel's or Devora's Google Calendar. This cannot be undone. The tool itself " +
+      "Delete a real event from one of this group's configured Google Calendars (at minimum Uriel's and " +
+      "Devora's; an operator may add more). This cannot be undone. The tool itself " +
       "blocks and asks the user to confirm (a real yes/no card, same mechanism as ask_user_question) before " +
       'issuing the actual delete — there is nothing else to orchestrate, one call resolves the target, gets a ' +
       'real confirmation, and deletes (or does not) in sequence. Target the event either by a known eventId or ' +
@@ -919,8 +1161,10 @@ export const deleteCalendarEvent: McpToolDefinition = {
       properties: {
         calendar: {
           type: 'string',
-          enum: ['uriel', 'devorah'],
-          description: 'Which calendar the event is on.',
+          description:
+            "Which calendar the event is on — one of this group's resolvable calendar names: the built-in " +
+            '"uriel"/"devorah" plus any names added to this group\'s calendar registry ' +
+            '(`ncl groups config add-calendar`).',
         },
         eventId: {
           type: 'string',
@@ -953,10 +1197,11 @@ export const deleteCalendarEvent: McpToolDefinition = {
     const from = args.from as string | undefined;
     const to = args.to as string | undefined;
 
-    if (!calendar) return err(`calendar is required — one of: ${Object.keys(CALENDAR_IDS).join(', ')}`);
-    const calendarId = CALENDAR_IDS[calendar];
+    const calendarIds = resolveCalendarIds();
+    if (!calendar) return err(`calendar is required — one of: ${Object.keys(calendarIds).join(', ')}`);
+    const calendarId = calendarIds[calendar];
     if (!calendarId) {
-      return err(`Unknown calendar "${calendar}" — must be one of: ${Object.keys(CALENDAR_IDS).join(', ')}`);
+      return err(`Unknown calendar "${calendar}" — must be one of: ${Object.keys(calendarIds).join(', ')}`);
     }
 
     if (!eventId && !eventQuery) {

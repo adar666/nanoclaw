@@ -12,7 +12,12 @@ import { TIMEZONE } from './config.js';
 import { configFromDb, resolveGroupTimezone } from './container-config.js';
 import { createAgentGroup } from './db/agent-groups.js';
 import { closeDb, initTestDb } from './db/connection.js';
-import { ensureContainerConfig, getContainerConfig, updateContainerConfigScalars } from './db/container-configs.js';
+import {
+  ensureContainerConfig,
+  getContainerConfig,
+  updateContainerConfigJson,
+  updateContainerConfigScalars,
+} from './db/container-configs.js';
 import { runMigrations } from './db/migrations/index.js';
 import type { AgentGroup } from './types.js';
 
@@ -53,5 +58,21 @@ describe('resolveGroupTimezone', () => {
 
     updateContainerConfigScalars(GROUP.id, { timezone: 'Not/AZone' });
     expect(configFromDb(getContainerConfig(GROUP.id)!, GROUP).timezone).toBeUndefined();
+  });
+
+  /**
+   * Verification-gap review finding (spec cal-2.3): every calendar.ts test
+   * stubs calendarConfigHooks and never exercises the real DB→configFromDb
+   * round trip. This closes the host-side half — the container-side half
+   * (loadConfig() parsing the materialized JSON) is covered separately in
+   * container/agent-runner/src/config.test.ts.
+   */
+  it('configFromDb round-trips calendar_registry verbatim (empty by default, real entries after a write)', () => {
+    expect(configFromDb(getContainerConfig(GROUP.id)!, GROUP).calendarRegistry).toEqual([]);
+
+    const registry = [{ name: 'family', calendarId: 'family-cal@group.calendar.google.com' }];
+    updateContainerConfigJson(GROUP.id, 'calendar_registry', registry);
+
+    expect(configFromDb(getContainerConfig(GROUP.id)!, GROUP).calendarRegistry).toEqual(registry);
   });
 });

@@ -27,6 +27,7 @@ export interface ContainerConfigRow {
   cli_scope: string; // 'disabled' | 'group' | 'global'
   timezone: string | null; // IANA id; NULL = follow the install-global timezone
   idle_timeout_minutes: number | null; // NULL = follow the instance-global absolute ceiling (host-sweep.ts)
+  calendar_registry: string; // JSON: Array<{ name: string; calendarId: string }> — merged with built-in CALENDAR_IDS, config wins on name collision
   updated_at: string;
 }
 

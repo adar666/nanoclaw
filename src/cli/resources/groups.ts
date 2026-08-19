@@ -70,6 +70,7 @@ function presentConfig(row: ContainerConfigRow): Record<string, unknown> {
     cli_scope: row.cli_scope,
     timezone: row.timezone,
     idle_timeout_minutes: row.idle_timeout_minutes,
+    calendar_registry: JSON.parse(row.calendar_registry),
     updated_at: row.updated_at,
   };
 }
@@ -395,6 +396,62 @@ registerResource({
         if (!servers[name]) throw new Error(`MCP server "${name}" not found`);
         delete servers[name];
         updateContainerConfigJson(id, 'mcp_servers', servers);
+
+        return { removed: name };
+      },
+    },
+    'config add-calendar': {
+      access: 'approval',
+      description:
+        "Add (or override) a calendar name in the group's calendar registry — extends the built-in " +
+        '"uriel"/"devorah" set, or overrides one of those names with a different calendarId. Requires ' +
+        '`ncl groups restart` to take effect. Use --id <group-id> --name <name> --calendar-id <calendar-id>.',
+      handler: async (args) => {
+        const id = args.id as string;
+        if (!id) throw new Error('--id is required');
+        // Trimmed + lowercased at write time so a stray-whitespace or
+        // differently-cased --name never silently produces an unresolvable
+        // registry entry — the built-ins ("uriel"/"devorah") are already
+        // lowercase, and this keeps every entry matchable by exact string
+        // compare at resolve time without needing case-insensitive lookup
+        // logic there (review finding).
+        const name = (args.name as string | undefined)?.trim().toLowerCase();
+        if (!name) throw new Error('--name is required');
+        const calendarId = ((args['calendar-id'] ?? args.calendar_id) as string | undefined)?.trim();
+        if (!calendarId) throw new Error('--calendar-id is required');
+
+        const row = getContainerConfig(id);
+        if (!row) throw new Error(`No container config for group: ${id}`);
+
+        const registry = JSON.parse(row.calendar_registry) as Array<{ name: string; calendarId: string }>;
+        const filtered = registry.filter((e) => e.name !== name);
+        filtered.push({ name, calendarId });
+        updateContainerConfigJson(id, 'calendar_registry', filtered);
+
+        return { added: { name, calendarId }, registry: filtered };
+      },
+    },
+    'config remove-calendar': {
+      access: 'approval',
+      description:
+        "Remove a calendar name from the group's calendar registry. Only removes a config-added (or config-" +
+        'overriding) entry — a built-in name ("uriel"/"devorah") with no registry entry keeps working via the ' +
+        'built-in default. Requires `ncl groups restart` to take effect. Use --id <group-id> --name <name>.',
+      handler: async (args) => {
+        const id = args.id as string;
+        if (!id) throw new Error('--id is required');
+        const name = (args.name as string | undefined)?.trim().toLowerCase();
+        if (!name) throw new Error('--name is required');
+
+        const row = getContainerConfig(id);
+        if (!row) throw new Error(`No container config for group: ${id}`);
+
+        const registry = JSON.parse(row.calendar_registry) as Array<{ name: string; calendarId: string }>;
+        if (!registry.some((e) => e.name === name)) {
+          throw new Error(`Calendar "${name}" not found in this group's registry`);
+        }
+        const filtered = registry.filter((e) => e.name !== name);
+        updateContainerConfigJson(id, 'calendar_registry', filtered);
 
         return { removed: name };
       },

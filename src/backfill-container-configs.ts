@@ -67,6 +67,7 @@ export function backfillContainerConfigs(): void {
       cli_scope: 'group',
       timezone: null,
       idle_timeout_minutes: null,
+      calendar_registry: '[]',
       updated_at: new Date().toISOString(),
     };
 
