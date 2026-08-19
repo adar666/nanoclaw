@@ -7,6 +7,7 @@ import {
   deleteCalendarEvent,
   deleteHooks,
   createHooks,
+  updateHooks,
   calendarConfigHooks,
 } from './calendar.js';
 import { TIMEZONE, parseZonedToUtc, formatLocalTime } from '../timezone.js';
@@ -14,6 +15,7 @@ import { TIMEZONE, parseZonedToUtc, formatLocalTime } from '../timezone.js';
 const originalFetch = globalThis.fetch;
 const originalConfirmDeletion = deleteHooks.confirmDeletion;
 const originalConfirmCreation = createHooks.confirmCreation;
+const originalConfirmCollision = updateHooks.confirmCollision;
 
 /**
  * "devorah" is no longer a hardcoded CALENDAR_IDS built-in (deferred-work.md
@@ -48,6 +50,7 @@ afterEach(() => {
   globalThis.fetch = originalFetch;
   deleteHooks.confirmDeletion = originalConfirmDeletion;
   createHooks.confirmCreation = originalConfirmCreation;
+  updateHooks.confirmCollision = originalConfirmCollision;
   calendarConfigHooks.getCalendarRegistry = () => DEFAULT_CALENDAR_REGISTRY;
 });
 
@@ -85,6 +88,17 @@ function stubConfirmCreation(result: { confirmed: boolean } | { error: { content
     return result;
   });
   createHooks.confirmCreation = fn as unknown as typeof createHooks.confirmCreation;
+  return { fn, questions };
+}
+
+/** Mirrors stubConfirmCreation — stubs update_calendar_event's collision-guard confirmation gate. */
+function stubConfirmCollision(result: { confirmed: boolean } | { error: { content: unknown; isError: true } }) {
+  const questions: string[] = [];
+  const fn = mock(async (question: string) => {
+    questions.push(question);
+    return result;
+  });
+  updateHooks.confirmCollision = fn as unknown as typeof updateHooks.confirmCollision;
   return { fn, questions };
 }
 
@@ -1802,6 +1816,121 @@ describe('update_calendar_event MCP tool', () => {
     await updateCalendarEvent.handler({ calendar: 'uriel', eventId: 'evt-1', description: 'New notes' });
     const sentBody = JSON.parse(calls[0].init!.body as string);
     expect(sentBody).toEqual({ description: 'New notes' });
+  });
+
+  describe('collision guard (deferred-work.md finding)', () => {
+    it('runs no collision precheck when only start (no end) is being changed', async () => {
+      const { calls } = stubFetch(200, { summary: 'x' });
+      await updateCalendarEvent.handler({
+        calendar: 'uriel',
+        eventId: 'evt-1',
+        start: '2026-08-20T15:00:00',
+      });
+      // Only the PATCH call — no precheck GET, since there's no resolved
+      // new [start, end] window to check against another event.
+      expect(calls.length).toBe(1);
+      expect(calls[0].init?.method).toBe('PATCH');
+    });
+
+    it('proceeds straight to PATCH, no confirmation, when the precheck window is empty', async () => {
+      const { calls } = stubFetchSequence([PRECHECK_EMPTY, { status: 200, body: { summary: 'x' } }]);
+      const result = await updateCalendarEvent.handler({
+        calendar: 'uriel',
+        eventId: 'evt-1',
+        start: '2026-08-20T15:00:00',
+        end: '2026-08-20T16:00:00',
+      });
+      expect(result.isError).toBeFalsy();
+      expect(calls.length).toBe(2);
+      expect(calls[1].init?.method).toBe('PATCH');
+    });
+
+    it('proceeds straight to PATCH, no confirmation, when the only precheck result is the event being moved itself', async () => {
+      const { calls } = stubFetchSequence([
+        { status: 200, body: { items: [{ id: 'evt-1', summary: 'x', start: { dateTime: '2026-08-20T15:00:00Z' } }] } },
+        { status: 200, body: { summary: 'x' } },
+      ]);
+      const result = await updateCalendarEvent.handler({
+        calendar: 'uriel',
+        eventId: 'evt-1',
+        start: '2026-08-20T15:00:00',
+        end: '2026-08-20T16:00:00',
+      });
+      expect(result.isError).toBeFalsy();
+      expect(calls.length).toBe(2);
+      expect(calls[1].init?.method).toBe('PATCH');
+    });
+
+    it('blocks on a real confirmation when the new window overlaps a different event, then PATCHes on confirm', async () => {
+      const { calls } = stubFetchSequence([
+        {
+          status: 200,
+          body: {
+            items: [
+              { id: 'evt-other', summary: 'Existing meeting', start: { dateTime: '2026-08-20T15:30:00Z' } },
+            ],
+          },
+        },
+        { status: 200, body: { summary: 'x' } },
+      ]);
+      const { fn: confirmFn, questions } = stubConfirmCollision({ confirmed: true });
+
+      const result = await updateCalendarEvent.handler({
+        calendar: 'uriel',
+        eventId: 'evt-1',
+        start: '2026-08-20T15:00:00',
+        end: '2026-08-20T16:00:00',
+      });
+
+      expect(confirmFn).toHaveBeenCalledTimes(1);
+      expect(questions[0]).toContain('Existing meeting');
+      expect(questions[0]).toContain('overlap');
+      expect(result.isError).toBeFalsy();
+      expect(calls.length).toBe(2);
+      expect(calls[1].init?.method).toBe('PATCH');
+    });
+
+    it('does not PATCH when the user declines the collision confirmation', async () => {
+      const { calls } = stubFetchSequence([
+        {
+          status: 200,
+          body: { items: [{ id: 'evt-other', summary: 'Existing meeting', start: { dateTime: '2026-08-20T15:30:00Z' } }] },
+        },
+      ]);
+      stubConfirmCollision({ confirmed: false });
+
+      const result = await updateCalendarEvent.handler({
+        calendar: 'uriel',
+        eventId: 'evt-1',
+        start: '2026-08-20T15:00:00',
+        end: '2026-08-20T16:00:00',
+      });
+
+      expect(result.isError).toBeFalsy();
+      const text = (result.content[0] as { text: string }).text;
+      expect(text).toContain('Not updated');
+      expect(text).toContain('Existing meeting');
+      // Only the one precheck GET — never a second (PATCH) call.
+      expect(calls.length).toBe(1);
+    });
+
+    it('surfaces a clean error when the collision precheck itself fails, no PATCH attempted', async () => {
+      const fn = mock(async () => {
+        throw new Error('network unreachable');
+      });
+      globalThis.fetch = fn as unknown as typeof fetch;
+
+      const result = await updateCalendarEvent.handler({
+        calendar: 'uriel',
+        eventId: 'evt-1',
+        start: '2026-08-20T15:00:00',
+        end: '2026-08-20T16:00:00',
+      });
+
+      expect(result.isError).toBe(true);
+      expect((result.content[0] as { text: string }).text).toContain('network unreachable');
+      expect(fn).toHaveBeenCalledTimes(1); // precheck only — PATCH never attempted
+    });
   });
 });
 

@@ -674,6 +674,27 @@ function formatAgeDesc(ageMs: number): string {
 }
 
 /**
+ * update_calendar_event's own collision guard (deferred-work.md finding,
+ * resolved 2026-08-19): create_calendar_event has had an idempotency guard
+ * since spec cal-2.1, but moving an *existing* event's start/end to overlap
+ * another event bypassed it entirely — nothing checked the new window at
+ * all. `fetchEvents` with timeMin/timeMax already returns only events
+ * overlapping that window (Google's own semantics, not something computed
+ * here), so this only has to exclude the event being moved from its own
+ * result set — any other candidate left is a real overlap, no separate
+ * overlap-math needed. Deliberately not reusing `findDuplicateCandidate`:
+ * that function's whole job is "is this the SAME event, retried" (title +
+ * exact instant + recent `created`); this one's job is "does the NEW time
+ * hit something ELSE" — a different question with a much simpler answer.
+ */
+function findCollisionCandidate(
+  events: CalendarEventItem[],
+  targetEventId: string,
+): CalendarEventItem | undefined {
+  return events.find((ev) => ev.id !== targetEventId);
+}
+
+/**
  * Shared search entry point — resolves the from/to window then calls
  * fetchEvents. Both `list_calendar_events` and `update_calendar_event`'s
  * eventQuery disambiguation path call this; neither duplicates the window
@@ -959,6 +980,35 @@ export const updateCalendarEvent: McpToolDefinition = {
     if ('response' in resolved) return resolved.response;
     const targetEventId = resolved.event.id;
 
+    // Collision guard (deferred-work.md finding): only runs when BOTH
+    // start and end are being set this call — a single-sided time change
+    // (e.g. start only) has no resolved new window to check against
+    // another event, same "don't fetch-then-resend" boundary the rest of
+    // this handler already respects (see the endUtc<=startUtc check above).
+    if (startUtc && endUtc) {
+      const collisionPrecheck = await fetchEvents(calendarId, {
+        timeMinIso: startUtc.toISOString(),
+        timeMaxIso: endUtc.toISOString(),
+        notConnectedAction: 'update the event',
+      });
+      if ('error' in collisionPrecheck) return collisionPrecheck.error;
+      const collision = findCollisionCandidate(collisionPrecheck.events, targetEventId);
+      if (collision) {
+        const confirmResult = await updateHooks.confirmCollision(
+          `Moving this event to ${formatEventTimeRange24h({ dateTime: startUtc.toISOString(), timeZone: TIMEZONE }, { dateTime: endUtc.toISOString(), timeZone: TIMEZONE })} on ${calendar}'s calendar would overlap with:\n` +
+            `${formatConfirmationSummary(collision)}\n\nMove it anyway?`,
+        );
+        if ('error' in confirmResult) return confirmResult.error;
+        if (!confirmResult.confirmed) {
+          log(`update_calendar_event: possible collision on ${calendar}'s calendar — user cancelled the move`);
+          return ok(
+            `Not updated — the new time overlaps with "${collision.summary?.trim() || '(no title)'}" on ${calendar}'s calendar.`,
+          );
+        }
+        log(`update_calendar_event: possible collision on ${calendar}'s calendar — user confirmed move anyway`);
+      }
+    }
+
     // `!== undefined`, not truthy — see the "nothing to update" gate above:
     // an explicit '' is a real value (clear this field) and must reach
     // Google, not be silently dropped from the PATCH body.
@@ -1150,6 +1200,40 @@ async function defaultConfirmCreation(question: string): Promise<{ confirmed: bo
  */
 export const createHooks = {
   confirmCreation: defaultConfirmCreation,
+};
+
+const CONFIRM_MOVE_LABEL = 'Move anyway';
+const CANCEL_MOVE_LABEL = "Don't move it";
+
+/**
+ * update_calendar_event's own collision guard (deferred-work.md finding,
+ * resolved 2026-08-19) — same in-process blocking-confirmation mechanism as
+ * defaultConfirmCreation/defaultConfirmDeletion above, own title/labels
+ * since "move onto another event's slot" isn't "possible duplicate."
+ */
+async function defaultConfirmCollision(question: string): Promise<{ confirmed: boolean } | { error: CallToolResult }> {
+  let result: CallToolResult;
+  try {
+    result = await askUserQuestion.handler({
+      title: 'Possible scheduling collision',
+      question,
+      options: [CONFIRM_MOVE_LABEL, CANCEL_MOVE_LABEL],
+    });
+  } catch (e) {
+    return { error: err(`Could not ask for confirmation: ${e instanceof Error ? e.message : String(e)}`) };
+  }
+  if (result.isError) return { error: result };
+  const answer = (result.content[0] as { text?: string } | undefined)?.text;
+  return { confirmed: answer === CONFIRM_MOVE_LABEL };
+}
+
+/**
+ * Exported so tests can substitute the confirmation gate — same rationale
+ * and pattern as createHooks/deleteHooks. Production code never overrides
+ * this.
+ */
+export const updateHooks = {
+  confirmCollision: defaultConfirmCollision,
 };
 
 const CONFIRM_DELETE_LABEL = 'Yes, delete it';

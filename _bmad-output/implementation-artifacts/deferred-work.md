@@ -54,6 +54,7 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-1-idempotency-guard-on-event-creation.md`
   summary: update_calendar_event has no analogous duplicate/collision guard — moving an existing event's start/end to collide with another event bypasses idempotency protection entirely, with no in-code comment pointing this out.
   evidence: Blind-hunter review finding; out of this story's scope (create-only), not covered by any epic-2 story yet.
+  resolved: 2026-08-19 — `update_calendar_event` now runs a collision precheck whenever both `start` and `end` are given (a resolved new window exists to check), and blocks on a real yes/no confirmation (`updateHooks.confirmCollision`, same in-process mechanism as create's duplicate guard and delete's confirmation) if the new window overlaps a different event. A single-sided time change still skips the check — no resolved new window to compare, same partial-PATCH boundary as before. 6 new regression tests. `container/agent-runner/src/mcp-tools/calendar.ts`, `container/skills/calendar/SKILL.md` (v1.9.0).
 - source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-1-idempotency-guard-on-event-creation.md`
   summary: defaultConfirmCreation (and the pre-existing defaultConfirmDeletion it mirrors) has no try/catch around askUserQuestion.handler — a thrown rejection (vs. a returned isError) would propagate unhandled instead of surfacing as a clean MCP error.
   evidence: Edge-case-hunter review finding; pre-existing pattern inherited unchanged from defaultConfirmDeletion, not introduced by this story.

@@ -15,7 +15,7 @@ description: >-
   unrelated Google OAuth (never disclose that one).
 metadata:
   author: nanoclaw
-  version: "1.8.0"
+  version: "1.9.0"
 ---
 
 # Calendar
@@ -174,6 +174,16 @@ deletes/cancels an event — use `delete_calendar_event` for that.
 
 The confirmation reflects what Google's response actually echoes back, not
 just a restatement of the request — relay that, same as `create_calendar_event`.
+
+If both `start` and `end` are given (moving the event to a new time), the
+tool checks whether that new window overlaps another event already on the
+same calendar. If it does, the tool itself blocks and asks the user to
+confirm — a real yes/no card, same mechanism as `delete_calendar_event`'s
+confirmation — before actually moving it. Just call `update_calendar_event`
+as usual; relay the result either way, don't pre-empt it with your own
+"heads up, that might conflict" message. A single-sided time change (only
+`start` or only `end`, not both) skips this check — there's no new resolved
+window to compare against.
 
 ## delete_calendar_event
 
