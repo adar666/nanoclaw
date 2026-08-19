@@ -7,6 +7,7 @@ on:
 jobs:
   ci:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -35,7 +36,19 @@ jobs:
         run: pnpm exec vitest run
 
       - name: Install LibreOffice (for .doc conversion tests)
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libreoffice-writer
+        timeout-minutes: 8
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          for attempt in 1 2; do
+            if sudo apt-get update && sudo apt-get install -y --no-install-recommends libreoffice-writer; then
+              exit 0
+            fi
+            echo "apt attempt $attempt failed, retrying..." >&2
+            sleep 5
+          done
+          echo "apt-get install failed after 2 attempts" >&2
+          exit 1
 
       - name: Container tests
         working-directory: container/agent-runner
