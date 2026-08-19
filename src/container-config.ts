@@ -81,10 +81,7 @@ function safeJsonParse<T>(raw: string, fallback: T, column: string, agentGroupId
 /** Build a `ContainerConfig` from a DB row + agent group identity. */
 export function configFromDb(row: ContainerConfigRow, group: AgentGroup): ContainerConfig {
   return {
-    mcpServers: safeJsonParse(row.mcp_servers, {}, 'mcp_servers', group.id) as Record<
-      string,
-      McpServerConfig
-    >,
+    mcpServers: safeJsonParse(row.mcp_servers, {}, 'mcp_servers', group.id) as Record<string, McpServerConfig>,
     packages: {
       apt: safeJsonParse(row.packages_apt, [], 'packages_apt', group.id) as string[],
       npm: safeJsonParse(row.packages_npm, [], 'packages_npm', group.id) as string[],

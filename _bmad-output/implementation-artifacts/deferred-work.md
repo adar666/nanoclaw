@@ -17,6 +17,7 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-3-calendars-beyond-uriel-and-devorah.md`
   summary: `config add-calendar --calendar-id` has no format/plausibility validation (contrast `install_packages`'s explicit apt/npm name regexes) — a typo'd calendar ID surfaces only as an opaque Google API error much later, at call time.
   evidence: Blind-hunter review finding; consistent with this story's own "no RRULE validation" precedent (spec cal-2.2) and this file's existing "let Google's API be the validator" pattern for description/location — not fixed now.
+  resolved: 2026-08-19 — `config add-calendar` now rejects a `--calendar-id` that doesn't match `CALENDAR_ID_RE` ("primary" or an email-shaped id), mirroring `install_packages`' plausibility-only precedent. `src/cli/resources/groups.ts`.
 - source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-3-calendars-beyond-uriel-and-devorah.md`
   summary: A duplicate `name` in a hand-edited/corrupted `calendar_registry` JSON array silently lets the last entry win in `resolveCalendarIds()`'s merge, with no diagnostic.
   evidence: Blind-hunter review finding; low-likelihood (the CLI write path already dedupes by name), not worth defensive read-time validation now.
@@ -28,6 +29,7 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-2-recurring-events.md`
   summary: update_calendar_event silently drops a recurrence argument if one is passed to it (no schema entry, not destructured, no error) rather than rejecting it clearly — there is no way to add/change/remove recurrence on an existing event short of delete-and-recreate.
   evidence: Blind-hunter review finding; out of this story's scope (spec explicitly said don't touch update_calendar_event), but worth a real decision before someone assumes update supports it.
+  resolved: 2026-08-19 — `update_calendar_event` now explicitly rejects a `recurrence` argument with a clear message (delete-and-recreate instead), rather than silently ignoring it. `container/agent-runner/src/mcp-tools/calendar.ts`.
 - source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-2-recurring-events.md`
   summary: list_calendar_events' output doesn't indicate whether a listed event is part of a recurring series, even though CalendarEventItem.recurrence/recurringEventId are already read internally.
   evidence: Blind-hunter review finding; real UX gap, out of this story's scope (list wasn't touched).

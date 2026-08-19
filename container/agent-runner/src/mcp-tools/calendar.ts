@@ -888,6 +888,17 @@ export const updateCalendarEvent: McpToolDefinition = {
     const description = args.description as string | undefined;
     const location = args.location as string | undefined;
 
+    // Not in this tool's schema — recurrence is create-time only (see
+    // create_calendar_event). A caller passing it anyway would otherwise be
+    // silently ignored (deferred-work.md finding); reject clearly instead so
+    // no one assumes update_calendar_event can add/change/remove recurrence.
+    if (args.recurrence !== undefined) {
+      return err(
+        'update_calendar_event cannot add, change, or remove recurrence on an existing event — delete and ' +
+          're-create it with create_calendar_event instead.',
+      );
+    }
+
     const calendarIds = resolveCalendarIds();
     if (!calendar) return err(`calendar is required — one of: ${Object.keys(calendarIds).join(', ')}`);
     const calendarId = calendarIds[calendar];

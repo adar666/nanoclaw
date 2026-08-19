@@ -53,6 +53,15 @@ function parseIdleTimeoutFlag(value: unknown): number | null | undefined {
   return minutes;
 }
 
+// A real Google Calendar id is either the literal "primary" or an
+// email-shaped string (a person's calendar, or a generated
+// "...@group.calendar.google.com" id) — this is plausibility-only, matching
+// install_packages' own "let the real API be the final validator" pattern
+// (self-mod.ts's APT_RE/NPM_RE): it catches an obvious typo before it
+// silently becomes an opaque Google API error much later, at call time
+// (deferred-work.md finding), without trying to fully validate the format.
+const CALENDAR_ID_RE = /^(primary|[^\s@]+@[^\s@]+\.[^\s@]+)$/;
+
 /**
  * Parse a `container_configs` JSON column for display, falling back to
  * `fallback` (and logging) on a hand-corrupted row instead of throwing
@@ -440,6 +449,12 @@ registerResource({
         if (!name) throw new Error('--name is required');
         const calendarId = ((args['calendar-id'] ?? args.calendar_id) as string | undefined)?.trim();
         if (!calendarId) throw new Error('--calendar-id is required');
+        if (!CALENDAR_ID_RE.test(calendarId)) {
+          throw new Error(
+            `--calendar-id "${calendarId}" doesn't look like a real Google Calendar id — expected "primary" or ` +
+              'an email-shaped id (e.g. "user@gmail.com" or "...@group.calendar.google.com")',
+          );
+        }
 
         const row = getContainerConfig(id);
         if (!row) throw new Error(`No container config for group: ${id}`);

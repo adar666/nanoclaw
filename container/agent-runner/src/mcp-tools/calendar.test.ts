@@ -1414,6 +1414,22 @@ describe('update_calendar_event MCP tool', () => {
     expect(fn).not.toHaveBeenCalled();
   });
 
+  it('declines a recurrence argument with a clear message, no fetch attempted', async () => {
+    // update_calendar_event has no recurrence support (create-time only) —
+    // an agent passing it anyway must get a clear rejection, not have it
+    // silently ignored (deferred-work.md finding).
+    const fn = stubFetchThrows();
+    const result = await updateCalendarEvent.handler({
+      calendar: 'uriel',
+      eventId: 'evt-1',
+      title: 'x',
+      recurrence: ['RRULE:FREQ=WEEKLY'],
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('cannot add, change, or remove recurrence');
+    expect(fn).not.toHaveBeenCalled();
+  });
+
   it('declines when neither eventId nor eventQuery is given, no fetch attempted', async () => {
     const fn = stubFetchThrows();
     const result = await updateCalendarEvent.handler({ calendar: 'uriel', title: 'New title' });

@@ -400,4 +400,30 @@ describe('groups config add-calendar / remove-calendar', () => {
     );
     expect(noCalendarId.ok).toBe(false);
   });
+
+  it('add-calendar rejects a --calendar-id that is not plausibly a real Google Calendar id', async () => {
+    const GID = 'ag-cal-implausible';
+    createAgentGroup({ id: GID, name: 'c', folder: 'c', agent_provider: null, created_at: now() });
+    ensureContainerConfig(GID);
+
+    const result = await dispatch(
+      {
+        id: 'r1',
+        command: 'groups-config-add-calendar',
+        args: { id: GID, name: 'family', 'calendar-id': 'not-a-real-id' },
+      },
+      { caller: 'host' },
+    );
+    expect(result.ok).toBe(false);
+    expect((result as { ok: false; error: { message: string } }).error.message).toMatch(
+      /doesn't look like a real Google Calendar id/,
+    );
+
+    // "primary" is the one non-email-shaped id that's real — must still work.
+    const primary = await dispatch(
+      { id: 'r2', command: 'groups-config-add-calendar', args: { id: GID, name: 'family', 'calendar-id': 'primary' } },
+      { caller: 'host' },
+    );
+    expect(primary.ok).toBe(true);
+  });
 });
