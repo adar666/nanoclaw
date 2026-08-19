@@ -15,6 +15,7 @@ import {
 import { initGroupFilesystem } from '../../group-init.js';
 import { createAgentFromTemplate } from '../../templates/create-agent.js';
 import { isValidTimezone } from '../../timezone.js';
+import { log } from '../../log.js';
 import type { AgentGroup, ContainerConfigRow } from '../../types.js';
 import { registerResource } from '../crud.js';
 
@@ -52,8 +53,28 @@ function parseIdleTimeoutFlag(value: unknown): number | null | undefined {
   return minutes;
 }
 
+/**
+ * Parse a `container_configs` JSON column for display, falling back to
+ * `fallback` (and logging) on a hand-corrupted row instead of throwing
+ * uncaught (deferred-work.md finding — pre-existing across every JSON
+ * column here).
+ */
+function safeJsonParse<T>(raw: string, fallback: T, column: string, agentGroupId: string): T {
+  try {
+    return JSON.parse(raw) as T;
+  } catch (e) {
+    log.warn('container_configs: unparseable JSON column, using fallback', {
+      column,
+      agentGroupId,
+      err: e instanceof Error ? e.message : String(e),
+    });
+    return fallback;
+  }
+}
+
 /** Deserialize JSON columns for display. */
 function presentConfig(row: ContainerConfigRow): Record<string, unknown> {
+  const id = row.agent_group_id;
   return {
     agent_group_id: row.agent_group_id,
     provider: row.provider,
@@ -62,15 +83,15 @@ function presentConfig(row: ContainerConfigRow): Record<string, unknown> {
     image_tag: row.image_tag,
     assistant_name: row.assistant_name,
     max_messages_per_prompt: row.max_messages_per_prompt,
-    skills: JSON.parse(row.skills),
-    mcp_servers: JSON.parse(row.mcp_servers),
-    packages_apt: JSON.parse(row.packages_apt),
-    packages_npm: JSON.parse(row.packages_npm),
-    additional_mounts: JSON.parse(row.additional_mounts),
+    skills: safeJsonParse(row.skills, [], 'skills', id),
+    mcp_servers: safeJsonParse(row.mcp_servers, {}, 'mcp_servers', id),
+    packages_apt: safeJsonParse(row.packages_apt, [], 'packages_apt', id),
+    packages_npm: safeJsonParse(row.packages_npm, [], 'packages_npm', id),
+    additional_mounts: safeJsonParse(row.additional_mounts, [], 'additional_mounts', id),
     cli_scope: row.cli_scope,
     timezone: row.timezone,
     idle_timeout_minutes: row.idle_timeout_minutes,
-    calendar_registry: JSON.parse(row.calendar_registry),
+    calendar_registry: safeJsonParse(row.calendar_registry, [], 'calendar_registry', id),
     updated_at: row.updated_at,
   };
 }

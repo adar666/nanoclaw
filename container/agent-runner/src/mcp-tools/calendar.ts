@@ -87,11 +87,23 @@ function resolveCalendarIds(): Record<string, string> {
   // of becoming a real own property (review finding).
   const merged: Record<string, string> = Object.create(null);
   for (const [name, calendarId] of Object.entries(CALENDAR_IDS)) merged[name] = calendarId;
+  const seenRegistryNames = new Set<string>();
   for (const entry of calendarConfigHooks.getCalendarRegistry()) {
     // An empty calendarId would list the name as "resolvable" (error text
     // would offer it) yet still fail as "Unknown calendar" when chosen —
     // skip it instead (review finding).
-    if (entry.calendarId) merged[entry.name] = entry.calendarId;
+    if (!entry.calendarId) continue;
+    // A name colliding with a built-in (uriel/devorah) is the intended
+    // override, not a duplicate — only warn when two REGISTRY entries share
+    // a name (hand-edited/corrupted registry; the CLI write path already
+    // dedupes by name, so this shouldn't happen via normal use). Otherwise
+    // the last entry silently wins with no diagnostic (deferred-work.md
+    // finding).
+    if (seenRegistryNames.has(entry.name)) {
+      log(`calendar registry: duplicate name "${entry.name}" — using the later entry (${entry.calendarId})`);
+    }
+    seenRegistryNames.add(entry.name);
+    merged[entry.name] = entry.calendarId;
   }
   return merged;
 }
@@ -626,13 +638,17 @@ function findDuplicateCandidate(
   now: Date,
   newRecurrence: boolean,
 ): { event: CalendarEventItem; ageMs: number } | undefined {
-  const normalizedTitle = title.trim().toLowerCase();
+  // Collapses internal whitespace too, not just leading/trailing — a
+  // realistic copy/paste or agent-generated "Team  Sync" (double space)
+  // must still match "Team Sync" (deferred-work.md finding).
+  const normalizeTitle = (s: string) => s.trim().toLowerCase().replace(/\s+/g, ' ');
+  const normalizedTitle = normalizeTitle(title);
   for (const ev of events) {
     const candidateIsRecurring = Boolean(ev.recurrence || ev.recurringEventId);
     if (candidateIsRecurring && !newRecurrence) continue; // one-off create — an unrelated series is never a match
     if (!ev.start?.dateTime) continue; // all-day or malformed — no instant to compare
     if (new Date(ev.start.dateTime).getTime() !== startUtc.getTime()) continue;
-    if ((ev.summary ?? '').trim().toLowerCase() !== normalizedTitle) continue;
+    if (normalizeTitle(ev.summary ?? '') !== normalizedTitle) continue;
     if (!ev.created) continue; // can't verify recency — not treated as a match
     const ageMs = now.getTime() - new Date(ev.created).getTime();
     // Number.isNaN guards an unparseable `created` string: NaN fails both the
@@ -1092,11 +1108,19 @@ const SKIP_CREATE_LABEL = 'Skip, likely already exists';
  * could self-authorize past.
  */
 async function defaultConfirmCreation(question: string): Promise<{ confirmed: boolean } | { error: CallToolResult }> {
-  const result = await askUserQuestion.handler({
-    title: 'Possible duplicate event',
-    question,
-    options: [CONFIRM_CREATE_LABEL, SKIP_CREATE_LABEL],
-  });
+  let result: CallToolResult;
+  try {
+    result = await askUserQuestion.handler({
+      title: 'Possible duplicate event',
+      question,
+      options: [CONFIRM_CREATE_LABEL, SKIP_CREATE_LABEL],
+    });
+  } catch (e) {
+    // A thrown rejection (vs. a returned isError) would otherwise propagate
+    // unhandled instead of surfacing as a clean MCP error (deferred-work.md
+    // finding — same fix applied to defaultConfirmDeletion below).
+    return { error: err(`Could not ask for confirmation: ${e instanceof Error ? e.message : String(e)}`) };
+  }
   if (result.isError) return { error: result };
   const answer = (result.content[0] as { text?: string } | undefined)?.text;
   return { confirmed: answer === CONFIRM_CREATE_LABEL };
@@ -1125,11 +1149,16 @@ const CANCEL_DELETE_LABEL = 'No, cancel';
  * directly here makes that skip structurally impossible.
  */
 async function defaultConfirmDeletion(question: string): Promise<{ confirmed: boolean } | { error: CallToolResult }> {
-  const result = await askUserQuestion.handler({
-    title: 'Confirm deletion',
-    question,
-    options: [CONFIRM_DELETE_LABEL, CANCEL_DELETE_LABEL],
-  });
+  let result: CallToolResult;
+  try {
+    result = await askUserQuestion.handler({
+      title: 'Confirm deletion',
+      question,
+      options: [CONFIRM_DELETE_LABEL, CANCEL_DELETE_LABEL],
+    });
+  } catch (e) {
+    return { error: err(`Could not ask for confirmation: ${e instanceof Error ? e.message : String(e)}`) };
+  }
   if (result.isError) return { error: result };
   const answer = (result.content[0] as { text?: string } | undefined)?.text;
   return { confirmed: answer === CONFIRM_DELETE_LABEL };

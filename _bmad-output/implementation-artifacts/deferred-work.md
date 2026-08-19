@@ -10,6 +10,7 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-3-calendars-beyond-uriel-and-devorah.md`
   summary: `configFromDb()`/`presentConfig()`'s `JSON.parse(row.calendar_registry)` (and every other JSON column on that same function) has no try/catch — a hand-corrupted DB row throws uncaught instead of falling back to empty.
   evidence: Edge-case-hunter review finding; pre-existing pattern across every JSON column on `container_configs`, not unique to `calendar_registry`.
+  resolved: 2026-08-19 — both functions now route every JSON column through a `safeJsonParse()` helper that logs (`log.warn`) and falls back to an empty value instead of throwing. `src/container-config.ts`'s `configFromDb()`, `src/cli/resources/groups.ts`'s `presentConfig()`.
 - source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-3-calendars-beyond-uriel-and-devorah.md`
   summary: Adding a calendar today is a bare CLI CRUD verb with no restart-reminder automation or on-wake notification — unlike `install_packages`/`add_mcp_server`'s self-mod MCP-tool flow (admin approval → auto image rebuild/restart → on-wake chat notification, `src/modules/self-mod/apply.ts`). An approved `config add-calendar` still requires a human to remember `ncl groups restart`.
   evidence: Blind-hunter review finding; a real, valuable enhancement (agent-initiated calendar registry changes with the same auto-restart+notify UX as package/MCP-server self-mod) but a separate, bigger feature — extending `self-mod.ts`'s action set — not this story's scope.
@@ -19,6 +20,7 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-3-calendars-beyond-uriel-and-devorah.md`
   summary: A duplicate `name` in a hand-edited/corrupted `calendar_registry` JSON array silently lets the last entry win in `resolveCalendarIds()`'s merge, with no diagnostic.
   evidence: Blind-hunter review finding; low-likelihood (the CLI write path already dedupes by name), not worth defensive read-time validation now.
+  resolved: 2026-08-19 — `resolveCalendarIds()` now logs (`log()`) when a registry entry's name collides with an earlier *registry* entry (a built-in override like uriel/devorah is the intended behavior, not flagged). `container/agent-runner/src/mcp-tools/calendar.ts`.
 - source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-3-calendars-beyond-uriel-and-devorah.md`
   summary: The built-in `CALENDAR_IDS` constant in `calendar.ts` still hardcodes a real personal email address (`adardevora@gmail.com`) directly in trunk source — pre-existing since Story 1.2, unchanged by this story's own migration-default design (which deliberately avoids adding *more* hardcoded personal data, but doesn't retroactively scrub what was already there).
   evidence: Blind-hunter review finding; a deliberate call for the repo owner to make (whether/how to move this to per-install config), not something to silently patch mid-story.
@@ -39,6 +41,7 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-1-idempotency-guard-on-event-creation.md`
   summary: The idempotency-guard's title match trims leading/trailing whitespace but doesn't collapse internal whitespace ("Team  Sync" vs "Team Sync" won't match).
   evidence: Blind-hunter review finding; correctly implements the spec's stated "trimmed" rule, but a realistic copy/paste or agent-generated artifact could silently miss the guard.
+  resolved: 2026-08-19 — `findDuplicateCandidate()`'s title match now also collapses internal whitespace (`.replace(/\s+/g, ' ')`) before comparing. `container/agent-runner/src/mcp-tools/calendar.ts`.
 - source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-1-idempotency-guard-on-event-creation.md`
   summary: The duplicate-confirmation card shows only the existing candidate's details, never the new event's own location/description/guests/times, so a user can't compare what they're creating against what's flagged as a likely duplicate.
   evidence: Blind-hunter review finding; real UX gap, not required by any AC.
@@ -51,6 +54,7 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-1-idempotency-guard-on-event-creation.md`
   summary: defaultConfirmCreation (and the pre-existing defaultConfirmDeletion it mirrors) has no try/catch around askUserQuestion.handler — a thrown rejection (vs. a returned isError) would propagate unhandled instead of surfacing as a clean MCP error.
   evidence: Edge-case-hunter review finding; pre-existing pattern inherited unchanged from defaultConfirmDeletion, not introduced by this story.
+  resolved: 2026-08-19 — both `defaultConfirmCreation()` and `defaultConfirmDeletion()` now wrap `askUserQuestion.handler(...)` in try/catch, converting a thrown rejection into a clean `{ error: err(...) }` MCP result. `container/agent-runner/src/mcp-tools/calendar.ts`.
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-1-1-save-a-word-pdf-document-to-memory.md`
   summary: No size limits / decompression-bomb protection on docx unzip or PDF read (whole-file reads, only a 64MB unzip output cap).

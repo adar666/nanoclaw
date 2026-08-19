@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 08-17-2026
-last_updated: 08-19-2026 18:28
+last_updated: 08-19-2026 18:50
 project: nanoclaw-v2
 project_key: NOKEY
 tracking_system: file-system
@@ -86,7 +86,7 @@ action_items:
       Y, make that confirmation a checklist item in whichever later story ships Y,
       not something left to be remembered"
     owner: "spec-owner"
-    status: open
+    status: done
     ref: "_bmad-output/implementation-artifacts/epic-2-retro-2026-08-18.md"
   - id: "epic-2-retro-item-6-live-verify-epic-2s-four-behaviors-idemp"
     epic: 2

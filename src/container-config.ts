@@ -15,6 +15,7 @@ import { GROUPS_DIR, TIMEZONE } from './config.js';
 import { getContainerConfig } from './db/container-configs.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { isValidTimezone } from './timezone.js';
+import { log } from './log.js';
 import type { AgentGroup, ContainerConfigRow } from './types.js';
 
 export interface McpServerConfig {
@@ -59,17 +60,43 @@ export function resolveGroupTimezone(agentGroupId: string): string {
   return tz && isValidTimezone(tz) ? tz : TIMEZONE;
 }
 
+/**
+ * Parse a `container_configs` JSON column, falling back to `fallback` (and
+ * logging) on a hand-corrupted row instead of throwing uncaught
+ * (deferred-work.md finding — pre-existing across every JSON column here).
+ */
+function safeJsonParse<T>(raw: string, fallback: T, column: string, agentGroupId: string): T {
+  try {
+    return JSON.parse(raw) as T;
+  } catch (e) {
+    log.warn('container_configs: unparseable JSON column, using fallback', {
+      column,
+      agentGroupId,
+      err: e instanceof Error ? e.message : String(e),
+    });
+    return fallback;
+  }
+}
+
 /** Build a `ContainerConfig` from a DB row + agent group identity. */
 export function configFromDb(row: ContainerConfigRow, group: AgentGroup): ContainerConfig {
   return {
-    mcpServers: JSON.parse(row.mcp_servers) as Record<string, McpServerConfig>,
+    mcpServers: safeJsonParse(row.mcp_servers, {}, 'mcp_servers', group.id) as Record<
+      string,
+      McpServerConfig
+    >,
     packages: {
-      apt: JSON.parse(row.packages_apt) as string[],
-      npm: JSON.parse(row.packages_npm) as string[],
+      apt: safeJsonParse(row.packages_apt, [], 'packages_apt', group.id) as string[],
+      npm: safeJsonParse(row.packages_npm, [], 'packages_npm', group.id) as string[],
     },
     imageTag: row.image_tag ?? undefined,
-    additionalMounts: JSON.parse(row.additional_mounts) as AdditionalMountConfig[],
-    skills: JSON.parse(row.skills) as string[] | 'all',
+    additionalMounts: safeJsonParse(
+      row.additional_mounts,
+      [],
+      'additional_mounts',
+      group.id,
+    ) as AdditionalMountConfig[],
+    skills: safeJsonParse(row.skills, [], 'skills', group.id) as string[] | 'all',
     provider: row.provider ?? undefined,
     groupName: group.name,
     assistantName: row.assistant_name ?? group.name,
@@ -78,7 +105,10 @@ export function configFromDb(row: ContainerConfigRow, group: AgentGroup): Contai
     model: row.model ?? undefined,
     effort: row.effort ?? undefined,
     timezone: row.timezone && isValidTimezone(row.timezone) ? row.timezone : undefined,
-    calendarRegistry: JSON.parse(row.calendar_registry) as Array<{ name: string; calendarId: string }>,
+    calendarRegistry: safeJsonParse(row.calendar_registry, [], 'calendar_registry', group.id) as Array<{
+      name: string;
+      calendarId: string;
+    }>,
   };
 }
 
