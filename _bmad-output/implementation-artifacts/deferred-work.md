@@ -34,13 +34,16 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-2-recurring-events.md`
   summary: list_calendar_events' output doesn't indicate whether a listed event is part of a recurring series, even though CalendarEventItem.recurrence/recurringEventId are already read internally.
   evidence: Blind-hunter review finding; real UX gap, out of this story's scope (list wasn't touched).
+  resolved: 2026-08-19 — `formatEventLine()` now appends `(recurring)` when `ev.recurringEventId`/`ev.recurrence` is set, shared by `list_calendar_events`' results and `update_calendar_event`'s multi-match candidate list. Agent-facing text (re-narrated, not shown verbatim), SKILL.md v1.10.0 tells the agent to mention it when relevant. `container/agent-runner/src/mcp-tools/calendar.ts`.
 - source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-2-recurring-events.md`
   summary: The idempotency guard's precheck only brackets the new event's own first-occurrence [startUtc, endUtc] window — a new recurring series' later occurrences are never checked against existing events, so a later occurrence could double-book with no warning.
   evidence: Edge-case-hunter review finding; spec explicitly said don't touch the idempotency guard's existing exclusion logic for this story, and full recurrence-aware dedup is a materially bigger feature.
+  status_check: 2026-08-19 — still deferred, deliberately not fixed alongside the other two items in this same "recurring/idempotency cluster" pick. A real fix means parsing the RRULE and expanding future occurrences to precheck each one, which is what this finding's own evidence already called "a materially bigger feature" — not something to build from a one-word go-ahead. Stays open for a real scoping conversation.
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-1-idempotency-guard-on-event-creation.md`
   summary: A zero-duration existing duplicate (start === end === the new event's own start) lands exactly on the pre-check's exclusive `timeMin` bound and would be excluded from the returned page, missing the guard entirely.
   evidence: Blind-hunter review loop-1 finding; genuinely rare (a real zero-duration Google Calendar event is unusual) and a real fix (padding the window) would slightly change matching semantics, not purely mechanical — worth a deliberate look, not a blind patch.
+  resolved: 2026-08-19 — the deliberate look: padding only widens what Google's API is asked to RETURN (`timeMin` on the precheck GET, moved back 1000ms via `PRECHECK_WINDOW_PAD_MS`); `findDuplicateCandidate()`'s own match criteria (exact-instant `start` equality) is completely unchanged, so a genuinely-different event ending just before the new one starts still can't false-match. `container/agent-runner/src/mcp-tools/calendar.ts`.
 - source_spec: `_bmad-output/implementation-artifacts/spec-cal-2-1-idempotency-guard-on-event-creation.md`
   summary: The idempotency-guard's title match trims leading/trailing whitespace but doesn't collapse internal whitespace ("Team  Sync" vs "Team Sync" won't match).
   evidence: Blind-hunter review finding; correctly implements the spec's stated "trimmed" rule, but a realistic copy/paste or agent-generated artifact could silently miss the guard.

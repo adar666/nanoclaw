@@ -903,15 +903,38 @@ describe('create_calendar_event MCP tool', () => {
       expect(result.isError).toBeFalsy();
     });
 
-    it('brackets the pre-check GET to the new event\'s own [startUtc, endUtc] window', async () => {
+    it('brackets the pre-check GET to the new event\'s own [startUtc, endUtc] window, timeMin padded back 1s for the zero-duration edge case', async () => {
       stubConfirmCreation({ confirmed: true });
       const { calls } = stubFetchSequence([PRECHECK_EMPTY, { status: 200, body: { summary: 'Team sync' } }]);
 
       await createCalendarEvent.handler({ calendar: 'uriel', title: 'Team sync', start, end });
 
       const url = new URL(calls[0].url);
-      expect(url.searchParams.get('timeMin')).toBe(startUtc.toISOString());
+      // Padded back 1000ms (deferred-work.md finding) so a zero-duration
+      // existing duplicate — end === startUtc exactly — doesn't land right
+      // on Google's exclusive timeMin bound and get silently dropped from
+      // the returned page before the guard ever sees it.
+      expect(url.searchParams.get('timeMin')).toBe(new Date(startUtc.getTime() - 1000).toISOString());
       expect(url.searchParams.get('timeMax')).toBe(new Date(startUtc.getTime() + 3_600_000).toISOString());
+    });
+
+    it('catches a zero-duration existing duplicate landing exactly on the old exclusive timeMin bound', async () => {
+      // end === startUtc exactly, at the padded window's edge — before the
+      // 1s pad, this candidate would never have been returned by Google's
+      // own timeMin filtering at all (its end lands exactly on the
+      // exclusive bound), missing the guard entirely.
+      const zeroDurationDuplicate = baseDuplicateCandidate({
+        id: 'evt-zero-dur',
+        end: { dateTime: startUtc.toISOString(), timeZone: TIMEZONE },
+      });
+      const { fn: confirmFn } = stubConfirmCreation({ confirmed: false });
+      stubFetch(200, { items: [zeroDurationDuplicate] });
+
+      const result = await createCalendarEvent.handler({ calendar: 'uriel', title: 'Team sync', start, end });
+
+      expect(confirmFn).toHaveBeenCalledTimes(1);
+      expect(result.isError).toBeFalsy();
+      expect((result.content[0] as { text: string }).text).toContain('duplicate');
     });
 
     it('surfaces the pre-check GET failing at the network layer (throw/timeout) — no POST attempted, not connected wording says "create the event"', async () => {
@@ -1361,6 +1384,33 @@ describe('list_calendar_events MCP tool', () => {
     expect(text).toContain(formatLocalTime('2026-08-20T14:00:00.000Z', TIMEZONE));
     expect(text).toContain('evt-2');
     expect(text).toContain('Team sync');
+  });
+
+  it('marks a recurring-series instance with "(recurring)", leaves a one-off event unmarked (deferred-work.md finding)', async () => {
+    stubFetch(200, {
+      items: [
+        {
+          id: 'evt-recurring',
+          summary: 'Weekly standup',
+          start: { dateTime: '2026-08-20T09:00:00.000Z', timeZone: TIMEZONE },
+          end: { dateTime: '2026-08-20T09:30:00.000Z', timeZone: TIMEZONE },
+          recurringEventId: 'master-evt-1', // singleEvents=true instance shape
+        },
+        {
+          id: 'evt-oneoff',
+          summary: 'Dentist',
+          start: { dateTime: '2026-08-20T14:00:00.000Z', timeZone: TIMEZONE },
+          end: { dateTime: '2026-08-20T15:00:00.000Z', timeZone: TIMEZONE },
+        },
+      ],
+    });
+
+    const result = await listCalendarEvents.handler({ calendar: 'uriel' });
+    const text = (result.content[0] as { text: string }).text;
+    const recurringLine = text.split('\n').find((l) => l.includes('Weekly standup'));
+    const oneOffLine = text.split('\n').find((l) => l.includes('Dentist'));
+    expect(recurringLine).toContain('(recurring)');
+    expect(oneOffLine).not.toContain('(recurring)');
   });
 
   it('formats an all-day event without a raw dateTime', async () => {

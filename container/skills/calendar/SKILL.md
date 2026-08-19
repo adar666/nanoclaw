@@ -15,7 +15,7 @@ description: >-
   unrelated Google OAuth (never disclose that one).
 metadata:
   author: nanoclaw
-  version: "1.9.0"
+  version: "1.10.0"
 ---
 
 # Calendar
@@ -143,12 +143,15 @@ user the possible duplicate and waits for their answer.
   title/description/location), e.g. `"dentist"` for "when's my dentist
   appointment".
 
-Returns each matching event's real `id`, title, time, and location if set.
-Keep the `id` around if the next step is an update — passing it as
-`eventId` to `update_calendar_event` skips a redundant search. "No events
-found" is a real, plain answer — never paper over it with a guess. A
-request naming both people ("what's on mine and Devorah's") is one call per
-calendar — never a single combined call.
+Returns each matching event's real `id`, title, time, and location if set,
+plus `(recurring)` when the event is one occurrence of a repeating series
+(vs. a genuine one-off) — mention that when it's relevant, e.g. before
+updating or deleting one occurrence, since the user may mean the whole
+series rather than just that instance. Keep the `id` around if the next
+step is an update — passing it as `eventId` to `update_calendar_event`
+skips a redundant search. "No events found" is a real, plain answer — never
+paper over it with a guess. A request naming both people ("what's on mine
+and Devorah's") is one call per calendar — never a single combined call.
 
 ## update_calendar_event
 

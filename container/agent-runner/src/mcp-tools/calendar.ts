@@ -308,8 +308,19 @@ export const createCalendarEvent: McpToolDefinition = {
     // match logic, never Google's own unreliable `q` search). Best-effort
     // only: two genuinely-simultaneous calls can both pass this check
     // before either POST lands.
+    //
+    // timeMin is padded back by PRECHECK_WINDOW_PAD_MS (deferred-work.md
+    // finding, resolved 2026-08-19): Google's events.list timeMin is an
+    // EXCLUSIVE bound on an event's end time — a zero-duration existing
+    // duplicate (start === end === this new event's own start) would have
+    // end === startUtc exactly, landing precisely on that exclusive bound
+    // and getting dropped from the returned page before findDuplicateCandidate
+    // ever saw it, missing the guard entirely for that one edge case. This
+    // only widens what Google's API is asked to RETURN — findDuplicateCandidate's
+    // own match criteria (exact-instant start equality) is unchanged, so a
+    // genuinely-different event one second earlier still can't false-match.
     const precheck = await fetchEvents(calendarId, {
-      timeMinIso: startUtc.toISOString(),
+      timeMinIso: new Date(startUtc.getTime() - PRECHECK_WINDOW_PAD_MS).toISOString(),
       timeMaxIso: endUtc.toISOString(),
       notConnectedAction: 'create the event',
     });
@@ -540,11 +551,23 @@ function formatEventTimeRange(start?: EventTimePoint, end?: EventTimePoint): str
  * disambiguation candidate list never drops a field (e.g. location) that
  * the list output includes, which would make two same-title/same-time
  * events differing only by location indistinguishable.
+ *
+ * "(recurring)" marker (deferred-work.md finding, resolved 2026-08-19):
+ * `fetchEvents` always sets `singleEvents=true`, so every returned item is
+ * an expanded instance — `recurringEventId` is the field that survives that
+ * expansion (see `CalendarEventItem.recurringEventId`'s own doc comment);
+ * `recurrence` would only ever be set on a master, which this call path
+ * never returns, but is still checked for robustness against a future
+ * change to that assumption. Agent-facing only (this text is re-narrated,
+ * never shown verbatim to the user) — helps the agent say "this is part of
+ * a repeating series" instead of treating a single occurrence as the whole
+ * story when asked to update or cancel it.
  */
 function formatEventLine(ev: CalendarEventItem): string {
   const title = ev.summary ?? '(no title)';
   let line = `[${ev.id}] ${title} — ${formatEventTimeRange(ev.start, ev.end)}`;
   if (ev.location) line += ` @ ${ev.location}`;
+  if (ev.recurringEventId || ev.recurrence) line += ' (recurring)';
   return line;
 }
 
@@ -608,6 +631,16 @@ async function fetchEvents(
 
 /** create_calendar_event's idempotency guard (spec cal-2.1): a candidate must have been created within this window to count as a possible duplicate. */
 const DUPLICATE_RECENCY_WINDOW_MS = 10 * 60 * 1000;
+
+/**
+ * How far back the idempotency-guard precheck's timeMin is padded, to catch
+ * a zero-duration existing duplicate landing exactly on Google's exclusive
+ * timeMin bound (deferred-work.md finding — see the precheck call site's
+ * own comment in create_calendar_event for the full explanation). Small
+ * enough to have no realistic chance of pulling in an unrelated event that
+ * genuinely ends just before the new event starts.
+ */
+const PRECHECK_WINDOW_PAD_MS = 1000;
 
 /**
  * Find a pre-check candidate that looks like the same event `create_calendar_event`
