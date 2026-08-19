@@ -11,8 +11,8 @@
  * per-agent scoping exists in the CLI at all). So there is exactly one
  * connected Google account, and which calendar a call targets is picked by
  * the `calendar` argument, resolved to a `calendarId` via `resolveCalendarIds()`
- * below — **not** a closed `"uriel"`/`"devorah"` set (AD-18, Story 2.3: a
- * config-driven registry extends it) — never by which container/identity
+ * below — **not** a closed built-in set (AD-18, Story 2.3: a config-driven
+ * registry extends the one true built-in, `"uriel"`) — never by which container/identity
  * happens to be calling. Each configured calendar is reachable because its
  * owner shares it with the
  * connected account (Google Calendar's own sharing, not a second OAuth
@@ -34,12 +34,19 @@ import { askUserQuestion } from './interactive.js';
 import { getConfig } from '../config.js';
 
 /**
- * The two built-in calendars (spec cal-2.3: these stay hardcoded defaults,
- * unchanged behavior, no migration-time personal data). "uriel" maps to the
- * connected account's own calendar; "devorah" to her calendar, reachable
- * because she shares it with the connected account (AD-3) — not a second
- * OAuth connection. Matches `groups/household/memory/household/people.md`'s
- * recorded email for Devora.
+ * The one true built-in calendar. "uriel" maps to `'primary'` — the
+ * connected account's own calendar — a generic Google Calendar API value,
+ * not personal data, so it's safe to hardcode for every install.
+ *
+ * "devorah" used to be hardcoded here too (a real email address,
+ * `adardevora@gmail.com`), but a real personal email address doesn't belong
+ * in trunk source (deferred-work.md finding, resolved 2026-08-19) — every
+ * other calendar, including hers, is now install-config-only, added via
+ * `ncl groups config add-calendar` into the per-group `calendarRegistry`
+ * (spec cal-2.3, AD-18). An install that relied on the old built-in
+ * "devorah" default needs one `ncl groups config add-calendar --name
+ * devorah --calendar-id <her real email>` per group that uses her calendar,
+ * once, to keep working — this trimmed constant no longer provides it.
  *
  * Do NOT reference this constant directly in a tool handler — call
  * `resolveCalendarIds()` instead, which merges this with the per-group
@@ -47,7 +54,6 @@ import { getConfig } from '../config.js';
  */
 const CALENDAR_IDS: Record<string, string> = {
   uriel: 'primary',
-  devorah: 'adardevora@gmail.com',
 };
 
 /**
@@ -93,8 +99,9 @@ function resolveCalendarIds(): Record<string, string> {
     // would offer it) yet still fail as "Unknown calendar" when chosen —
     // skip it instead (review finding).
     if (!entry.calendarId) continue;
-    // A name colliding with a built-in (uriel/devorah) is the intended
-    // override, not a duplicate — only warn when two REGISTRY entries share
+    // A name colliding with a built-in (uriel — or a former one like
+    // devorah, now install-config-only) is the intended override, not a
+    // duplicate — only warn when two REGISTRY entries share
     // a name (hand-edited/corrupted registry; the CLI write path already
     // dedupes by name, so this shouldn't happen via normal use). Otherwise
     // the last entry silently wins with no diagnostic (deferred-work.md
@@ -200,8 +207,8 @@ export const createCalendarEvent: McpToolDefinition = {
   tool: {
     name: 'create_calendar_event',
     description:
-      'Create a real event on one of this group\'s configured Google Calendars (at minimum Uriel\'s and ' +
-      'Devora\'s; an operator may add more) — all reachable through one connected account, each other ' +
+      'Create a real event on one of this group\'s configured Google Calendars (at minimum Uriel\'s own; an ' +
+      'operator may add more, e.g. Devora\'s) — all reachable through one connected account, each other ' +
       'calendar via sharing, not a separate connection.',
     inputSchema: {
       type: 'object' as const,
@@ -210,7 +217,7 @@ export const createCalendarEvent: McpToolDefinition = {
           type: 'string',
           description:
             "Which calendar to create the event on — one of this group's resolvable calendar names: the " +
-            'built-in "uriel"/"devorah" plus any names added to this group\'s calendar registry ' +
+            'built-in "uriel" plus any names added to this group\'s calendar registry ' +
             '(`ncl groups config add-calendar`).',
         },
         title: { type: 'string', description: 'Event title/summary.' },
@@ -700,8 +707,8 @@ export const listCalendarEvents: McpToolDefinition = {
   tool: {
     name: 'list_calendar_events',
     description:
-      "List real events on one of this group's configured Google Calendars (at minimum Uriel's and " +
-      "Devora's; an operator may add more) — all reachable through one connected account. Use for " +
+      "List real events on one of this group's configured Google Calendars (at minimum Uriel's own; an " +
+      "operator may add more, e.g. Devora's) — all reachable through one connected account. Use for " +
       '"what\'s on my/their calendar" or "when is X" questions — never answer those from memory or a guess.',
     inputSchema: {
       type: 'object' as const,
@@ -710,7 +717,7 @@ export const listCalendarEvents: McpToolDefinition = {
           type: 'string',
           description:
             "Which calendar to list events from — one of this group's resolvable calendar names: the " +
-            'built-in "uriel"/"devorah" plus any names added to this group\'s calendar registry ' +
+            'built-in "uriel" plus any names added to this group\'s calendar registry ' +
             '(`ncl groups config add-calendar`).',
         },
         from: {
@@ -832,8 +839,8 @@ export const updateCalendarEvent: McpToolDefinition = {
   tool: {
     name: 'update_calendar_event',
     description:
-      "Update a real event on one of this group's configured Google Calendars (at minimum Uriel's and " +
-      "Devora's; an operator may add more). Target it either by a known eventId " +
+      "Update a real event on one of this group's configured Google Calendars (at minimum Uriel's own; an " +
+      "operator may add more, e.g. Devora's). Target it either by a known eventId " +
       '(e.g. from a prior list_calendar_events call) or by eventQuery free-text search. Never deletes/cancels ' +
       'an event — use delete_calendar_event for that.',
     inputSchema: {
@@ -843,7 +850,7 @@ export const updateCalendarEvent: McpToolDefinition = {
           type: 'string',
           description:
             "Which calendar the event is on — one of this group's resolvable calendar names: the built-in " +
-            '"uriel"/"devorah" plus any names added to this group\'s calendar registry ' +
+            '"uriel" plus any names added to this group\'s calendar registry ' +
             '(`ncl groups config add-calendar`).',
         },
         eventId: {
@@ -1190,8 +1197,8 @@ export const deleteCalendarEvent: McpToolDefinition = {
   tool: {
     name: 'delete_calendar_event',
     description:
-      "Delete a real event from one of this group's configured Google Calendars (at minimum Uriel's and " +
-      "Devora's; an operator may add more). This cannot be undone. The tool itself " +
+      "Delete a real event from one of this group's configured Google Calendars (at minimum Uriel's own; an " +
+      "operator may add more, e.g. Devora's). This cannot be undone. The tool itself " +
       "blocks and asks the user to confirm (a real yes/no card, same mechanism as ask_user_question) before " +
       'issuing the actual delete — there is nothing else to orchestrate, one call resolves the target, gets a ' +
       'real confirmation, and deletes (or does not) in sequence. Target the event either by a known eventId or ' +
@@ -1203,7 +1210,7 @@ export const deleteCalendarEvent: McpToolDefinition = {
           type: 'string',
           description:
             "Which calendar the event is on — one of this group's resolvable calendar names: the built-in " +
-            '"uriel"/"devorah" plus any names added to this group\'s calendar registry ' +
+            '"uriel" plus any names added to this group\'s calendar registry ' +
             '(`ncl groups config add-calendar`).',
         },
         eventId: {

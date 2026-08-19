@@ -16,16 +16,27 @@ const originalConfirmDeletion = deleteHooks.confirmDeletion;
 const originalConfirmCreation = createHooks.confirmCreation;
 
 /**
- * Suite-wide default calendar registry: empty, matching a fresh migration
- * (spec cal-2.3 I/O Matrix row 1) — every pre-existing test in this file
- * exercises only the built-in "uriel"/"devorah" names and must keep passing
- * unmodified. Deliberately NOT the real `calendarConfigHooks.getCalendarRegistry`
- * (which calls `getConfig()` — this test file never calls `loadConfig()`, so
- * the real implementation would throw "Config not loaded" on every call).
- * Tests that care about the registry stub this per-test via
- * `stubCalendarRegistry` and afterEach resets back to this default.
+ * "devorah" is no longer a hardcoded CALENDAR_IDS built-in (deferred-work.md
+ * finding, resolved 2026-08-19 — a real personal email doesn't belong in
+ * trunk source) — she only resolves once a group's own registry carries this
+ * entry, exactly as a real install must do via `ncl groups config
+ * add-calendar --name devorah --calendar-id adardevora@gmail.com`.
  */
-const DEFAULT_CALENDAR_REGISTRY: Array<{ name: string; calendarId: string }> = [];
+const DEVORAH_REGISTRY_ENTRY = { name: 'devorah', calendarId: 'adardevora@gmail.com' };
+
+/**
+ * Suite-wide default calendar registry: just the devorah entry above,
+ * matching a real install post-migration (spec cal-2.3) — every
+ * pre-existing test in this file exercises the built-in "uriel" plus this
+ * registry-backed "devorah" and must keep passing unmodified. Deliberately
+ * NOT the real `calendarConfigHooks.getCalendarRegistry` (which calls
+ * `getConfig()` — this test file never calls `loadConfig()`, so the real
+ * implementation would throw "Config not loaded" on every call). Tests that
+ * care about the registry (including a genuinely empty one) stub this
+ * per-test via `stubCalendarRegistry` and afterEach resets back to this
+ * default.
+ */
+const DEFAULT_CALENDAR_REGISTRY: Array<{ name: string; calendarId: string }> = [DEVORAH_REGISTRY_ENTRY];
 calendarConfigHooks.getCalendarRegistry = () => DEFAULT_CALENDAR_REGISTRY;
 
 /** Stub the calendar-registry source for one test — mirrors stubConfirmDeletion/stubConfirmCreation. */
@@ -2145,15 +2156,17 @@ describe('calendar registry resolution (spec cal-2.3)', () => {
   // CLI-level behavior with no calendar.ts involvement — covered in
   // src/cli/resources/groups.test.ts's 'groups config add-calendar /
   // remove-calendar' block instead, not duplicated here.
-  it('I/O Matrix row 1: empty registry (fresh migration) — built-in "uriel"/"devorah" resolve exactly as before this story', async () => {
+  it('I/O Matrix row 1: empty registry — built-in "uriel" still resolves; "devorah" is registry-only now and declines', async () => {
     stubCalendarRegistry([]);
     const { calls: urielCalls } = stubFetch(200, { items: [] });
     await listCalendarEvents.handler({ calendar: 'uriel' });
     expect(urielCalls[0].url).toContain('/calendars/primary/events');
 
-    const { calls: devorahCalls } = stubFetch(200, { items: [] });
-    await listCalendarEvents.handler({ calendar: 'devorah' });
-    expect(devorahCalls[0].url).toContain(encodeURIComponent('adardevora@gmail.com'));
+    const fn = stubFetchThrows();
+    const result = await listCalendarEvents.handler({ calendar: 'devorah' });
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as { text: string }).text).toContain('Unknown calendar');
+    expect(fn).not.toHaveBeenCalled();
   });
 
   it('I/O Matrix row 2: a config-added third calendar resolves and works the same as a built-in name', async () => {
@@ -2187,7 +2200,6 @@ describe('calendar registry resolution (spec cal-2.3)', () => {
     const text = (result.content[0] as { text: string }).text;
     expect(text).toContain('Unknown calendar');
     expect(text).toContain('uriel');
-    expect(text).toContain('devorah');
     expect(text).toContain('family');
     expect(fn).not.toHaveBeenCalled();
   });
@@ -2211,7 +2223,6 @@ describe('calendar registry resolution (spec cal-2.3)', () => {
     expect(text).toContain('Unknown calendar "family"');
     const resolvableSet = text.split('must be one of:')[1] ?? '';
     expect(resolvableSet).toContain('uriel');
-    expect(resolvableSet).toContain('devorah');
     expect(resolvableSet).not.toContain('family');
     expect(fn).not.toHaveBeenCalled();
   });

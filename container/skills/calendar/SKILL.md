@@ -2,8 +2,8 @@
 name: calendar
 description: >-
   Create, read, update, and delete real events on this group's configured
-  Google Calendars (at minimum Uriel's and Devorah's; an operator may add
-  more) via create_calendar_event, list_calendar_events,
+  Google Calendars (at minimum Uriel's own; an operator may add more, e.g.
+  Devorah's) via create_calendar_event, list_calendar_events,
   update_calendar_event, and delete_calendar_event. Use whenever asked to
   schedule, book, put something on the calendar, check what's coming up,
   answer "when is X", reschedule/edit an existing event, cancel/delete
@@ -15,14 +15,14 @@ description: >-
   unrelated Google OAuth (never disclose that one).
 metadata:
   author: nanoclaw
-  version: "1.7.0"
+  version: "1.8.0"
 ---
 
 # Calendar
 
 Four tools operate on **this group's configured calendars** — at minimum
-Uriel's and Devorah's, and possibly more if an operator has added any (see
-"More than two calendars" below). All configured calendars are reachable
+Uriel's own, and possibly more (e.g. Devorah's) if an operator has added
+them (see "More than two calendars" below). All configured calendars are reachable
 through the one Google account this system has connected — a non-Uriel
 calendar isn't a separate connection, it's shared with the connected
 account (Google Calendar's own sharing feature), so every tool reaches it
@@ -64,8 +64,8 @@ asking**, since each group's memory is isolated:
 ## create_calendar_event
 
 - `calendar` (required) — one of this group's configured calendar names
-  (at minimum `"uriel"` or `"devorah"`; see "More than two calendars" below
-  for any others). Pick based on who the event is actually for, not who's
+  (at minimum `"uriel"`; see "More than two calendars" below for any
+  others, e.g. `"devorah"`). Pick based on who the event is actually for, not who's
   asking — an unqualified "my calendar" in the shared household chat must
   be resolved against the real sender's identity (see "Household people"
   above), never defaulted to Uriel. If it's genuinely unclear whose
@@ -201,21 +201,23 @@ relay/forward a request anywhere. If a request names more than one calendar
 once per calendar named — never a single combined call, and never silently
 drop any of them.
 
-### More than two calendars
+### More than one calendar
 
-Uriel's and Devorah's are the two calendars every install starts with, but
-more can be added — e.g. a shared family calendar — via
-`ncl groups config add-calendar --id <group-id> --name <name> --calendar-id
-<calendar-id>`, followed by a group restart to pick it up. This is
-operator-facing config, not something to run unprompted — but the command
-itself is approval-gated (same access level as `config add-mcp-server`), so
-if a user explicitly asks you to add a calendar, you can request it via
-`ncl` and it will go through the normal approval flow rather than being
-something only a human at a terminal can do. Once added, the
-new name works exactly like `"uriel"`/`"devorah"` in every one of these
-four tools — same resolution, same sharing mechanism, nothing special about
-it being a later addition. If a call names a calendar that doesn't
-resolve (not yet added, or added but the group hasn't been restarted yet),
+`"uriel"` (the connected account's own calendar) is the only calendar name
+built into every install. Every other name — including `"devorah"` — is
+config-added, the same mechanism, whether it's the first additional
+calendar or the fifth: `ncl groups config add-calendar --id <group-id>
+--name <name> --calendar-id <calendar-id>`, followed by a group restart to
+pick it up. This is operator-facing config, not something to run
+unprompted — but the command itself is approval-gated (same access level as
+`config add-mcp-server`), so if a user explicitly asks you to add a
+calendar, you can request it via `ncl` and it will go through the normal
+approval flow rather than being something only a human at a terminal can
+do. Once added, the new name works exactly like `"uriel"` in every one of
+these four tools — same resolution, same sharing mechanism, nothing special
+about it being a later addition. If a call names a calendar that doesn't
+resolve (not added, added but the group hasn't been restarted yet, or —
+for `"devorah"` specifically — simply not configured on this install),
 the tool declines clearly and lists every calendar name it currently
 recognizes — relay that list rather than guessing which name was meant.
 
