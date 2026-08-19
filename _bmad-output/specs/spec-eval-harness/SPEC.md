@@ -35,6 +35,9 @@ This project's persona-level behavioral claims — SKILL.md instructions like "r
 - **CAP-6**
   - **intent:** A human can invoke the harness on demand from the command line.
   - **success:** Running the CLI command against the guest-resolution scenario set produces a saved report (per-scenario verdict + evidence) with no CI or scheduled-job dependency required.
+- **CAP-7**
+  - **intent:** A standalone sweep can find and remove leftover eval-test-calendar events left behind by a crashed or interrupted run, independent of any single scenario's own per-run cleanup (CAP-4).
+  - **success:** Running the sweep against a test calendar with orphaned events removes them and reports what was removed; running it against an already-clean calendar is a safe no-op.
 
 ## Constraints
 
@@ -57,8 +60,3 @@ Running the harness against the guest-resolution scenario set produces genuine p
 - Assumed the `household` group's real `people.md` (already used in production guest resolution) is an acceptable source of scenario ground truth — a scenario like "invite Devorah" can assert against the real recorded email in that file, rather than needing a separate fixture file.
 - Assumed a scenario is judged from the container's outbound behavior (what it actually sent/did — the `outbound.db` content and any real Calendar API side effects), not from inspecting its internal reasoning trace — matching how every live bug in this project's history so far was actually found (reading `outbound.db`, not reading agent "thinking").
 
-## Open Questions
-
-- Which specific Claude model/effort should the LLM-judge calls use, and should that be pinned independently of whatever model the agent-under-test is currently configured with (so a future agent model upgrade doesn't silently also change what "correct" means)?
-- Should the eval-test calendar be shared across all three real agent groups (household, Yulanda, Tina) or does each need its own, mirroring how `calendar_registry` is already per-group?
-- Does cleanup-on-failure need a standing "sweep stale eval-test events older than N hours" safety net (in case a crashed run leaves orphaned events), or is per-run cleanup alone considered sufficient for v1?
