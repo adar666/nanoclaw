@@ -101,3 +101,23 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-1-5-support-legacy-doc-files-save-recall-and-fill-via-conversion.md`
   summary: The test fixture builder (buildDocViaSoffice) independently duplicates the production conversion invocation's flags rather than sharing them -- a future change to the production flags has no structural guarantee the test fixture generator stays in sync.
   evidence: Blind-hunter finding; a shared-constant refactor is a minor drift-prevention nice-to-have, not urgent.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-eval-1-1-scaffold-the-isolated-eval-agent-group-and-safety-checks.md`
+  summary: Whether to wire a CI job step for `pnpm run typecheck:eval` was deliberately deferred (the spec's own "Ask First" boundary) to avoid touching `.github/workflows/ci.yml` in this story; tracked here so it isn't simply forgotten.
+  evidence: Blind-hunter finding; the spec's own Boundaries & Constraints section already named this as a fast-follow, this entry just makes it durable.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-eval-1-1-scaffold-the-isolated-eval-agent-group-and-safety-checks.md`
+  summary: `eval/session.ts`'s `resolveEvalSession`, `eval/safety.ts`'s `assertNoDestinations`, and `eval/setup.ts`'s `ensureAgentGroup` never validate that the `agentGroupId`/`folder` argument they're given actually exists or is well-formed (e.g. a folder like `"../x"` isn't rejected before reaching `initGroupFilesystem`'s `path.resolve`). Worth hardening once Story 1.4 wires real spawn-path callers into these functions, so a caller bug can't silently pass an id/folder these safety primitives were never meant to guard.
+  evidence: Blind-hunter + edge-case-hunter findings, combined (same underlying gap surfacing on three call sites). Pre-existing in the functions being mirrored too: `src/cli/resources/groups.ts`'s own `create` handler never calls the existing `assertValidGroupFolder`/`isValidGroupFolder` helpers (`src/group-folder.ts`) either, and `resolveTaskSession` (`src/session-manager.ts`) doesn't check its `agentGroupId` argument exists before use — not introduced by this story, but this story's own safety-framing language ("structurally cannot leak") makes the gap more consequential here than in the code it mirrors.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-eval-1-1-scaffold-the-isolated-eval-agent-group-and-safety-checks.md`
+  summary: `ensureAgentGroup` (two concurrent calls, same folder) and `resolveEvalSession` (two concurrent calls, same thread id) have no protection against a race — an uncaught SQLite UNIQUE-constraint exception in the first case, a duplicate active session row in the second.
+  evidence: Edge-case-hunter finding. Pre-existing in the mirrored source (`groups.ts`'s `create` handler has the identical race). For `resolveEvalSession` specifically, Story 1.3's run-exclusivity lock (AD-8) closes this for the harness's own actual call pattern (one `cli.ts` process at a time) once built — re-verify this entry is actually moot once Story 1.3 lands, don't just assume.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-eval-1-1-scaffold-the-isolated-eval-agent-group-and-safety-checks.md`
+  summary: `ensureAgentGroup` and `resolveEvalSession` have no rollback if the DB insert succeeds but the follow-up filesystem step (`initGroupFilesystem` / `initSessionFolder`) then throws -- an orphaned `agent_groups` or `sessions` row with no matching workspace/session folder.
+  evidence: Blind-hunter + edge-case-hunter findings, combined. Pre-existing in the exact functions being mirrored (`groups.ts`'s `create` handler, `resolveTaskSession`) -- not introduced by this story.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-eval-1-1-scaffold-the-isolated-eval-agent-group-and-safety-checks.md`
+  summary: No timeout/kill-switch is specified anywhere for a hung scenario container spawn, despite the spec's own SPEC.md explicitly calling out that every run costs real Claude API tokens and isn't cheap to run casually; also no decommission/teardown path exists for the `eval` agent group itself, only creation.
+  evidence: Blind-hunter finding. Both belong to later stories (the timeout to Story 1.4/1.7's runner/CLI design, teardown to whoever needs to retire the harness) -- matches this project's own existing precedent of deliberately deferring exactly this class of operational concern (ARCHITECTURE-SPINE.md's own Deferred section already does the same for "report retention/cleanup policy").

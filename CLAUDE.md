@@ -135,6 +135,7 @@ For ad-hoc queries from skills or scripts, use the in-tree wrapper rather than t
 | `container/agent-runner/src/` | Agent-runner: poll loop, formatter, provider abstraction, MCP tools, destinations |
 | `container/skills/` | Container skills mounted into every agent session (`agent-browser`, `document-memory`, `frontend-engineer`, `onecli-gateway`, `self-customize`, `vercel-cli`, `welcome`; channel-specific skills like `slack-formatting` and `whatsapp-formatting` install with their channel) |
 | `groups/<folder>/` | Per-agent-group filesystem (CLAUDE.md, skills) — agent-runner source is a shared read-only mount, not copied per group |
+| `eval/` | Agent Evaluation Harness — spins up the real per-agent-group container, drives scripted scenarios through it, judges deterministically or via a second Claude call, reports results. Mirrors `scripts/`: imports host `src/**` modules directly, run via `tsx`, own standalone `eval/tsconfig.json` (not covered by the root `pnpm exec tsc --noEmit`). |
 | `scripts/init-first-agent.ts` | Bootstrap the first DM-wired agent (used by `/init-first-agent` skill) |
 | `scripts/skill-apply.ts` | Deterministic SKILL.md applier — executes `nc:` directive fences; declare/emit core, journaled + idempotent |
 | `scripts/skill-directives.ts` + `scripts/skill-policy.ts` | `nc:` grammar parser + lint; UI-free driver policy derived from document structure (gate confirm, URL offer) |
@@ -287,6 +288,8 @@ cd container/agent-runner && bun test      # Container tests (bun:test)
 ```
 
 Container typecheck is a separate tsconfig — if you edit `container/agent-runner/src/`, run `pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit` from root (or `bun run typecheck` from `container/agent-runner/`).
+
+`eval/` typecheck is also a separate tsconfig (same reasoning: it's outside the root config's `src/**/*`-only `include`) — if you edit `eval/`, run `pnpm run typecheck:eval`.
 
 Service management:
 ```bash
