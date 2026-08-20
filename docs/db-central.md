@@ -167,7 +167,7 @@ CREATE INDEX idx_sessions_lookup     ON sessions(messaging_group_id, thread_id);
 
 - **Resolved by:** `resolveSession()` in `src/session-manager.ts`.
 - Creating a session also provisions the session folder and both session DBs via `initSessionFolder()` — see [db-session.md](db-session.md).
-- **`managed_by`:** NULL for every normal session. `'eval'` marks a session created by the Agent Evaluation Harness (`eval/session.ts`'s `resolveEvalSession`) — `host-sweep.ts`'s own exclusion (planned) will filter these out of sweep/stale-recovery so an eval scenario run is never treated as a stuck real session.
+- **`managed_by`:** NULL for every normal session. `'eval'` marks a session created by the Agent Evaluation Harness (`eval/session.ts`'s `resolveEvalSession`) — `getActiveSessions()`/`getRunningSessions()` (`src/db/sessions.ts`) filter these out, so they're invisible to `host-sweep.ts` and `delivery.ts`'s polling and an eval scenario run is never treated as a stuck real session. `ncl sessions list`/`get` still shows them (that resource doesn't go through either filtered function) and surfaces this column so an admin can tell them apart.
 
 ### 1.9 `pending_questions`
 

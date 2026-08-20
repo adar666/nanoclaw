@@ -162,9 +162,10 @@ export interface Session {
   created_at: string;
   /**
    * AD-6 exclusion marker. `'eval'` for eval-harness scenario sessions
-   * (`eval/session.ts`'s `resolveEvalSession`) — `host-sweep.ts`'s own
-   * exclusion (Story 1.5, not yet built) will filter on this so those
-   * sessions are never swept/recovered like a real user session.
+   * (`eval/session.ts`'s `resolveEvalSession`) — `src/db/sessions.ts`'s
+   * `getActiveSessions`/`getRunningSessions` (Story 1.5) filter these out,
+   * so they're invisible to host-sweep and delivery polling and never
+   * swept/recovered like a real user session.
    * Optional/nullable: every existing `Session` object literal across the
    * host compiles unchanged.
    */

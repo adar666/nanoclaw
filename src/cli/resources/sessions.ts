@@ -41,6 +41,12 @@ registerResource({
     },
     { name: 'last_active', type: 'string', description: 'Last message or heartbeat. Used for stale detection.' },
     { name: 'created_at', type: 'string', description: 'Auto-set.', generated: true },
+    {
+      name: 'managed_by',
+      type: 'string',
+      description:
+        'AD-6 exclusion marker. Null for normal sessions. "eval" marks an Agent Evaluation Harness scenario session — excluded from host-sweep and delivery polling (src/db/sessions.ts\'s getActiveSessions/getRunningSessions), which manage their own container lifecycle in a separate process instead.',
+    },
   ],
   operations: { list: 'open', get: 'open' },
 });

@@ -28,6 +28,9 @@
  *        (claim_age > tolerance) AND (heartbeat_mtime <= status_changed)
  *        → kill + reset this message + tries++. Semantics: "container
  *        claimed a message and went quiet past tolerance since the claim."
+ *
+ * Eval sessions (AD-6 `managed_by` marker) never reach this file at all —
+ * excluded at the source in `db/sessions.ts`'s `getActiveSessions()`.
  */
 import type Database from 'better-sqlite3';
 import fs from 'fs';

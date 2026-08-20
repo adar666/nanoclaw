@@ -114,12 +114,35 @@ export function findTaskSessions(agentGroupId: string): Session[] {
     .all(agentGroupId, TASKS_SYSTEM_THREAD_ID, `${TASKS_SYSTEM_THREAD_ID}:%`) as Session[];
 }
 
+/**
+ * All active sessions eligible for host-sweep / delivery / tasks processing.
+ * Excludes eval-harness sessions (AD-6 `managed_by` marker, Story 1.5) — an
+ * eval scenario run spawns and manages its own containers in a separate
+ * process, so it must never enter the same spawn/kill/retry pipeline as a
+ * real user session. `ncl sessions list` (src/cli/resources/sessions.ts)
+ * deliberately does NOT go through this function — admin visibility into
+ * eval sessions is preserved by construction, and now surfaces the
+ * `managed_by` column itself so an admin can actually tell them apart.
+ *
+ * Filters on `managed_by <> 'eval'` specifically, not "any non-null value" —
+ * `managed_by` is a general-purpose column, and a future feature reusing it
+ * with a different marker must not silently vanish from sweep/delivery just
+ * for having *some* value here (a review finding: the original filter would
+ * have done exactly that).
+ */
 export function getActiveSessions(): Session[] {
-  return getDb().prepare("SELECT * FROM sessions WHERE status = 'active'").all() as Session[];
+  return getDb()
+    .prepare("SELECT * FROM sessions WHERE status = 'active' AND (managed_by IS NULL OR managed_by <> 'eval')")
+    .all() as Session[];
 }
 
+/** See `getActiveSessions` — same eval exclusion applies here. */
 export function getRunningSessions(): Session[] {
-  return getDb().prepare("SELECT * FROM sessions WHERE container_status IN ('running', 'idle')").all() as Session[];
+  return getDb()
+    .prepare(
+      "SELECT * FROM sessions WHERE container_status IN ('running', 'idle') AND (managed_by IS NULL OR managed_by <> 'eval')",
+    )
+    .all() as Session[];
 }
 
 export function updateSession(
