@@ -31,6 +31,17 @@ export interface AdditionalMountConfig {
   readonly?: boolean;
 }
 
+// A real Google Calendar id is either the literal "primary" or an
+// email-shaped string (a person's calendar, or a generated
+// "...@group.calendar.google.com" id) — this is plausibility-only, matching
+// install_packages' own "let the real API be the final validator" pattern
+// (self-mod.ts's APT_RE/NPM_RE): it catches an obvious typo before it
+// silently becomes an opaque Google API error much later, at call time
+// (deferred-work.md finding), without trying to fully validate the format.
+// Single source of truth — src/cli/resources/groups.ts's `config add-calendar`
+// handler and eval/setup.ts's `ensureEvalCalendarOverride` both import this.
+export const CALENDAR_ID_RE = /^(primary|[^\s@]+@[^\s@]+\.[^\s@]+)$/;
+
 /** Shape of the materialized `container.json` file read by the container runner. */
 export interface ContainerConfig {
   mcpServers: Record<string, McpServerConfig>;
