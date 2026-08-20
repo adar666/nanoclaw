@@ -160,6 +160,15 @@ export interface Session {
   container_status: 'running' | 'idle' | 'stopped';
   last_active: string | null;
   created_at: string;
+  /**
+   * AD-6 exclusion marker. `'eval'` for eval-harness scenario sessions
+   * (`eval/session.ts`'s `resolveEvalSession`) — `host-sweep.ts`'s own
+   * exclusion (Story 1.5, not yet built) will filter on this so those
+   * sessions are never swept/recovered like a real user session.
+   * Optional/nullable: every existing `Session` object literal across the
+   * host compiles unchanged.
+   */
+  managed_by?: string | null;
 }
 
 // ── Session DB entities ──

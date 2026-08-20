@@ -8,10 +8,14 @@ export const TASKS_SYSTEM_THREAD_ID = 'system:tasks';
 export function createSession(session: Session): void {
   getDb()
     .prepare(
-      `INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, agent_provider, status, container_status, last_active, created_at)
-       VALUES (@id, @agent_group_id, @messaging_group_id, @thread_id, @agent_provider, @status, @container_status, @last_active, @created_at)`,
+      `INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, agent_provider, status, container_status, last_active, created_at, managed_by)
+       VALUES (@id, @agent_group_id, @messaging_group_id, @thread_id, @agent_provider, @status, @container_status, @last_active, @created_at, @managed_by)`,
     )
-    .run(session);
+    // managed_by defaults to null: callers that omit the field (every
+    // pre-existing Session object literal) don't hit a "missing named
+    // parameter" error from better-sqlite3, which requires every @-bound
+    // key to be present on the object passed to .run().
+    .run({ ...session, managed_by: session.managed_by ?? null });
 }
 
 export function getSession(id: string): Session | undefined {
@@ -120,7 +124,7 @@ export function getRunningSessions(): Session[] {
 
 export function updateSession(
   id: string,
-  updates: Partial<Pick<Session, 'status' | 'container_status' | 'last_active' | 'agent_provider'>>,
+  updates: Partial<Pick<Session, 'status' | 'container_status' | 'last_active' | 'agent_provider' | 'managed_by'>>,
 ): void {
   const fields: string[] = [];
   const values: Record<string, unknown> = { id };

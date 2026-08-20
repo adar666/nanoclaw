@@ -10,12 +10,21 @@
  */
 import { randomUUID } from 'crypto';
 
-import { findSystemSession, createSession } from '../src/db/sessions.js';
+import { findSystemSession, createSession, updateSession } from '../src/db/sessions.js';
 import { log } from '../src/log.js';
 import { initSessionFolder } from '../src/session-manager.js';
 import type { Session } from '../src/types.js';
 
 export const EVAL_THREAD_PREFIX = 'system:eval';
+
+/**
+ * AD-6 exclusion marker value for eval-harness sessions — one named constant
+ * so the literal string appears exactly once, not re-typed at each call site
+ * (a typo like `'evla'` would type-check silently against `Session`'s loose
+ * `managed_by?: string | null` and never match whatever `host-sweep.ts`'s
+ * Story 1.5 exclusion filters on).
+ */
+export const EVAL_MANAGED_BY = 'eval';
 
 /**
  * Find or create the isolated eval session for a given thread id.
@@ -32,7 +41,18 @@ export function resolveEvalSession(agentGroupId: string, threadId: string): { se
   }
 
   const existing = findSystemSession(agentGroupId, threadId);
-  if (existing) return { session: existing, created: false };
+  if (existing) {
+    // Backfill: a session created before this marker existed (or by any
+    // future path that doesn't set it) would otherwise stay permanently
+    // unmarked and invisible to host-sweep.ts's Story 1.5 exclusion once
+    // that lands — defensive, not currently reachable in this install (no
+    // eval session predates this marker), but cheap to close.
+    if (existing.managed_by !== EVAL_MANAGED_BY) {
+      updateSession(existing.id, { managed_by: EVAL_MANAGED_BY });
+      existing.managed_by = EVAL_MANAGED_BY;
+    }
+    return { session: existing, created: false };
+  }
 
   const id = `eval-${randomUUID()}`;
   const session: Session = {
@@ -45,6 +65,10 @@ export function resolveEvalSession(agentGroupId: string, threadId: string): { se
     container_status: 'stopped',
     last_active: null,
     created_at: new Date().toISOString(),
+    // AD-6 exclusion marker — host-sweep.ts's own exclusion (Story 1.5,
+    // not yet built) will filter on this so an eval scenario session is
+    // never swept/recovered like a real user session.
+    managed_by: EVAL_MANAGED_BY,
   };
 
   createSession(session);

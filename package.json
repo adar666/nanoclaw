@@ -25,7 +25,8 @@
     "lint": "eslint src/",
     "lint:fix": "eslint src/ --fix",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "test:eval-live": "EVAL_LIVE_TEST=1 vitest run eval/runner.live.test.ts"
   },
   "dependencies": {
     "@chat-adapter/telegram": "4.29.0",

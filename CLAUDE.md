@@ -72,6 +72,7 @@ Hard-won, not hypothetical — each line below is something that actually went w
 
 - `pnpm test` (host, vitest) and `cd container/agent-runner && bun test` (container, bun:test) are two separate suites on two separate runtimes — a green run of one says nothing about the other. Run both when a change touches both trees.
 - `pnpm exec tsc --noEmit -p .` (host) and `pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit` (container) are two separate tsconfigs — same split as above.
+- `pnpm run test:eval-live` (`eval/runner.live.test.ts`) is a real end-to-end eval-harness test — real container, real Claude call, real tokens spent. Excluded from `pnpm test` and from CI; run it only deliberately, and confirm with the operator before the first run of a session.
 <!-- AGENTS-BMAD:end -->
 
 ## Entity Model

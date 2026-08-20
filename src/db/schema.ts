@@ -118,7 +118,8 @@ CREATE TABLE sessions (
   status             TEXT DEFAULT 'active',
   container_status   TEXT DEFAULT 'stopped',
   last_active        TEXT,
-  created_at         TEXT NOT NULL
+  created_at         TEXT NOT NULL,
+  managed_by         TEXT -- AD-6 exclusion marker, e.g. 'eval' (migration 025)
 );
 CREATE INDEX idx_sessions_agent_group ON sessions(agent_group_id);
 CREATE INDEX idx_sessions_lookup ON sessions(messaging_group_id, thread_id);
