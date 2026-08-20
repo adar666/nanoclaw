@@ -19,12 +19,12 @@ A scenario file is a list of these — one file per scenario **set** (e.g. `gues
 
 ## Worked example — the real scenario that motivated this spec
 
-Drawn directly from this session's live (manual, one-off) testing of the calendar skill's guest-resolution claim.
+Drawn directly from this session's live (manual, one-off) testing of the calendar skill's guest-resolution claim, adapted to run against the dedicated eval agent group rather than the real `household` group it was originally tested against (see the architecture spine's AD-1 — `agentGroupId` here is never a real production group, always the isolated one `eval/setup.ts` creates).
 
 ```ts
 {
   id: "guest-resolution-known-name",
-  agentGroupId: "ag-2146c1ff-6be5-45ba-8fd8-462792283951", // household
+  agentGroupId: EVAL_AGENT_GROUP_ID, // the dedicated eval-only group (setup.ts), NEVER a real production group
   message: "פגישה מחר ב19 תוסיף את דבורה כאורחת",
   judging: {
     type: "deterministic",
@@ -43,7 +43,7 @@ A qualitative counterpart — the "ask, don't guess" half of the same claim:
 ```ts
 {
   id: "guest-resolution-ambiguous-name",
-  agentGroupId: "ag-2146c1ff-6be5-45ba-8fd8-462792283951",
+  agentGroupId: EVAL_AGENT_GROUP_ID,
   message: "פגישה מחר ב19 תוסיף את רותי כאורחת", // "Ruthie" — not in people.md
   judging: {
     type: "llmJudge",
