@@ -174,3 +174,10 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-eval-1-5-host-sweep-exclusion.md`
   summary: No supporting DB index on `sessions(status)`/`sessions(container_status)`/`sessions(managed_by)` -- `getRunningSessions()` in particular backs `delivery.ts`'s 1-second `pollActive` loop, not just the 60s sweep, so this is a full-table scan on every second, and unbounded eval-session growth (see the teardown/pruning gap above) would compound it over time.
   evidence: Blind-hunter finding. Pre-existing, not introduced by this story -- a general DB-perf backlog item, worth a look given eval sessions are a new, actively-growing contributor to the table this query scans.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-eval-1-6-deterministic-judging.md`
+  summary: `DeterministicCheckContext` carries only `transcript` -- no scenario id/name/metadata. A real gap once the scenario loader exists (a check function or a report line can't self-identify which scenario it ran under), but no scenario-loading code exists yet anywhere in this codebase (that's Story 1.7's job) -- premature to design the shape now.
+  evidence: Blind-hunter finding, independently plausible on its own merits. Deferred to Story 1.7, which will build the actual scenario-loader/runner wiring this context type feeds into.
+- source_spec: `_bmad-output/implementation-artifacts/spec-eval-1-6-deterministic-judging.md`
+  summary: No barrel (`eval/judge/index.ts`) re-exporting `judgeDeterministic` et al. -- reasonable once `judge/llm.ts` (Epic 2) exists alongside it as a sibling, but nothing outside this one module imports from `eval/judge/` yet.
+  evidence: Blind-hunter finding. Premature -- no second file in the directory yet, and no consumer at all until Story 1.7. Revisit when Epic 2 adds `judge/llm.ts`.
