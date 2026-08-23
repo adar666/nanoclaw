@@ -53,7 +53,7 @@ vi.mock('./judge/llm.js', () => ({
 import { closeDb } from '../src/db/index.js';
 import type { OutboundMessage } from '../src/db/session-db.js';
 import { readEnvFile } from '../src/env.js';
-import { runCli, runOneScenario } from './cli.js';
+import { dispatchEvalCli, runCli, runOneScenario } from './cli.js';
 import { judgeDeterministic } from './judge/deterministic.js';
 import { judgeLlm } from './judge/llm.js';
 import type { Scenario } from './loader.js';
@@ -446,5 +446,89 @@ describe('runOneScenario (llmJudge branch)', () => {
     expect(entry.passed).toBe(false);
     expect(mockedJudgeLlm).not.toHaveBeenCalled();
     expect(mockedJudgeDeterministic).not.toHaveBeenCalled();
+  });
+});
+
+describe('dispatchEvalCli (Story 3.1)', () => {
+  // "sweep" routes to the real `runSweep()` (`./sweep.js`, not mocked in this
+  // file) — it drives `runScenarioTurn` (mocked above, same as every other
+  // test in this file) under the real `withEvalLock`/`ensureEvalScenarioGroup`
+  // path, exactly like a real `pnpm eval sweep` invocation would.
+  it('routes "sweep" to runSweep(), returning its SweepResult', async () => {
+    mockedRunScenarioTurn.mockReset();
+    mockedRunScenarioTurn.mockResolvedValueOnce({
+      status: 'completed',
+      transcript: [outboundMsg('SWEEP: REMOVED 2')],
+      sessionId: 's-sweep',
+    });
+
+    const result = await dispatchEvalCli(['sweep']);
+
+    expect(result).toEqual({ removedCount: 2, agentReplyText: 'SWEEP: REMOVED 2' });
+    expect(mockedRunScenarioTurn).toHaveBeenCalledTimes(1);
+    const [, threadId] = mockedRunScenarioTurn.mock.calls[0];
+    expect(threadId).toBe(`${EVAL_THREAD_PREFIX}:sweep`);
+  });
+
+  it('routes "run" to the existing runCli(argv), unchanged', async () => {
+    queueTurns(
+      { status: 'completed', transcript: [outboundMsg('נוסף כאורח: adardevora@gmail.com')], sessionId: 's1' },
+      COMPLETED_CLEANUP,
+    );
+    mockedJudgeDeterministic.mockReturnValue({ passed: true, evidence: 'adardevora@gmail.com' });
+
+    const report = await dispatchEvalCli(['run', 'guest-resolution']);
+    writtenReportDirs.push(path.join(REPORTS_DIR, (report as Awaited<ReturnType<typeof runCli>>).runId));
+
+    expect(report).toMatchObject({ scenarioSetName: 'guest-resolution' });
+    expect(process.exitCode).toBe(0);
+  });
+
+  it('rejects with one usage error naming both "run" and "sweep" for an unknown subcommand, touching nothing (no lock file either)', async () => {
+    await expect(dispatchEvalCli(['bogus'])).rejects.toThrow(/run.*sweep|sweep.*run/is);
+    expect(mockedRunScenarioTurn).not.toHaveBeenCalled();
+    expect(fs.existsSync(EVAL_LOCK_PATH)).toBe(false);
+  });
+
+  it('rejects with one usage error naming both "run" and "sweep" when no subcommand is given, touching nothing (no lock file either)', async () => {
+    await expect(dispatchEvalCli([])).rejects.toThrow(/run.*sweep|sweep.*run/is);
+    expect(mockedRunScenarioTurn).not.toHaveBeenCalled();
+    expect(fs.existsSync(EVAL_LOCK_PATH)).toBe(false);
+  });
+
+  it('rejects for "sweep" with a trailing extra argument, matching run\'s own strictness about extra args', async () => {
+    await expect(dispatchEvalCli(['sweep', 'extra-arg'])).rejects.toThrow(/usage/i);
+    expect(mockedRunScenarioTurn).not.toHaveBeenCalled();
+  });
+
+  it("a bad subcommand's throw is a genuine promise rejection, not a synchronous throw that would escape the entry point's own .catch() (regression: all 3 review layers converged on this)", async () => {
+    // Mirrors the real CLI entry point's own exact call shape
+    // (`dispatchEvalCli(argv).catch(handler)`) — a bare `expect(() =>
+    // ...).toThrow()` on the call itself would pass whether the throw is
+    // synchronous or a rejection, so it can't verify this specific fix.
+    // Calling `.catch` directly on the returned value proves `dispatchEvalCli`
+    // never throws synchronously — a real synchronous throw here would blow
+    // up this very line, before `.catch` could even be attached to it.
+    let caught: unknown;
+    await dispatchEvalCli(['bogus']).catch((err) => {
+      caught = err;
+    });
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toMatch(/run.*sweep|sweep.*run/is);
+  });
+
+  it('a "sweep" run never calls writeReport or creates anything under eval/reports/ — a sweep is not a scenario run', async () => {
+    mockedRunScenarioTurn.mockReset();
+    mockedRunScenarioTurn.mockResolvedValueOnce({
+      status: 'completed',
+      transcript: [outboundMsg('SWEEP: CLEAN')],
+      sessionId: 's-sweep-2',
+    });
+    const before = fs.existsSync(REPORTS_DIR) ? fs.readdirSync(REPORTS_DIR) : [];
+
+    await dispatchEvalCli(['sweep']);
+
+    const after = fs.existsSync(REPORTS_DIR) ? fs.readdirSync(REPORTS_DIR) : [];
+    expect(after).toEqual(before);
   });
 });

@@ -1,15 +1,17 @@
 /**
- * CLI entry point: `pnpm eval run <scenario-set-name>`.
+ * CLI entry point: `pnpm eval run <scenario-set-name>` or `pnpm eval sweep`.
  *
- * Drives the whole pipeline this epic built — `loader → runner →
+ * `dispatchEvalCli` (bottom of this file) routes between the two: `run`
+ * drives the whole pipeline this epic built — `loader → runner →
  * judge/deterministic (or judge/llm, depending on the scenario's judging
  * type) → reporter` — under one `withEvalLock` call (AD-8), matching
  * `lock.ts`'s own docstring expectation that this file is its first real
- * caller. Exactly one invocation shape is supported: an unknown
- * subcommand or an unregistered scenario-set name is a clear error to
- * stderr with `process.exitCode = 1` and, per the I/O matrix, is thrown
- * before `withEvalLock` ever acquires — a bad invocation touches no
- * session, no container, no lock file.
+ * caller; `sweep` (Story 3.1) delegates to `./sweep.js`'s `runSweep()`, its
+ * own standalone, differently-shaped operation. Exactly two subcommands are
+ * supported: an unknown subcommand, no subcommand, or an unregistered
+ * scenario-set name is a clear error to stderr with `process.exitCode = 1`
+ * and, per the I/O matrix, is thrown before `withEvalLock` ever acquires —
+ * a bad invocation touches no session, no container, no lock file.
  */
 import { log } from '../src/log.js';
 import { judgeDeterministic } from './judge/deterministic.js';
@@ -20,6 +22,7 @@ import { makeRunId, writeReport, type Report, type ScenarioReportEntry } from '.
 import { runScenarioTurn } from './runner.js';
 import { EVAL_THREAD_PREFIX } from './session.js';
 import { bootstrapDb, ensureEvalJudgeGroup, ensureEvalScenarioGroup } from './setup.js';
+import { runSweep, type SweepResult } from './sweep.js';
 
 interface ParsedArgs {
   scenarioSetName: string;
@@ -227,11 +230,46 @@ export async function runCli(argv: string[]): Promise<Report> {
   return report;
 }
 
+/**
+ * Top-level subcommand dispatcher (Story 3.1). Recognizes exactly two
+ * subcommands: `run` (delegates the full, unmodified `argv` to `runCli`,
+ * which does its own scenario-set-name parsing/validation) and `sweep`
+ * (delegates to `runSweep()`, which takes no arguments — a trailing extra
+ * argument is a usage error, same strictness `run`'s own `parseArgs`
+ * already applies). Anything else — an unknown subcommand, or no
+ * subcommand at all — is one clear, combined usage error naming both,
+ * thrown before either handler runs so a bad invocation never touches a
+ * lock, a session, or a container.
+ *
+ * Declared `async` deliberately (review finding, converged across all 3
+ * review layers): a plain function's own `throw` below is a *synchronous*
+ * throw, not a promise rejection — the real CLI entry point at the bottom
+ * of this file calls `dispatchEvalCli(argv).catch(...)`, and a synchronous
+ * throw happens while evaluating that call expression, before `.catch` is
+ * even attached, so it would have crashed as a raw uncaught exception
+ * instead of the clean `eval: <message>` handling every other error path
+ * in this file gets. `async` makes every throw in this function body
+ * uniformly become a rejection, the same guarantee `runCli`'s own
+ * `async` declaration already provides for `parseArgs`'s throw.
+ *
+ * Exported for `cli.test.ts`'s own direct coverage of the dispatch routing,
+ * same reasoning as `runOneScenario` above.
+ */
+export async function dispatchEvalCli(argv: string[]): Promise<Report | SweepResult> {
+  const [subcommand, ...rest] = argv;
+  if (subcommand === 'run') return runCli(argv);
+  if (subcommand === 'sweep') {
+    if (rest.length > 0) throw new Error(`Usage: pnpm eval sweep. Got: ${JSON.stringify(argv)}`);
+    return runSweep();
+  }
+  throw new Error(`Usage: pnpm eval run <scenario-set-name> | pnpm eval sweep. Got: ${JSON.stringify(argv)}`);
+}
+
 // CLI entry point — only runs when this file is executed directly (`tsx
 // eval/cli.ts`, via the "eval" package.json script), not when imported by
 // tests or other eval/ modules.
 if (import.meta.url === `file://${process.argv[1]}`) {
-  runCli(process.argv.slice(2)).catch((err) => {
+  dispatchEvalCli(process.argv.slice(2)).catch((err) => {
     console.error(`eval: ${err instanceof Error ? err.message : String(err)}`);
     process.exitCode = 1;
   });

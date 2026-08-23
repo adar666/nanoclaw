@@ -51,6 +51,6 @@ development_status:
   2-3-ambiguous-name-scenario-and-full-report: review
   epic-2-retrospective: optional
 
-  epic-3: backlog
-  3-1-standalone-stale-event-sweep: backlog
+  epic-3: in-progress
+  3-1-standalone-stale-event-sweep: review
   epic-3-retrospective: optional
