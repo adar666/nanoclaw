@@ -45,8 +45,8 @@ development_status:
   1-7-cli-entry-point-cleanup-and-report: review
   epic-1-retrospective: optional
 
-  epic-2: backlog
-  2-1-judge-s-own-isolated-agent-group: backlog
+  epic-2: in-progress
+  2-1-judge-s-own-isolated-agent-group: review
   2-2-llm-judge-verdict-with-reasoning: backlog
   2-3-ambiguous-name-scenario-and-full-report: backlog
   epic-2-retrospective: optional

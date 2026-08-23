@@ -35,6 +35,7 @@ import { readEnvFile } from '../src/env.js';
 import {
   ensureAgentGroup,
   ensureEvalCalendarOverride,
+  ensureEvalJudgeGroup,
   ensureEvalPeopleMount,
   ensureEvalScenarioGroup,
 } from './setup.js';
@@ -118,6 +119,46 @@ describe('ensureEvalScenarioGroup', () => {
     const group = getAgentGroupByFolder('eval')!;
     const config = getContainerConfig(group.id)!;
     expect(JSON.parse(config.additional_mounts)).toEqual([]);
+  });
+});
+
+describe('ensureEvalJudgeGroup', () => {
+  it('creates a new group with folder "eval-judge", the expected display name, and zero destinations on first run', () => {
+    const group = ensureEvalJudgeGroup();
+
+    expect(group.folder).toBe('eval-judge');
+    expect(group.name).toBe('Eval Harness (Judge)');
+    expect(getDestinations(group.id)).toEqual([]);
+  });
+
+  it('is idempotent: re-running returns the same group, no duplicate row', () => {
+    const first = ensureEvalJudgeGroup();
+    const second = ensureEvalJudgeGroup();
+
+    expect(second.id).toBe(first.id);
+    expect(getAllAgentGroups().filter((g) => g.folder === 'eval-judge')).toHaveLength(1);
+  });
+
+  it('does not touch the calendar registry or additional mounts', () => {
+    const group = ensureEvalJudgeGroup();
+
+    const config = getContainerConfig(group.id)!;
+    expect(JSON.parse(config.calendar_registry)).toEqual([]);
+    expect(JSON.parse(config.additional_mounts)).toEqual([]);
+  });
+
+  it('leaves the scenario group untouched', () => {
+    process.env.EVAL_TEST_CALENDAR_ID = 'eval-test@group.calendar.google.com';
+    const scenarioGroup = ensureEvalScenarioGroup();
+    const scenarioConfigBefore = getContainerConfig(scenarioGroup.id)!;
+
+    ensureEvalJudgeGroup();
+
+    const scenarioConfigAfter = getContainerConfig(scenarioGroup.id)!;
+    expect(scenarioConfigAfter.calendar_registry).toEqual(scenarioConfigBefore.calendar_registry);
+    expect(scenarioConfigAfter.additional_mounts).toEqual(scenarioConfigBefore.additional_mounts);
+    expect(getDestinations(scenarioGroup.id)).toEqual([]);
+    expect(getAllAgentGroups().filter((g) => g.folder === 'eval')).toHaveLength(1);
   });
 });
 

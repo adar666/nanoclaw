@@ -42,8 +42,8 @@ export function ensureAgentGroup(folder: string, name: string): AgentGroup {
 /**
  * The dedicated, isolated agent group that eval scenario turns run in.
  *
- * Epic 2 Story 2.1 adds a sibling `ensureEvalJudgeGroup()` (folder
- * `eval-judge`) alongside this one — not built here.
+ * See the sibling `ensureEvalJudgeGroup()` below (folder `eval-judge`) —
+ * structurally distinct from this group (AD-3).
  */
 export function ensureEvalScenarioGroup(): AgentGroup {
   const group = ensureAgentGroup('eval', 'Eval Harness (Scenario)');
@@ -130,6 +130,22 @@ export function ensureEvalPeopleMount(agentGroupId: string): void {
 }
 
 /**
+ * The dedicated, isolated agent group that eval judge turns will run in
+ * (Story 2.2 adds the actual judge session/spawn logic — this story only
+ * provisions the group itself).
+ *
+ * Structurally separate from `ensureEvalScenarioGroup()`'s group (AD-3 in
+ * the eval-harness architecture spine — a different AD-3 exists in the
+ * Google-Calendar epic's own spine, unrelated: a judge bug must never touch
+ * the scenario's own session/group state). No calendar override, no
+ * `people.md` mount — the judge is only meant to read a transcript and a
+ * rubric, never Calendar or guest data.
+ */
+export function ensureEvalJudgeGroup(): AgentGroup {
+  return ensureAgentGroup('eval-judge', 'Eval Harness (Judge)');
+}
+
+/**
  * Central-DB bootstrap for standalone execution, matching
  * scripts/init-first-agent.ts. Exported — Story 1.7's `cli.ts` reuses this
  * exact path rather than a second DB-init implementation.
@@ -143,6 +159,8 @@ export function bootstrapDb(): void {
 // eval/setup.ts`), not when imported by tests or other eval/ modules.
 if (import.meta.url === `file://${process.argv[1]}`) {
   bootstrapDb();
-  const group = ensureEvalScenarioGroup();
-  console.log(`Eval scenario agent group ready: ${group.id} (${group.folder})`);
+  const scenarioGroup = ensureEvalScenarioGroup();
+  console.log(`Eval scenario agent group ready: ${scenarioGroup.id} (${scenarioGroup.folder})`);
+  const judgeGroup = ensureEvalJudgeGroup();
+  console.log(`Eval judge agent group ready: ${judgeGroup.id} (${judgeGroup.folder})`);
 }
