@@ -129,8 +129,12 @@ export function ensureEvalPeopleMount(agentGroupId: string): void {
   }
 }
 
-/** Central-DB bootstrap for standalone execution, matching scripts/init-first-agent.ts. */
-function bootstrapDb(): void {
+/**
+ * Central-DB bootstrap for standalone execution, matching
+ * scripts/init-first-agent.ts. Exported — Story 1.7's `cli.ts` reuses this
+ * exact path rather than a second DB-init implementation.
+ */
+export function bootstrapDb(): void {
   const db = initDb(path.join(DATA_DIR, 'v2.db'));
   runMigrations(db); // idempotent
 }

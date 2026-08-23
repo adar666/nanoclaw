@@ -43,7 +43,5 @@ describe.skipIf(!process.env.EVAL_LIVE_TEST)('runScenarioTurn (live)', () => {
     expect(result.status).toBe('completed');
     expect(result.transcript.length).toBeGreaterThan(0);
     expect(result.sessionId).toBeTruthy();
-  }, // Matches runScenarioTurn's own default timeoutMs (300_000) plus margin
-  // for container spawn — a real turn is not fast.
-  320_000);
+  }, 320_000); // for container spawn — a real turn is not fast. // Matches runScenarioTurn's own default timeoutMs (300_000) plus margin
 });

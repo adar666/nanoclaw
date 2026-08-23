@@ -58,3 +58,6 @@ launchd/NanoClawBridge.app/
 
 # Per-host scheduler lock, not shared state.
 .claude/scheduled_tasks.lock
+
+# Eval harness run artifacts — never committed.
+eval/reports/
