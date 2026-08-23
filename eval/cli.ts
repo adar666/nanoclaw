@@ -2,9 +2,10 @@
  * CLI entry point: `pnpm eval run <scenario-set-name>`.
  *
  * Drives the whole pipeline this epic built — `loader → runner →
- * judge/deterministic → reporter` — under one `withEvalLock` call (AD-8),
- * matching `lock.ts`'s own docstring expectation that this file is its first
- * real caller. Exactly one invocation shape is supported: an unknown
+ * judge/deterministic (or judge/llm, depending on the scenario's judging
+ * type) → reporter` — under one `withEvalLock` call (AD-8), matching
+ * `lock.ts`'s own docstring expectation that this file is its first real
+ * caller. Exactly one invocation shape is supported: an unknown
  * subcommand or an unregistered scenario-set name is a clear error to
  * stderr with `process.exitCode = 1` and, per the I/O matrix, is thrown
  * before `withEvalLock` ever acquires — a bad invocation touches no
@@ -12,12 +13,13 @@
  */
 import { log } from '../src/log.js';
 import { judgeDeterministic } from './judge/deterministic.js';
+import { judgeLlm } from './judge/llm.js';
 import { loadScenarios, SCENARIO_SETS, type Scenario } from './loader.js';
 import { withEvalLock } from './lock.js';
 import { makeRunId, writeReport, type Report, type ScenarioReportEntry } from './reporter.js';
 import { runScenarioTurn } from './runner.js';
 import { EVAL_THREAD_PREFIX } from './session.js';
-import { bootstrapDb, ensureEvalScenarioGroup } from './setup.js';
+import { bootstrapDb, ensureEvalJudgeGroup, ensureEvalScenarioGroup } from './setup.js';
 
 interface ParsedArgs {
   scenarioSetName: string;
@@ -55,19 +57,26 @@ function parseArgs(argv: string[]): ParsedArgs {
  * environmental problems the whole run should abort loudly for, not a
  * per-scenario verdict.
  *
+ * `judgeAgentGroupId` is infrastructure (which isolated agent group the
+ * judge's own turn spawns under), never scenario content — `runCli`
+ * provisions it once via `ensureEvalJudgeGroup()` and passes it to every
+ * call, unconditionally, even for a scenario set with zero `llmJudge`
+ * scenarios.
+ *
  * Exported for `cli.test.ts`'s own direct unit coverage of the `llmJudge`
- * stub branch — the registered `guest-resolution` set has no `llmJudge`
- * scenario to exercise that branch through `runCli` end to end, so it needs
- * a hand-built `Scenario` object instead.
+ * branch — the registered `guest-resolution` set's own `llmJudge` scenario
+ * (`guest-resolution-ambiguous-name`) exercises it through `runCli` too, but
+ * a hand-built `Scenario` gives finer-grained control over pass/fail/throw
+ * cases without needing three separate scenario-set fixtures.
  */
-export async function runOneScenario(scenario: Scenario): Promise<ScenarioReportEntry> {
+export async function runOneScenario(scenario: Scenario, judgeAgentGroupId: string): Promise<ScenarioReportEntry> {
   const threadId = `${EVAL_THREAD_PREFIX}:${scenario.id}`;
   const turn = await runScenarioTurn(scenario.agentGroupId, threadId, scenario.message);
 
   let entry: ScenarioReportEntry;
   if (turn.status !== 'completed') {
     // A turn that never reached 'completed' is reported failed, with the
-    // status as evidence — judgeDeterministic is never called against an
+    // status as evidence — neither judge is ever called against an
     // incomplete transcript.
     entry = {
       id: scenario.id,
@@ -77,15 +86,33 @@ export async function runOneScenario(scenario: Scenario): Promise<ScenarioReport
       evidence: `turn did not complete: status=${turn.status}`,
     };
   } else if (scenario.judging.type === 'llmJudge') {
-    // Epic 2 territory (judge/llm.ts doesn't exist yet) — a clear, distinct
-    // report entry, not a silent skip.
-    entry = {
-      id: scenario.id,
-      status: 'unsupported',
-      judging: 'llmJudge',
-      passed: false,
-      evidence: 'llmJudge scenarios are not executed until Epic 2 adds judge/llm.ts',
-    };
+    try {
+      const judgeThreadId = `${EVAL_THREAD_PREFIX}:judge:${scenario.id}`;
+      const verdict = await judgeLlm(judgeAgentGroupId, judgeThreadId, turn.transcript, scenario.judging.rubric);
+      entry = {
+        id: scenario.id,
+        status: 'completed',
+        judging: 'llmJudge',
+        passed: verdict.verdict === 'pass',
+        evidence: verdict.reasoning,
+      };
+    } catch (err) {
+      // Mirrors the deterministic branch's own check()-throwing case below
+      // exactly: judgeLlm's own documented failure modes (an incomplete
+      // judge turn, an unparseable judge reply) are caught here rather than
+      // left to propagate — a judging failure on one scenario must not abort
+      // the whole run, skip that scenario's own cleanup, or discard every
+      // other scenario's already-computed report entry.
+      const message = err instanceof Error ? err.message : String(err);
+      log.error('Scenario llmJudge threw', { scenarioId: scenario.id, err });
+      entry = {
+        id: scenario.id,
+        status: 'judge-error',
+        judging: 'llmJudge',
+        passed: false,
+        evidence: `judgeLlm threw: ${message}`,
+      };
+    }
   } else {
     try {
       const judged = judgeDeterministic(turn.transcript, scenario.judging.check);
@@ -160,12 +187,17 @@ export async function runCli(argv: string[]): Promise<Report> {
   const report = await withEvalLock(async (): Promise<Report> => {
     bootstrapDb();
     const group = ensureEvalScenarioGroup();
+    // Provisioned unconditionally, even for a scenario set with zero
+    // llmJudge scenarios — idempotent, cheap, matches this file's existing
+    // "provision everything up front" pattern (mirrors ensureEvalScenarioGroup
+    // just above).
+    const judgeGroup = ensureEvalJudgeGroup();
     const scenarioSet = loadScenarios(scenarioSetName, group.id);
 
     const startedAt = new Date().toISOString();
     const entries: ScenarioReportEntry[] = [];
     for (const scenario of scenarioSet.scenarios) {
-      const entry = await runOneScenario(scenario);
+      const entry = await runOneScenario(scenario, judgeGroup.id);
       printSummaryLine(entry);
       entries.push(entry);
     }

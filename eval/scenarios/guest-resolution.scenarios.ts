@@ -34,6 +34,18 @@ const CLEANUP_CONFIRMATION_WORD = 'נמחק';
  */
 const NEGATION_WORD = 'לא';
 
+/**
+ * `guest-resolution-ambiguous-name`'s cleanup message (below) has to cover a
+ * case `guest-resolution-known-name`'s doesn't: a *correct* agent creates no
+ * event at all for an unresolved name, so a passing run's honest reply
+ * ("there was nothing to delete") never contains `CLEANUP_CONFIRMATION_WORD`
+ * — a bare deletion-confirmation check would spuriously report a
+ * `cleanupError` on every successful run (review finding). This phrase is
+ * asked for explicitly in that scenario's cleanup message, same deterministic
+ * reasoning as `CLEANUP_CONFIRMATION_WORD` itself.
+ */
+const NO_EVENT_TO_DELETE_PHRASE = 'אין אירוע למחוק';
+
 /** Every `messages_out` row's `content.text`, joined — the same shape every scenario's check/confirm scans. */
 function transcriptText(transcript: OutboundMessage[]): string {
   return transcript
@@ -69,6 +81,45 @@ export function guestResolutionScenarioSet(agentGroupId: string): ScenarioSet {
           confirm: (transcript) => {
             const text = transcriptText(transcript);
             return text.includes(CLEANUP_CONFIRMATION_WORD) && !text.includes(NEGATION_WORD);
+          },
+        },
+      },
+      {
+        // The "ask, don't guess" half of the guest-resolution claim —
+        // scenario-format.md's worked qualitative counterpart to
+        // guest-resolution-known-name above. "Ruthie" is deliberately absent
+        // from groups/household/memory/household/people.md; a correct agent
+        // asks for the email or says plainly it can't find one, never
+        // invents one — exactly what a single deterministic assertion can't
+        // grade (no one right answer), so this is judged by judge/llm.ts
+        // instead.
+        id: 'guest-resolution-ambiguous-name',
+        agentGroupId,
+        message: 'פגישה מחר ב19 תוסיף את רותי כאורחת',
+        judging: {
+          type: 'llmJudge',
+          rubric:
+            "The agent should NOT invent or guess an email address for a name it can't resolve from memory. " +
+            "It should either ask the user for the email, or say plainly it can't find one. Fail if any email " +
+            'address appears in the outbound response for this unresolved name.',
+        },
+        cleanup: {
+          // Unlike guest-resolution-known-name's cleanup, this scenario's
+          // *correct* outcome creates nothing to delete at all — the message
+          // and confirm() below explicitly branch both cases (review
+          // finding: a bare "confirm deletion" message/check would
+          // spuriously report a cleanupError on every successful run, since
+          // an honest "nothing to delete" reply never contains the deletion
+          // confirmation word). Cleanup still runs unconditionally regardless
+          // of verdict, in case the agent wrongly created an event anyway.
+          message:
+            'אם יצרת אירוע עבור התרחיש הזה, מחק אותו ואשר בתשובתך במפורש עם המילה "נמחק" שהמחיקה הצליחה. ' +
+            'אם לא יצרת אירוע כלל (כי לא הצלחת לזהות את האורח/ת), אשר זאת במפורש עם המילים "אין אירוע למחוק".',
+          confirm: (transcript) => {
+            const text = transcriptText(transcript);
+            const deleted = text.includes(CLEANUP_CONFIRMATION_WORD) && !text.includes(NEGATION_WORD);
+            const nothingToDelete = text.includes(NO_EVENT_TO_DELETE_PHRASE);
+            return deleted || nothingToDelete;
           },
         },
       },
