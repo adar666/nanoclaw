@@ -102,6 +102,10 @@ export interface RoutingContext {
    *  delivers from a task session; final-text `<message to>` blocks are inert
    *  and the final text auto-appends to the series run log. */
   taskRun: boolean;
+  /** Batch is an eval-harness run (isolated `system:eval`-prefixed session,
+   *  no attached chat). Mirrors `taskRun`: final text is auto-recorded
+   *  (as an `eval_log` row) instead of requiring a `<message to>` wrapper. */
+  evalRun: boolean;
 }
 
 /**
@@ -116,6 +120,7 @@ export function extractRouting(messages: MessageInRow[]): RoutingContext {
     threadId: first?.thread_id ?? null,
     inReplyTo: first?.id ?? null,
     taskRun: messages.length > 0 && messages.every((m) => m.kind === 'task'),
+    evalRun: messages.length > 0 && messages.every((m) => m.kind === 'eval'),
   };
 }
 
@@ -136,7 +141,7 @@ export function formatMessages(messages: MessageInRow[]): string {
   if (messages.length === 0) return header;
 
   // Group by kind
-  const chatMessages = messages.filter((m) => m.kind === 'chat' || m.kind === 'chat-sdk');
+  const chatMessages = messages.filter((m) => m.kind === 'chat' || m.kind === 'chat-sdk' || m.kind === 'eval');
   const taskMessages = messages.filter((m) => m.kind === 'task');
   const webhookMessages = messages.filter((m) => m.kind === 'webhook');
   const systemMessages = messages.filter((m) => m.kind === 'system');

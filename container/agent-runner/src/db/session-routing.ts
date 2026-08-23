@@ -33,3 +33,16 @@ export function getTaskSeriesId(): string | null {
   const threadId = getSessionRouting().thread_id;
   return threadId?.startsWith(TASK_THREAD_PREFIX) ? threadId.slice(TASK_THREAD_PREFIX.length) : null;
 }
+
+/**
+ * `eval/session.ts`'s `EVAL_THREAD_PREFIX` — duplicated as a literal since
+ * this tree (a separate Bun package) can't import from the host's `eval/`
+ * module. Keep in sync by hand if that value ever changes.
+ */
+const EVAL_THREAD_PREFIX = 'system:eval';
+
+/** True iff this is an isolated eval-harness session (no attached chat). */
+export function isEvalThread(): boolean {
+  const threadId = getSessionRouting().thread_id;
+  return threadId === EVAL_THREAD_PREFIX || (threadId?.startsWith(`${EVAL_THREAD_PREFIX}:`) ?? false);
+}

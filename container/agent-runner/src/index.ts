@@ -26,8 +26,8 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 import { loadConfig } from './config.js';
-import { buildSystemPromptAddendum } from './destinations.js';
-import { getTaskSeriesId } from './db/session-routing.js';
+import { buildSystemPromptAddendum, resolveSessionMode } from './destinations.js';
+import { getTaskSeriesId, isEvalThread } from './db/session-routing.js';
 import { ensureMemoryScaffold } from './memory/scaffold.js';
 import { MEMORY_SESSION_HOOK } from './memory/session-hook.js';
 // Providers barrel — each enabled provider self-registers on import.
@@ -68,7 +68,7 @@ async function main(): Promise<void> {
   const taskId = getTaskSeriesId();
   const instructions = buildSystemPromptAddendum(
     config.assistantName || undefined,
-    taskId ? { kind: 'task', taskId } : { kind: 'chat' },
+    resolveSessionMode(taskId, isEvalThread()),
   );
 
   // Discover additional directories mounted at /workspace/extra/*

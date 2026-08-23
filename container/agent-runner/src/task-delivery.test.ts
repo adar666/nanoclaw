@@ -39,6 +39,7 @@ const taskRouting: RoutingContext = {
   threadId: 'system:tasks:daily-digest-a1b2',
   inReplyTo: 'run-1',
   taskRun: true,
+  evalRun: false,
 };
 
 beforeEach(() => {

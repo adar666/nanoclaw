@@ -90,7 +90,7 @@ export async function runScenarioTurn(
   const messageId = `eval-msg-${randomUUID()}`;
   writeSessionMessage(agentGroupId, session.id, {
     id: messageId,
-    kind: 'chat',
+    kind: 'eval',
     timestamp: new Date().toISOString(),
     content: JSON.stringify({ text: message }),
     trigger: 1,

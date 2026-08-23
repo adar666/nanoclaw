@@ -471,10 +471,14 @@ interface RoutingContext {
   channelType: string | null;
   threadId: string | null;
   inReplyTo: string | null;  // messages_in.id of the triggering message
+  taskRun: boolean;          // batch is a task-series run — see below
+  evalRun: boolean;          // batch is an eval-harness run — see below
 }
 ```
 
 When writing messages_out (either from provider results or MCP tool calls), the agent-runner copies this routing context by default. The agent never sees routing fields — it just produces text. The routing is implicit: "respond to whoever sent the message."
+
+**Task and eval runs — no chat destination to reply to.** `taskRun`/`evalRun` are batch-level flags (every message in the batch has `kind: 'task'` / `kind: 'eval'` respectively) for a session with no attached chat: a scheduled task series, or an eval-harness scenario turn (zero destinations by design, AD-1). Both bypass the normal `<message to="name">` wrapping requirement — `dispatchResultText`'s `hasUnwrapped` check excludes them — and the final text is instead auto-recorded straight to `messages_out` (`task_log` / `eval_log` kind respectively, `poll-loop.ts`'s `writeAutoLog()`), never delivered anywhere. The container's own startup `SessionMode` (`chat` | `task` | `eval`, `destinations.ts`'s `resolveSessionMode()`) drives matching system-prompt framing, resolved from the session's thread-id prefix (`system:tasks:<id>` / `system:eval[:...]`, `session-routing.ts`).
 
 MCP tools that target a named destination (`send_message` / `send_file` with a `to`
 argument) resolve routing through the session's destination map instead of the default

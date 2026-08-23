@@ -99,6 +99,27 @@ afterEach(() => {
 });
 
 describe('runScenarioTurn', () => {
+  it("writes the scenario message as kind: 'eval', not 'chat' — spec-eval-session-output-capture", async () => {
+    vi.mocked(wakeContainer).mockImplementation(async (session: Session) => {
+      const messageId = latestInboundMessageId(session);
+      writeFakeContainerResponse(session, messageId, 'completed', JSON.stringify({ text: 'hello back' }));
+      return true;
+    });
+
+    const threadId = `${EVAL_THREAD_PREFIX}:turn-kind-eval`;
+    const result = await runScenarioTurn(AG, threadId, 'hi there', { timeoutMs: 2_000, pollIntervalMs: 10 });
+
+    const db = openInboundDb(AG, result.sessionId);
+    try {
+      const row = db.prepare('SELECT kind FROM messages_in ORDER BY seq DESC LIMIT 1').get() as
+        | { kind: string }
+        | undefined;
+      expect(row?.kind).toBe('eval');
+    } finally {
+      db.close();
+    }
+  });
+
   it("returns status completed with a transcript containing exactly the reply to this run's own message", async () => {
     vi.mocked(wakeContainer).mockImplementation(async (session: Session) => {
       const messageId = latestInboundMessageId(session);

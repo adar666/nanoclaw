@@ -13,7 +13,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
 import { initTestSessionDb, closeSessionDb, getInboundDb } from './db/connection.js';
 import { getPendingMessages } from './db/messages-in.js';
-import { formatMessages, stripInternalTags, stripLegacyTaskContract } from './formatter.js';
+import { extractRouting, formatMessages, stripInternalTags, stripLegacyTaskContract } from './formatter.js';
 import { TIMEZONE, formatLocalTime } from './timezone.js';
 
 beforeEach(() => {
@@ -202,6 +202,36 @@ describe('XML escaping', () => {
     const result = formatMessages(getPendingMessages());
     expect(result).toContain('sender="A &amp; B &lt;Co&gt;"');
     expect(result).toContain('&lt;script&gt;alert(&quot;xss&quot;)&lt;/script&gt;');
+  });
+});
+
+describe('eval-run routing and formatting', () => {
+  it('extractRouting derives evalRun true when every message is kind eval', () => {
+    insertMessage('e1', 'eval', { sender: 'Judge', text: 'is there an event tomorrow?' });
+    const routing = extractRouting(getPendingMessages());
+    expect(routing.evalRun).toBe(true);
+    expect(routing.taskRun).toBe(false);
+  });
+
+  it('extractRouting derives evalRun false for a mixed or non-eval batch', () => {
+    insertMessage('m1', 'chat', { sender: 'Alice', text: 'hi' });
+    expect(extractRouting(getPendingMessages()).evalRun).toBe(false);
+
+    insertMessage('e1', 'eval', { sender: 'Judge', text: 'hi' });
+    // Batch now has both a chat row and an eval row — not a pure eval batch.
+    expect(extractRouting(getPendingMessages()).evalRun).toBe(false);
+  });
+
+  it('extractRouting derives evalRun false for an empty batch', () => {
+    expect(extractRouting([]).evalRun).toBe(false);
+  });
+
+  it('formats an eval-kind message the same as a chat message', () => {
+    insertMessage('e1', 'eval', { sender: 'Judge', text: 'eval scenario text' });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('sender="Judge"');
+    expect(result).toContain('eval scenario text');
+    expect(result).toContain('<message');
   });
 });
 

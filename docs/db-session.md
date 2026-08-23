@@ -151,6 +151,8 @@ Content shapes: see [api-details.md §Session DB Schema Details](api-details.md#
 **Writer (container):** `writeMessageOut()` in `container/agent-runner/src/db/messages-out.ts`.
 **Readers (host):** `src/delivery.ts` (polling delivery), `getMessageIdBySeq()` / `getRoutingBySeq()` for edit/reaction targeting.
 
+**Auto-recorded, never-delivered kinds:** `task_log` (task-series runs) and `eval_log` (eval-harness runs, `container/agent-runner/src/db/session-routing.ts`'s `isEvalThread()`) are written directly by `poll-loop.ts`'s `writeAutoLog()` when the agent's final text has no `<message to="name">` wrapper — a task or eval session has no chat destination to deliver to, so instead of dropping the reply as scratchpad, it's persisted here as the readable record. Neither `src/delivery.ts` (eval sessions are excluded from its scan entirely by `managed_by: 'eval'`, AD-6) nor any external channel ever sees these rows.
+
 ### 4.2 `processing_ack`
 
 Container-side status for each `messages_in.id` it has touched. The host polls this and syncs status back into `messages_in` — this avoids the container ever writing to `inbound.db`.

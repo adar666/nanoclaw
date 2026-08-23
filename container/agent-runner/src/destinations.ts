@@ -21,7 +21,27 @@ export interface DestinationEntry {
   agentGroupId?: string;
 }
 
-export type SessionMode = { kind: 'chat' } | { kind: 'task'; taskId: string };
+export type SessionMode = { kind: 'chat' } | { kind: 'task'; taskId: string } | { kind: 'eval' };
+
+/**
+ * Resolves which `SessionMode` a container's own startup should use. Task
+ * mode takes priority (thread-id prefixes are mutually exclusive by
+ * construction, so this ordering is a formality, not a real conflict).
+ *
+ * Extracted out of `index.ts`'s own `main()` (review finding): `main()`
+ * can't be driven in-process in tests (`index.wiring.test.ts`'s own comment
+ * explains why — no test exercised this exact resolution before), so a
+ * regression here (`isEvalThread()` swapped for something always-false, the
+ * branch deleted, operator precedence broken) would have silently sent a
+ * real eval session the generic "you currently have no configured
+ * destinations" chat-mode framing instead of the eval-specific one, with
+ * nothing in the test suite catching it.
+ */
+export function resolveSessionMode(taskId: string | null, isEval: boolean): SessionMode {
+  if (taskId) return { kind: 'task', taskId };
+  if (isEval) return { kind: 'eval' };
+  return { kind: 'chat' };
+}
 
 interface DestRow {
   name: string;
@@ -65,9 +85,9 @@ export function findByRouting(
   const db = getInboundDb();
   const row =
     channelType === 'agent'
-      ? (db
-          .prepare("SELECT * FROM destinations WHERE type = 'agent' AND agent_group_id = ?")
-          .get(platformId) as DestRow | undefined)
+      ? (db.prepare("SELECT * FROM destinations WHERE type = 'agent' AND agent_group_id = ?").get(platformId) as
+          | DestRow
+          | undefined)
       : (db
           .prepare("SELECT * FROM destinations WHERE type = 'channel' AND channel_type = ? AND platform_id = ?")
           .get(channelType, platformId) as DestRow | undefined);
@@ -85,7 +105,13 @@ export function buildSystemPromptAddendum(assistantName?: string, mode: SessionM
   const sections: string[] = [];
 
   if (assistantName) {
-    sections.push(['# You are ' + assistantName, '', `Your name is **${assistantName}**. Use it when the channel asks who you are, when introducing yourself, and when signing any message that explicitly calls for a signature.`].join('\n'));
+    sections.push(
+      [
+        '# You are ' + assistantName,
+        '',
+        `Your name is **${assistantName}**. Use it when the channel asks who you are, when introducing yourself, and when signing any message that explicitly calls for a signature.`,
+      ].join('\n'),
+    );
   }
 
   sections.push(buildDestinationsSection(mode));
@@ -117,6 +143,13 @@ function buildDestinationsSection(mode: SessionMode): string {
       'This is an isolated task run with no attached chat. Only notify someone when the task asks you to. For a user-visible message, call `send_message({ to: "name", text: "..." })`; for a file, call `send_file` with `to`. Always pass the explicit named destination.',
       '',
       `Your final output is not sent to the user. End with a concise work-log summary. It is recorded automatically in \`tasks/${mode.taskId}.md\`. Read that file when you need context from earlier runs. Use \`ncl tasks append-log --msg "…"\` only for optional mid-run notes.`,
+    );
+    return lines.join('\n');
+  }
+
+  if (mode.kind === 'eval') {
+    lines.push(
+      'This is an automated evaluation run with no attached chat — there is no user on the other end and no destination to send to. Just answer normally in your final response; your output is captured directly, not sent anywhere.',
     );
     return lines.join('\n');
   }

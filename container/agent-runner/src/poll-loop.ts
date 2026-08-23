@@ -565,12 +565,18 @@ export async function processQuery(
           // Errors included: a failed run's text belongs in its log, not chat.
           // A corrective retry handles delivery only; its result is not a
           // second run summary.
-          if (routing.taskRun && !taskBlockNudged) autoAppendTaskLog(event.text);
-          if (sent === 0 && event.isError === true && !routing.taskRun) {
+          if (routing.taskRun && !taskBlockNudged) autoAppendTaskLog(event.text, routing.inReplyTo);
+          if (routing.evalRun) autoAppendEvalLog(event.text, routing.inReplyTo);
+          if (sent === 0 && event.isError === true && !routing.taskRun && !routing.evalRun) {
             // Non-retryable error turn (e.g. a 403 billing_error) with no
             // <message> envelope: deliver the notice instead of dropping it as
             // scratchpad, and skip the re-wrap nudge — it would just re-hammer
-            // the failing gateway turn after turn.
+            // the failing gateway turn after turn. Eval runs are excluded the
+            // same as task runs (review finding, converged across all 3
+            // review layers): the auto-log write above already captures the
+            // error text under `eval_log`; delivering it again here would
+            // additionally write a stray `kind: 'chat'` row into a
+            // zero-destination session, duplicating the same text.
             deliverErrorResult(event.text, routing);
             notifyExchangeComplete(onExchangeComplete, {
               prompt: archivePrompts[0] ?? initialPrompt,
@@ -758,9 +764,10 @@ export function dispatchResultText(
     log(`[scratchpad] ${scratchpad.slice(0, 500)}${scratchpad.length > 500 ? '…' : ''}`);
   }
 
-  // In a task run, plain final text is the NORMAL ending (it becomes the run
-  // log) — never treat it as an undelivered reply or nudge the agent to wrap it.
-  const hasUnwrapped = !routing.taskRun && sent === 0 && !!scratchpad;
+  // In a task or eval run, plain final text is the NORMAL ending (it becomes
+  // the run/eval log) — never treat it as an undelivered reply or nudge the
+  // agent to wrap it.
+  const hasUnwrapped = !routing.taskRun && !routing.evalRun && sent === 0 && !!scratchpad;
   if (hasUnwrapped) {
     log(`WARNING: agent output had no <message to="..."> blocks — nothing was sent`);
   }
@@ -807,7 +814,58 @@ function escapePromptXml(value: string): string {
  * `task_log` outbound row; the host appends it to the series' tasks/<id>.md
  * with its usual timestamp stamp. Never delivered to anyone.
  */
-export function autoAppendTaskLog(text: string): void {
+export function autoAppendTaskLog(text: string, inReplyTo: string | null = null): void {
+  if (!writeAutoLog(text, 'task_log', inReplyTo, TASK_LOG_MAX_CHARS)) return;
+  log('Task run log auto-appended from final text');
+}
+
+/**
+ * Eval-harness runs: the final text is the only readable record of what the
+ * agent actually said — there is no chat destination to deliver to (AD-1,
+ * zero destinations by design). Mirrors `autoAppendTaskLog` exactly, just
+ * under a distinct `eval_log` kind so the two auto-recorded log types stay
+ * distinguishable. Never delivered to anyone — `deliverSessionMessages`
+ * never even sees this row, since eval sessions are excluded from the
+ * host's delivery scan by their `managed_by: 'eval'` marker (AD-6).
+ *
+ * `inReplyTo` must be the eval scenario's own inbound message id
+ * (`routing.inReplyTo`) — `eval/runner.ts`'s `readTranscript` reads
+ * `messages_out` filtered by `in_reply_to = <that id>`, so an omitted or
+ * wrong value here means the harness's own transcript stays empty even
+ * though this row genuinely exists (review finding: the first version of
+ * this function reused `writeAutoLog`'s original signature, which never
+ * set `in_reply_to` at all — harmless for `task_log`, which nothing reads
+ * that way, but silently fix-defeating for `eval_log`, which is the one
+ * thing this whole change exists to make readable).
+ */
+export function autoAppendEvalLog(text: string, inReplyTo: string | null): void {
+  if (!writeAutoLog(text, 'eval_log', inReplyTo, EVAL_LOG_MAX_CHARS)) return;
+  log('Eval run log auto-appended from final text');
+}
+
+/** `task_log` is a terse run-summary notification — 500 chars has always been plenty. */
+const TASK_LOG_MAX_CHARS = 500;
+/**
+ * `eval_log` is read back by deterministic/LLM judges doing substring/regex
+ * matching against the full reply (an email address, a confirmation phrase,
+ * a VERDICT/REASONING line) — the same 500-char budget that's fine for a
+ * task summary risks silently truncating the exact content a judge is
+ * checking for (review finding, converged across 2 layers). Generous, not
+ * unbounded — still a real ceiling against a pathological reply.
+ */
+const EVAL_LOG_MAX_CHARS = 4000;
+
+/**
+ * Shared write path for both auto-recorded log kinds. Returns false (no row
+ * written) when the text is empty after clamping — mirrors the original
+ * `autoAppendTaskLog`'s own `if (!line) return;` guard.
+ */
+function writeAutoLog(
+  text: string,
+  kind: 'task_log' | 'eval_log',
+  inReplyTo: string | null,
+  maxChars: number,
+): boolean {
   // Run-log hygiene: an inert <message to> block never belongs in the log as
   // raw XML — replace each with its inner text, marked undelivered, so the
   // log stays readable prose.
@@ -815,14 +873,15 @@ export function autoAppendTaskLog(text: string): void {
     /<message\s+to="([^"]+)"\s*>([\s\S]*?)<\/message>/g,
     (_m, to: string, body: string) => `[undelivered → ${to}] ${body.trim()}`,
   );
-  const line = stripInternalTags(prose).replace(/\s+/g, ' ').trim().slice(0, 500);
-  if (!line) return;
+  const line = stripInternalTags(prose).replace(/\s+/g, ' ').trim().slice(0, maxChars);
+  if (!line) return false;
   writeMessageOut({
     id: generateId(),
-    kind: 'task_log',
+    kind,
+    in_reply_to: inReplyTo,
     content: JSON.stringify({ text: line }),
   });
-  log('Task run log auto-appended from final text');
+  return true;
 }
 
 function sendToDestination(dest: DestinationEntry, body: string, routing: RoutingContext): void {

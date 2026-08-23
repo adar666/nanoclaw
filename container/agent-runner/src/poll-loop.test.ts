@@ -498,6 +498,7 @@ const TASK_ROUTING = {
   threadId: 'system:tasks:ser-1',
   inReplyTo: 't1',
   taskRun: true,
+  evalRun: false,
 };
 
 function taskLogRows(): Array<{ text: string }> {
@@ -570,6 +571,70 @@ describe('task-run turn wiring (real processQuery)', () => {
     expect(logs[1]).toContain('[undelivered → local-cli] fire two result');
     expect(logs).not.toContain('first delivery decision handled');
     expect(logs).not.toContain('second delivery decision handled');
+  });
+});
+
+// --- Eval-run turn wiring: the REAL processQuery path — spec-eval-session-output-capture ---
+// Drives the actual call site (`if (routing.evalRun) autoAppendEvalLog(...)`)
+// so deleting the wiring — not just the standalone helper — goes red here,
+// same guarantee task-run wiring above has.
+
+const EVAL_ROUTING = {
+  platformId: null,
+  channelType: null,
+  threadId: 'system:eval:guest-resolution-known-name',
+  inReplyTo: 'eval-msg-1',
+  taskRun: false,
+  evalRun: true,
+};
+
+function evalLogRows(): Array<{ text: string }> {
+  return (
+    getOutboundDb()
+      .prepare("SELECT content FROM messages_out WHERE kind = 'eval_log' ORDER BY seq")
+      .all() as Array<{ content: string }>
+  ).map((r) => JSON.parse(r.content) as { text: string });
+}
+
+describe('eval-run turn wiring (real processQuery)', () => {
+  it('auto-appends the final text as an eval_log row, with no unwrapped-text nudge', async () => {
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      yield {
+        type: 'result',
+        text: "No event exists tomorrow. I also still don't have an email on file for Ruti.",
+      };
+    }
+    const query: AgentQuery = { push: () => {}, end: () => {}, events: events(), abort: () => {} };
+
+    await processQuery(query, EVAL_ROUTING, ['eval-msg-1'], 'claude', undefined, 'prompt', undefined);
+
+    const logs = evalLogRows();
+    expect(logs).toHaveLength(1);
+    expect(logs[0].text).toContain("No event exists tomorrow.");
+    // Nothing was delivered as chat, and no re-wrap nudge was pushed.
+    expect(getUndeliveredMessages().filter((m) => m.kind === 'chat')).toHaveLength(0);
+  });
+
+  it('does not push the "not wrapped in <message to>" nudge for an eval run', async () => {
+    const pushes: string[] = [];
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      yield { type: 'result', text: 'plain unwrapped answer, no <message to> block' };
+    }
+    const query: AgentQuery = {
+      push: (m: string) => {
+        pushes.push(m);
+      },
+      end: () => {},
+      events: events(),
+      abort: () => {},
+    };
+
+    await processQuery(query, EVAL_ROUTING, ['eval-msg-1'], 'claude', undefined, 'prompt', undefined);
+
+    expect(pushes.some((p) => p.includes('not delivered — it was not wrapped'))).toBe(false);
+    expect(evalLogRows()).toHaveLength(1);
   });
 });
 
