@@ -30,6 +30,11 @@ vi.mock('./runner.js', () => ({
   runScenarioTurn: vi.fn(),
 }));
 
+vi.mock('../src/container-runner.js', () => ({
+  killAllActiveContainers: vi.fn(),
+}));
+
+import { killAllActiveContainers } from '../src/container-runner.js';
 import { closeDb } from '../src/db/index.js';
 import type { OutboundMessage } from '../src/db/session-db.js';
 import { readEnvFile } from '../src/env.js';
@@ -41,6 +46,7 @@ import { runSweep } from './sweep.js';
 
 const mockedReadEnvFile = vi.mocked(readEnvFile);
 const mockedRunScenarioTurn = vi.mocked(runScenarioTurn);
+const mockedKillAllActiveContainers = vi.mocked(killAllActiveContainers);
 
 const PEOPLE_MD_PATH = `${TEST_ROOT}/groups/household/memory/household/people.md`;
 
@@ -72,6 +78,7 @@ beforeEach(() => {
   process.env.EVAL_TEST_CALENDAR_ID = 'eval-test@group.calendar.google.com';
   mockedReadEnvFile.mockReturnValue({});
   mockedRunScenarioTurn.mockReset();
+  mockedKillAllActiveContainers.mockReset();
 });
 
 afterEach(() => {
@@ -226,6 +233,32 @@ describe('runSweep', () => {
     mockedRunScenarioTurn.mockRejectedValue(spawnError);
 
     await expect(runSweep()).rejects.toBe(spawnError);
+  });
+
+  it(
+    'tears down every eval container this invocation spawned after a successful sweep (regression — 2026-08-24: ' +
+      'eval containers have no idle-timeout of their own, so a leftover from one invocation could still be ' +
+      'running when a later invocation spawns its own, against the identical session)',
+    async () => {
+      mockedRunScenarioTurn.mockResolvedValue(turnResult('completed', [outboundMsg('SWEEP: CLEAN')]));
+
+      await runSweep();
+
+      expect(mockedKillAllActiveContainers).toHaveBeenCalledTimes(1);
+      expect(mockedKillAllActiveContainers).toHaveBeenCalledWith(expect.any(String));
+    },
+  );
+
+  it('still tears down every spawned container even when the sweep throws (unparseable reply, or a propagated structural rejection)', async () => {
+    mockedRunScenarioTurn.mockResolvedValue(turnResult('completed', [outboundMsg('not a protocol reply at all')]));
+    await expect(runSweep()).rejects.toThrow(/could not parse/);
+    expect(mockedKillAllActiveContainers).toHaveBeenCalledTimes(1);
+
+    mockedKillAllActiveContainers.mockClear();
+    const spawnError = new Error('runScenarioTurn: wakeContainer failed to spawn a container');
+    mockedRunScenarioTurn.mockRejectedValue(spawnError);
+    await expect(runSweep()).rejects.toBe(spawnError);
+    expect(mockedKillAllActiveContainers).toHaveBeenCalledTimes(1);
   });
 
   it('spawns under the scenario agent group (never the judge group) on a dedicated sweep thread id, distinct from any scenario/judge thread id', async () => {

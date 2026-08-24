@@ -2,7 +2,13 @@ import fs from 'fs';
 import path from 'path';
 import { describe, expect, it } from 'vitest';
 
-import { hardeningArgs, isRetryableMountRace, resolveProviderName } from './container-runner.js';
+import {
+  getActiveContainerCount,
+  hardeningArgs,
+  isRetryableMountRace,
+  killAllActiveContainers,
+  resolveProviderName,
+} from './container-runner.js';
 
 describe('resolveProviderName', () => {
   it('prefers session over container config', () => {
@@ -170,5 +176,24 @@ describe('hardeningArgs', () => {
 
   it('floors fractional values', () => {
     expect(hardeningArgs('2048.7').join(' ')).toContain('--pids-limit 2048');
+  });
+});
+
+describe('killAllActiveContainers', () => {
+  // Every genuinely-populated case (a real spawnContainer call, which sets
+  // activeContainers) needs a real `spawn()`/Docker call this file's own
+  // existing tests don't mock — out of scope here, matching this file's
+  // established convention of only testing this module's pure/structural
+  // functions directly. What's cheaply and safely testable without that:
+  // the no-op case, which is also the ONLY case this module's own real
+  // callers (eval/cli.ts, eval/sweep.ts) exercise in their own mocked unit
+  // tests — see cli.test.ts's/sweep.test.ts's own coverage of "is called
+  // exactly once" for the call-site contract; this only proves the function
+  // itself doesn't throw or misbehave against an empty map, which is this
+  // test file's own process-global state in every other test here too.
+  it('does nothing and does not throw when no container is currently tracked', () => {
+    expect(getActiveContainerCount()).toBe(0);
+    expect(() => killAllActiveContainers('test')).not.toThrow();
+    expect(getActiveContainerCount()).toBe(0);
   });
 });

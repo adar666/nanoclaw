@@ -18,6 +18,7 @@
  * (which never goes through `runCli`'s own DB bootstrap) still works against
  * an initialized central DB.
  */
+import { killAllActiveContainers } from '../src/container-runner.js';
 import type { OutboundMessage } from '../src/db/session-db.js';
 import { log } from '../src/log.js';
 import { truncateForError } from './error-text.js';
@@ -111,34 +112,45 @@ function parseSweepReply(replyText: string): number {
  *   actually received (truncated).
  */
 export async function runSweep(): Promise<SweepResult> {
-  return withEvalLock(async (): Promise<SweepResult> => {
-    bootstrapDb();
-    const group = ensureEvalScenarioGroup();
+  try {
+    return await withEvalLock(async (): Promise<SweepResult> => {
+      bootstrapDb();
+      const group = ensureEvalScenarioGroup();
 
-    const turn = await runScenarioTurn(group.id, SWEEP_THREAD_ID, SWEEP_PROMPT);
-    if (turn.status !== 'completed') {
-      const message =
-        `runSweep: sweep turn did not complete — expected status "completed", got "${turn.status}" ` +
-        `(session ${turn.sessionId}); refusing to report a result for an unverified outcome`;
-      log.error('Eval sweep turn did not complete', { status: turn.status, sessionId: turn.sessionId });
-      throw new Error(message);
-    }
+      const turn = await runScenarioTurn(group.id, SWEEP_THREAD_ID, SWEEP_PROMPT);
+      if (turn.status !== 'completed') {
+        const message =
+          `runSweep: sweep turn did not complete — expected status "completed", got "${turn.status}" ` +
+          `(session ${turn.sessionId}); refusing to report a result for an unverified outcome`;
+        log.error('Eval sweep turn did not complete', { status: turn.status, sessionId: turn.sessionId });
+        throw new Error(message);
+      }
 
-    const agentReplyText = transcriptText(turn.transcript);
-    let removedCount: number;
-    try {
-      removedCount = parseSweepReply(agentReplyText);
-    } catch (err) {
-      log.error('Eval sweep reply unparseable', { err });
-      throw err;
-    }
+      const agentReplyText = transcriptText(turn.transcript);
+      let removedCount: number;
+      try {
+        removedCount = parseSweepReply(agentReplyText);
+      } catch (err) {
+        log.error('Eval sweep reply unparseable', { err });
+        throw err;
+      }
 
-    console.log(
-      removedCount > 0 ? `Sweep removed ${removedCount} event(s).` : 'Sweep found nothing to remove (already clean).',
-    );
-    console.log(`Agent reply:\n${truncateForError(agentReplyText)}`);
-    log.info('Eval sweep completed', { removedCount, agentGroupId: group.id });
+      console.log(
+        removedCount > 0 ? `Sweep removed ${removedCount} event(s).` : 'Sweep found nothing to remove (already clean).',
+      );
+      console.log(`Agent reply:\n${truncateForError(agentReplyText)}`);
+      log.info('Eval sweep completed', { removedCount, agentGroupId: group.id });
 
-    return { removedCount, agentReplyText };
-  });
+      return { removedCount, agentReplyText };
+    });
+  } finally {
+    // See runCli's identical finally in cli.ts / killAllActiveContainers's
+    // own doc comment: an eval container left running past its own
+    // invocation has no idle-timeout to ever reap it (host-sweep excludes
+    // eval sessions, AD-6), and a later invocation's fresh, empty
+    // activeContainers map can't detect it — the exact gap that let two real
+    // containers end up polling the identical session DB concurrently
+    // (found live, 2026-08-24, during a pnpm eval sweep re-verification run).
+    killAllActiveContainers('eval sweep complete');
+  }
 }

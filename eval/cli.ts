@@ -13,6 +13,7 @@
  * and, per the I/O matrix, is thrown before `withEvalLock` ever acquires —
  * a bad invocation touches no session, no container, no lock file.
  */
+import { killAllActiveContainers } from '../src/container-runner.js';
 import { log } from '../src/log.js';
 import { judgeDeterministic } from './judge/deterministic.js';
 import { judgeLlm } from './judge/llm.js';
@@ -187,43 +188,57 @@ function printSummaryLine(entry: ScenarioReportEntry): void {
 export async function runCli(argv: string[]): Promise<Report> {
   const { scenarioSetName } = parseArgs(argv);
 
-  const report = await withEvalLock(async (): Promise<Report> => {
-    bootstrapDb();
-    const group = ensureEvalScenarioGroup();
-    // Provisioned unconditionally, even for a scenario set with zero
-    // llmJudge scenarios — idempotent, cheap, matches this file's existing
-    // "provision everything up front" pattern (mirrors ensureEvalScenarioGroup
-    // just above).
-    const judgeGroup = ensureEvalJudgeGroup();
-    const scenarioSet = loadScenarios(scenarioSetName, group.id);
+  let report: Report;
+  try {
+    report = await withEvalLock(async (): Promise<Report> => {
+      bootstrapDb();
+      const group = ensureEvalScenarioGroup();
+      // Provisioned unconditionally, even for a scenario set with zero
+      // llmJudge scenarios — idempotent, cheap, matches this file's existing
+      // "provision everything up front" pattern (mirrors ensureEvalScenarioGroup
+      // just above).
+      const judgeGroup = ensureEvalJudgeGroup();
+      const scenarioSet = loadScenarios(scenarioSetName, group.id);
 
-    const startedAt = new Date().toISOString();
-    const entries: ScenarioReportEntry[] = [];
-    for (const scenario of scenarioSet.scenarios) {
-      const entry = await runOneScenario(scenario, judgeGroup.id);
-      printSummaryLine(entry);
-      entries.push(entry);
-    }
-    const finishedAt = new Date().toISOString();
+      const startedAt = new Date().toISOString();
+      const entries: ScenarioReportEntry[] = [];
+      for (const scenario of scenarioSet.scenarios) {
+        const entry = await runOneScenario(scenario, judgeGroup.id);
+        printSummaryLine(entry);
+        entries.push(entry);
+      }
+      const finishedAt = new Date().toISOString();
 
-    const passedCount = entries.filter((e) => e.passed).length;
-    const cleanupFailureCount = entries.filter((e) => e.cleanupError).length;
-    console.log(
-      `${passedCount}/${entries.length} passed` +
-        (cleanupFailureCount ? `, ${cleanupFailureCount} cleanup failure(s)` : ''),
-    );
+      const passedCount = entries.filter((e) => e.passed).length;
+      const cleanupFailureCount = entries.filter((e) => e.cleanupError).length;
+      console.log(
+        `${passedCount}/${entries.length} passed` +
+          (cleanupFailureCount ? `, ${cleanupFailureCount} cleanup failure(s)` : ''),
+      );
 
-    const built: Report = {
-      runId: makeRunId(),
-      scenarioSetName: scenarioSet.name,
-      startedAt,
-      finishedAt,
-      entries,
-    };
-    const reportPath = writeReport(built);
-    console.log(`Report written to ${reportPath}`);
-    return built;
-  });
+      const built: Report = {
+        runId: makeRunId(),
+        scenarioSetName: scenarioSet.name,
+        startedAt,
+        finishedAt,
+        entries,
+      };
+      const reportPath = writeReport(built);
+      console.log(`Report written to ${reportPath}`);
+      return built;
+    });
+  } finally {
+    // Every eval container this invocation spawned (scenario + judge groups
+    // alike) is torn down before the process exits, regardless of outcome —
+    // eval containers have no idle-timeout/decommission path of their own
+    // (host-sweep deliberately excludes them, AD-6), so leaving one running
+    // past this invocation is what let two separate `pnpm eval` runs end up
+    // with two real containers polling the identical session DB concurrently
+    // (found live, 2026-08-24). See killAllActiveContainers's own doc for why
+    // this is safe only because this process's activeContainers map can only
+    // ever contain containers this same invocation itself spawned.
+    killAllActiveContainers('eval run complete');
+  }
 
   const allPassed = report.entries.length > 0 && report.entries.every((e) => e.passed);
   process.exitCode = allPassed ? 0 : 1;

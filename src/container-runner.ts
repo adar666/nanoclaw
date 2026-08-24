@@ -319,6 +319,40 @@ export function killContainer(sessionId: string, reason: string, onExit?: () => 
 }
 
 /**
+ * Kill every container this process is currently tracking (every session id
+ * in `activeContainers`), synchronously in sequence (`killContainer` →
+ * `stopContainer` is itself synchronous, `execSync` with a 1s grace).
+ *
+ * Intended for a short-lived, one-shot CLI process that must never leave a
+ * container running past its own exit — the eval harness (`eval/cli.ts`,
+ * `eval/sweep.ts`), whose containers otherwise have no idle-timeout or
+ * decommission path at all (host-sweep deliberately excludes eval sessions,
+ * AD-6/Story 1.5) and can persist indefinitely. `wakeContainer`'s own
+ * `activeContainers.has()` dedup check only ever sees the CALLING process's
+ * own in-memory map — a fresh `pnpm eval sweep`/`pnpm eval run` invocation
+ * starts with an empty map every time, so it has no way to detect (let alone
+ * reuse) a container a *previous*, already-exited invocation left running;
+ * left unaddressed, two real agent-runner containers can end up polling and
+ * writing the identical session DB concurrently (found live, 2026-08-24,
+ * during a `pnpm eval sweep` re-verification run). Calling this once at the
+ * very end of every eval CLI invocation means no eval container ever
+ * outlives the invocation that spawned it, so there is nothing left over
+ * for a later invocation to collide with.
+ *
+ * Never call this from the long-running host process (`index.ts`) — it
+ * would kill every session's container the host is currently serving, not
+ * just eval ones. Safe here specifically because a `pnpm eval` invocation's
+ * `activeContainers` map — a fresh module instance in its own separate OS
+ * process — only ever contains containers this same invocation itself
+ * spawned.
+ */
+export function killAllActiveContainers(reason: string): void {
+  for (const sessionId of [...activeContainers.keys()]) {
+    killContainer(sessionId, reason);
+  }
+}
+
+/**
  * Resolve the provider name for a session:
  *
  *   sessions.agent_provider

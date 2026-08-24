@@ -42,6 +42,10 @@ vi.mock('./runner.js', () => ({
   runScenarioTurn: vi.fn(),
 }));
 
+vi.mock('../src/container-runner.js', () => ({
+  killAllActiveContainers: vi.fn(),
+}));
+
 vi.mock('./judge/deterministic.js', () => ({
   judgeDeterministic: vi.fn(),
 }));
@@ -50,6 +54,7 @@ vi.mock('./judge/llm.js', () => ({
   judgeLlm: vi.fn(),
 }));
 
+import { killAllActiveContainers } from '../src/container-runner.js';
 import { closeDb } from '../src/db/index.js';
 import type { OutboundMessage } from '../src/db/session-db.js';
 import { readEnvFile } from '../src/env.js';
@@ -67,6 +72,7 @@ const mockedReadEnvFile = vi.mocked(readEnvFile);
 const mockedRunScenarioTurn = vi.mocked(runScenarioTurn);
 const mockedJudgeDeterministic = vi.mocked(judgeDeterministic);
 const mockedJudgeLlm = vi.mocked(judgeLlm);
+const mockedKillAllActiveContainers = vi.mocked(killAllActiveContainers);
 
 const PEOPLE_MD_PATH = `${TEST_ROOT}/groups/household/memory/household/people.md`;
 const writtenReportDirs: string[] = [];
@@ -125,6 +131,7 @@ beforeEach(() => {
   mockedJudgeDeterministic.mockReset();
   mockedJudgeLlm.mockReset();
   mockedJudgeLlm.mockResolvedValue(PASSING_LLM_VERDICT);
+  mockedKillAllActiveContainers.mockReset();
   process.exitCode = undefined;
 });
 
@@ -324,6 +331,35 @@ describe('runCli', () => {
   it('throws a usage error for trailing extra arguments, touching nothing', async () => {
     await expect(runCli(['run', 'guest-resolution', 'extra-arg'])).rejects.toThrow(/usage/i);
     expect(mockedRunScenarioTurn).not.toHaveBeenCalled();
+  });
+
+  it(
+    'tears down every eval container this invocation spawned exactly once after a successful run (regression — ' +
+      '2026-08-24: eval containers have no idle-timeout of their own, so a leftover from one invocation could ' +
+      'still be running when the next one spawns its own, against the identical session)',
+    async () => {
+      queueTurns(
+        { status: 'completed', transcript: [outboundMsg('נוסף כאורח: adardevora@gmail.com')], sessionId: 's1' },
+        COMPLETED_CLEANUP,
+      );
+      mockedJudgeDeterministic.mockReturnValue({ passed: true, evidence: 'adardevora@gmail.com' });
+
+      const report = await runCli(['run', 'guest-resolution']);
+      writtenReportDirs.push(path.join(REPORTS_DIR, report.runId));
+
+      expect(mockedKillAllActiveContainers).toHaveBeenCalledTimes(1);
+      expect(mockedKillAllActiveContainers).toHaveBeenCalledWith(expect.any(String));
+    },
+  );
+
+  it('still tears down every spawned container, and still propagates the error, when a scenario turn itself throws (a genuine AD-4 structural failure, not a per-scenario outcome)', async () => {
+    const boom = new Error('runScenarioTurn: wakeContainer failed to spawn a container');
+    mockedRunScenarioTurn.mockReset();
+    mockedRunScenarioTurn.mockRejectedValueOnce(boom);
+
+    await expect(runCli(['run', 'guest-resolution'])).rejects.toBe(boom);
+
+    expect(mockedKillAllActiveContainers).toHaveBeenCalledTimes(1);
   });
 });
 
