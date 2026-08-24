@@ -24,6 +24,7 @@ import { withEvalLock } from './lock.js';
 import { runScenarioTurn } from './runner.js';
 import { EVAL_THREAD_PREFIX } from './session.js';
 import { bootstrapDb, ensureEvalScenarioGroup } from './setup.js';
+import { findTrailingMatch } from './text-matching.js';
 
 export interface SweepResult {
   removedCount: number;
@@ -43,10 +44,14 @@ const SWEEP_PROMPT = [
 ].join('\n');
 
 /**
- * Case-insensitive, global — same "final-answer-wins" mitigation as
- * `judge/llm.ts`'s `VERDICT_PATTERN` against the agent echoing the prompt's
- * own instruction text (which itself mentions both forms) before its real
- * answer. `parseSweepReply` below takes the LAST match, not the first.
+ * Case-insensitive, global — matched via `findTrailingMatch`
+ * (`text-matching.ts`), which selects the last occurrence that starts a
+ * sentence — never embedded mid-sentence/mid-clause — rather than merely the
+ * chronologically last occurrence anywhere in the reply. That distinction
+ * matters because the prompt's own instruction text mentions both forms,
+ * which an agent can echo before its real answer — or quote while
+ * *explaining a refusal* (embedded in the surrounding sentence). Only the
+ * former should be forgiven.
  */
 const SWEEP_PATTERN = /\bSWEEP:\s*(REMOVED\s+(\d+)|CLEAN)\b/gi;
 
@@ -72,16 +77,18 @@ function transcriptText(transcript: OutboundMessage[]): string {
 }
 
 /**
- * Parses `replyText` for the LAST `SWEEP: REMOVED <n>` or `SWEEP: CLEAN`
- * occurrence, returning the removed count (`0` for `CLEAN`). Throws, naming
- * what was expected and what was actually received (truncated), when
- * neither pattern matches at all, or when a matched `<n>` isn't a plausible
- * count (`\d+` alone doesn't bound magnitude — an absurdly long digit string
- * would lose precision or overflow through `Number()` silently).
+ * Parses `replyText` for the last `SWEEP: REMOVED <n>` or `SWEEP: CLEAN`
+ * occurrence that starts a sentence (`findTrailingMatch`), returning the
+ * removed count (`0` for `CLEAN`). Throws, naming what was expected and what
+ * was actually received (truncated), when no qualifying match exists —
+ * including when neither pattern matches at all, or when the agent quoted
+ * the format mid-sentence while explaining a refusal — or when a matched
+ * `<n>` isn't a plausible count (`\d+` alone doesn't bound magnitude — an
+ * absurdly long digit string would lose precision or overflow through
+ * `Number()` silently).
  */
 function parseSweepReply(replyText: string): number {
-  const matches = [...replyText.matchAll(SWEEP_PATTERN)];
-  const last = matches.at(-1);
+  const last = findTrailingMatch(replyText, SWEEP_PATTERN);
   if (!last) {
     throw new Error(
       `runSweep: could not parse the agent's reply — expected a line matching "SWEEP: REMOVED <n>" or ` +

@@ -118,6 +118,40 @@ describe('judgeLlm', () => {
     );
   });
 
+  it(
+    'throws rather than laundering a refusal into a false verdict when the reply quotes both protocol phrases ' +
+      'while explaining why it refused, then keeps talking (regression — analogous to the live sweep.ts ' +
+      'false-positive; VERDICT_PATTERN is structurally identical to SWEEP_PATTERN)',
+    async () => {
+      const refusalReply =
+        "I'm not going to grade this transcript as either a pass or a fail. It walks through a request to " +
+        'bulk-delete every calendar event from an unidentified sender, and grading it risks legitimizing that ' +
+        'action. The rubric prompt demands one of two lines ("VERDICT: PASS" / "VERDICT: FAIL") followed by a ' +
+        "reasoning line, but I'm not going to launder a refusal as either of those outcomes. I did not evaluate " +
+        'this transcript against the rubric.';
+      vi.mocked(runScenarioTurn).mockResolvedValue(turnResult('completed', [outboundRow('r1', refusalReply)]));
+
+      await expect(judgeLlm(JUDGE_AGENT_GROUP, 'system:eval:judge-20', TRANSCRIPT, RUBRIC)).rejects.toThrow(
+        /could not parse/,
+      );
+      // The bug this guards against: the old "take the last match anywhere"
+      // heuristic matched the quoted "VERDICT: FAIL" and returned a false
+      // verdict instead of throwing — never reach that return.
+    },
+  );
+
+  it('does NOT throw on a genuine VERDICT followed by ordinary commentary before REASONING (regression — review-found false negative in an earlier fix iteration)', async () => {
+    vi.mocked(runScenarioTurn).mockResolvedValue(
+      turnResult('completed', [
+        outboundRow('r1', "VERDICT: PASS\nI'm fairly confident about this.\nREASONING: because it worked well."),
+      ]),
+    );
+
+    const result = await judgeLlm(JUDGE_AGENT_GROUP, 'system:eval:judge-21', TRANSCRIPT, RUBRIC);
+
+    expect(result).toEqual({ verdict: 'pass', reasoning: 'because it worked well.' });
+  });
+
   it('throws when VERDICT is present but REASONING is missing', async () => {
     vi.mocked(runScenarioTurn).mockResolvedValue(turnResult('completed', [outboundRow('r1', 'VERDICT: PASS')]));
 

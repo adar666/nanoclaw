@@ -23,6 +23,7 @@
 import type { OutboundMessage } from '../../src/db/session-db.js';
 import type { RunOptions } from '../runner.js';
 import { runScenarioTurn } from '../runner.js';
+import { findTrailingMatch } from '../text-matching.js';
 
 export interface LlmJudgeResult {
   verdict: 'pass' | 'fail';
@@ -34,10 +35,15 @@ export interface LlmJudgeResult {
  * real verdict line, and the prompt itself mentions both "VERDICT: PASS" and
  * "VERDICT: FAIL" together as instructions, which a judge can plausibly echo
  * back verbatim before giving its real answer (review finding, converged
- * across 2 layers). Matching the LAST occurrence rather than the first is
- * the standard robust pattern for this: whatever the judge states last is
- * treated as its real, final answer, correctly skipping past an echoed
- * instruction or an earlier self-correction ("actually, on reflection...").
+ * across 2 layers). Selected via `findTrailingMatch` (`text-matching.ts`),
+ * which requires the chosen occurrence to start a sentence — never embedded
+ * mid-sentence/mid-clause — rather than merely the chronologically last one
+ * anywhere in the reply: an echoed instruction or an earlier self-correction
+ * ("actually, on reflection...") is correctly skipped past, but a protocol
+ * phrase quoted while *explaining a refusal* (embedded in the surrounding
+ * sentence) is correctly rejected instead of being laundered into a false
+ * verdict (`spec-eval-trailing-match-guard.md`, this class of risk confirmed
+ * live for `sweep.ts`'s identical pattern).
  */
 const VERDICT_PATTERN = /VERDICT:\s*(PASS|FAIL)\b/gi;
 
@@ -135,9 +141,12 @@ export async function judgeLlm(
   }
 
   const replyText = transcriptText(result.transcript);
-  const verdictMatches = [...replyText.matchAll(VERDICT_PATTERN)];
-  const lastVerdict = verdictMatches.at(-1);
   const reasoning = extractReasoning(replyText);
+  // findTrailingMatch only rejects an EMBEDDED (mid-sentence) VERDICT mention
+  // — what follows a genuine match (a REASONING field, trailing punctuation,
+  // an unrelated remark) never disqualifies it, so this scans the full reply
+  // directly; no need to pre-slice before the REASONING label anymore.
+  const lastVerdict = findTrailingMatch(replyText, VERDICT_PATTERN);
 
   if (!lastVerdict || !reasoning) {
     throw new Error(
