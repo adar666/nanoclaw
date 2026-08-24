@@ -80,6 +80,7 @@ import type JSZipType from 'jszip';
 
 import type { McpToolDefinition } from './types.js';
 import { registerTools } from './server.js';
+import { TIMEZONE, formatLocalTime } from '../timezone.js';
 
 function log(msg: string): void {
   console.error(`[mcp-tools] ${msg}`);
@@ -1678,6 +1679,124 @@ function writeFillOutput(baseDir: string, slug: string, ext: string, data: Buffe
   return outPath;
 }
 
+// ---------------------------------------------------------------------------
+// Fill history (spec 2-3) — a small per-document index over the output
+// files writeFillOutput above already produces, so a later
+// list_document_versions call can offer an earlier fill back for resending
+// (via the existing send_file tool) without a new "restore"/"revert"
+// mechanism and without ever touching the stored canonical raw file or
+// extracted text. One JSON file per document
+// (memory/documents/.fill-history/<slug>.json), capped at
+// FILL_HISTORY_CAP entries (oldest dropped first — never deletes the
+// underlying .document-fills file an entry pointed at, only drops it from
+// this index). Locked read-modify-write, same AD-11 convention already
+// used for memory/index.md — per-slug lock file rather than one shared
+// lock, so concurrent fills of two different documents never contend with
+// each other.
+// ---------------------------------------------------------------------------
+
+// Caps raw index *entries*, not "still-recoverable" ones — an entry whose
+// output file was later manually deleted still occupies a cap slot until a
+// newer fill pushes it out, even though list_document_versions filters it
+// out of what it actually shows. Don't assume this cap tracks "visible"
+// history.
+const FILL_HISTORY_CAP = 20;
+
+interface FillHistoryEntry {
+  timestamp: string;
+  outputPath: string;
+  target: string;
+}
+
+function fillHistoryDir(baseDir: string): string {
+  return path.join(baseDir, 'memory', 'documents', '.fill-history');
+}
+
+function fillHistoryPath(baseDir: string, slug: string): string {
+  return path.join(fillHistoryDir(baseDir), `${slug}.json`);
+}
+
+/**
+ * Reads a document's fill-history index (capped array, newest last). A
+ * missing file resolves to an empty history silently — that's the normal
+ * "never filled yet" case, not a problem. An unreadable-for-another-reason
+ * file, malformed JSON, a JSON value that isn't an array, or an array
+ * containing malformed entries also resolve to an empty (or partial)
+ * history rather than throwing — a listable index must never error just
+ * because its backing file got corrupted — but those cases ARE logged
+ * (distinct from the plain-missing-file case) so a genuinely corrupted
+ * index is visible in nanoclaw.log rather than silently indistinguishable
+ * from "never filled." Malformed individual entries are dropped rather
+ * than discarding the whole array, so one bad entry can't hide every other
+ * real one.
+ */
+function readFillHistory(baseDir: string, slug: string): FillHistoryEntry[] {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(fillHistoryPath(baseDir, slug), 'utf-8');
+  } catch (e) {
+    if (errnoCode(e) !== 'ENOENT') {
+      log(`fill history read failed for "${slug}" (treating as empty): ${e instanceof Error ? e.message : String(e)}`);
+    }
+    return [];
+  }
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      log(`fill history for "${slug}" is not a JSON array — ignoring corrupted index, treating as empty`);
+      return [];
+    }
+    const valid = parsed.filter((e): e is FillHistoryEntry => {
+      if (e === null || typeof e !== 'object') return false;
+      const candidate = e as Record<string, unknown>;
+      return (
+        typeof candidate.timestamp === 'string' &&
+        typeof candidate.outputPath === 'string' &&
+        typeof candidate.target === 'string'
+      );
+    });
+    if (valid.length < parsed.length) {
+      log(`fill history for "${slug}" had ${parsed.length - valid.length} malformed entr(y/ies) — dropped, keeping the rest`);
+    }
+    return valid;
+  } catch (e) {
+    log(`fill history for "${slug}" is not valid JSON — ignoring corrupted index, treating as empty: ${e instanceof Error ? e.message : String(e)}`);
+    return [];
+  }
+}
+
+/**
+ * Appends one entry to a document's fill-history index, capped at
+ * FILL_HISTORY_CAP (oldest dropped first). Called once per *completed*
+ * fill only — see fillOneDocument's FILL_SUCCESS_MARKER-gated call site
+ * below; a discovery/prompt response or a per-item batch failure never
+ * reaches this function at all.
+ *
+ * The actual write is temp-file-then-rename, not a direct
+ * fs.writeFileSync onto the live path: a process kill/crash mid-write to
+ * the live file would leave it truncated, and readFillHistory's own
+ * corruption handling (correctly, for the "not-yet-created" case) treats
+ * an unparseable file as an *empty* history — so a direct-write crash
+ * would silently wipe every prior entry, not just fail to add the new
+ * one. fs.renameSync is atomic at the filesystem level, so any reader
+ * (including list_document_versions's readFillHistory call, which does
+ * NOT hold this function's per-slug lock) only ever observes the fully-old
+ * or fully-new file content, never a partial write.
+ */
+async function recordFillHistory(baseDir: string, slug: string, entry: FillHistoryEntry): Promise<void> {
+  const dir = fillHistoryDir(baseDir);
+  fs.mkdirSync(dir, { recursive: true });
+  const lockPath = path.join(dir, `.${slug}.lock`);
+  await withLock(lockPath, () => {
+    const existing = readFillHistory(baseDir, slug);
+    const updated = [...existing, entry].slice(-FILL_HISTORY_CAP);
+    const finalPath = fillHistoryPath(baseDir, slug);
+    const tmpPath = path.join(dir, `.${slug}.json.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+    fs.writeFileSync(tmpPath, JSON.stringify(updated, null, 2));
+    fs.renameSync(tmpPath, finalPath);
+  });
+}
+
 interface FillOpts {
   baseDir: string;
 }
@@ -2661,6 +2780,64 @@ const DOC_CONVERSION_NOTE =
  */
 const FILL_SUCCESS_MARKER = 'New file at ';
 
+/** Regex-extracts the output path from a completed fill's `ok()` text — every success site above writes exactly this shape (`New file at <path> — call send_file...`). Used by fillOneDocument to record fill history (spec 2-3). */
+function extractFillOutputPath(text: string): string | undefined {
+  const m = /New file at (.+?) — call send_file/.exec(text);
+  return m ? m[1] : undefined;
+}
+
+// A history entry's target description embeds the value written, so
+// several fills of the same location (e.g. three successive edits to
+// "row 1") are still distinguishable from each other in the
+// list_document_versions report, not just by timestamp/position. Capped
+// to keep each report line short — collapsed whitespace, then a plain
+// character cap with an ellipsis, not word-boundary-aware (a short,
+// single-line preview, not a rendered excerpt).
+const FILL_HISTORY_VALUE_PREVIEW_CHARS = 60;
+
+function truncateValuePreview(value: string): string {
+  const collapsed = value.replace(/\s+/g, ' ').trim();
+  return collapsed.length > FILL_HISTORY_VALUE_PREVIEW_CHARS
+    ? `${collapsed.slice(0, FILL_HISTORY_VALUE_PREVIEW_CHARS)}…`
+    : collapsed;
+}
+
+/**
+ * Short, human-readable description of what a fill call targeted, reusing
+ * whichever targeting args were actually given on that call — recorded
+ * verbatim as a fill-history entry's `target` field (spec 2-3, e.g.
+ * `"row 2"`, `"fieldName: Date"`), plus the value that was actually
+ * written (e.g. `row 1 = "third"`) so repeated fills of the same location
+ * remain distinguishable from each other in a list_document_versions
+ * report. Never invents a description beyond what the caller's own args
+ * already say.
+ */
+function describeFillTarget(args: Record<string, unknown>): string {
+  const parts: string[] = [];
+
+  if (args.row !== undefined) {
+    parts.push(`row ${args.row}`);
+    if (args.table !== undefined) parts.push(`table ${args.table}`);
+    if (args.column !== undefined) parts.push(`column ${args.column}`);
+  } else if (args.lineNumber !== undefined) {
+    parts.push(`line ${args.lineNumber}`);
+  } else if (args.fieldName !== undefined) {
+    parts.push(`fieldName: ${args.fieldName}`);
+  } else if (args.pixelX !== undefined || args.pixelY !== undefined) {
+    parts.push(`pixel (${args.pixelX ?? '?'}, ${args.pixelY ?? '?'})`);
+  }
+
+  if (args.signatureName !== undefined) {
+    parts.push(`signature: ${args.signatureName}`);
+  }
+
+  const location = parts.length > 0 ? parts.join(', ') : 'fill';
+  if (typeof args.value === 'string' && args.value.length > 0) {
+    return `${location} = "${truncateValuePreview(args.value)}"`;
+  }
+  return location;
+}
+
 const SUBPROCESS_OUTPUT_TAIL_CHARS = 500;
 
 /** Truncates captured subprocess output to a readable tail for an error message — the full buffer could be arbitrarily large or noisy. */
@@ -2870,6 +3047,40 @@ async function fillOneDocument(
       : meta.ext === 'doc'
         ? await fillDoc(rawPath, meta, args, opts)
         : await fillPdf(rawPath, meta, args, opts);
+
+  // History recording (spec 2-3) — the single choke point covering both
+  // fill_document_field and fill_document_field_batch, since both callers
+  // funnel through fillOneDocument. Gated on the exact same
+  // FILL_SUCCESS_MARKER signal the batch tool already uses to distinguish
+  // a completed fill from a discovery/prompt response — a discovery call
+  // or a per-item batch failure never reaches this point.
+  const resultText = typeof result.content[0]?.text === 'string' ? result.content[0].text : '';
+  const isCompletedFill = !('isError' in result && result.isError) && resultText.includes(FILL_SUCCESS_MARKER);
+  if (isCompletedFill) {
+    const outputPath = extractFillOutputPath(resultText);
+    if (outputPath) {
+      try {
+        await recordFillHistory(opts.baseDir, meta.slug, {
+          timestamp: new Date().toISOString(),
+          outputPath,
+          target: describeFillTarget(args),
+        });
+      } catch (e) {
+        // Best-effort: a fill-history write failure must never mask an
+        // already-successful fill — the real output file is already
+        // written and the response already confirms it. Log and move on.
+        log(`fill history recording failed for ${meta.slug}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    } else {
+      // Should be unreachable in practice — every FILL_SUCCESS_MARKER site
+      // writes the exact "New file at <path> — call send_file" shape
+      // extractFillOutputPath parses — but a future copy change to that
+      // text could silently break extraction. Log it rather than letting a
+      // completed fill silently get no history entry with zero trace.
+      log(`fill history: completed fill for ${meta.slug} matched FILL_SUCCESS_MARKER but no output path could be extracted from the result text`);
+    }
+  }
+
   log(`${callerLabel}: ${meta.slug} (${meta.ext}) -> ${'isError' in result && result.isError ? 'error' : 'ok'}`);
   return result;
 }
@@ -3297,4 +3508,104 @@ export const saveDocument: McpToolDefinition = {
   handler: (args) => saveDocumentImpl(args, { baseDir: '/workspace/agent', workspaceRoot: '/workspace' }),
 };
 
-registerTools([saveDocument, listDocuments, fillDocumentField, fillDocumentFieldBatch, saveSignature]);
+// ---------------------------------------------------------------------------
+// list_document_versions (spec 2-3) — reads the per-document fill-history
+// index fillOneDocument writes to, filters out any entry whose output file
+// no longer exists on disk, and reports the rest oldest to newest. This
+// tool never sends anything itself and never deletes/restores anything —
+// the agent relays a chosen entry's outputPath to the existing send_file
+// tool exactly as it already does after a fresh fill (no new "restore"
+// tool, no new delivery mechanism).
+// ---------------------------------------------------------------------------
+
+interface ListDocumentVersionsOpts {
+  baseDir: string;
+}
+
+export async function listDocumentVersionsImpl(
+  args: Record<string, unknown>,
+  opts: ListDocumentVersionsOpts,
+): Promise<ReturnType<typeof ok> | ReturnType<typeof err>> {
+  try {
+    const documentQueryRaw = typeof args.document === 'string' ? args.document : undefined;
+    const documentQuery = documentQueryRaw?.trim();
+    if (!documentQuery) {
+      return err('document is required — the saved document\'s name/slug/topic to list fill history for.');
+    }
+
+    const documentsDir = path.join(opts.baseDir, 'memory', 'documents');
+    const filesDir = path.join(documentsDir, 'files');
+    const resolution = resolveDocument(documentsDir, filesDir, documentQuery);
+
+    if (resolution.kind === 'not-found') {
+      log(`list_document_versions: no match for document "${documentQuery}"`);
+      return err(`No saved document matches "${documentQuery}".`);
+    }
+    if (resolution.kind === 'candidates') {
+      log(`list_document_versions: ${resolution.metas.length} candidates for document "${documentQuery}"`);
+      return ok(
+        `Multiple saved documents match "${documentQuery}":\n${formatDocumentCandidates(resolution.metas)}\n\n` +
+          'Call list_document_versions again with the exact slug (first column) to pick one.',
+      );
+    }
+
+    const slug = resolution.meta.slug;
+    // A manually-deleted (or otherwise missing) output file is dropped
+    // silently here — never listed as a recoverable entry — rather than
+    // shown alongside a path that would fail on send_file.
+    const history = readFillHistory(opts.baseDir, slug).filter((entry) => fs.existsSync(entry.outputPath));
+
+    if (history.length === 0) {
+      log(`list_document_versions: no fill history for "${slug}"`);
+      return ok(
+        `No fill history for "${slug}" — it hasn't been filled yet via fill_document_field/` +
+          'fill_document_field_batch, or none of its past fill outputs still exist on disk.',
+      );
+    }
+
+    // Storage stays ISO (readFillHistory/recordFillHistory never touch
+    // this) — only the display here renders in the install timezone, per
+    // CLAUDE.md's Timestamps convention (formatLocalTime/TIMEZONE, same
+    // helper calendar.ts already uses for its own agent-facing text).
+    const lines = history.map(
+      (entry, i) => `${i + 1}. ${formatLocalTime(entry.timestamp, TIMEZONE)} — ${entry.target} — ${entry.outputPath}`,
+    );
+    log(`list_document_versions: ${history.length} entries for "${slug}"`);
+    return ok(
+      `Fill history for "${slug}" (oldest to newest):\n${lines.join('\n')}\n\n` +
+        'To resend an earlier one, call send_file with its output path directly.',
+    );
+  } catch (e) {
+    return err(`list_document_versions failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+export const listDocumentVersions: McpToolDefinition = {
+  tool: {
+    name: 'list_document_versions',
+    description:
+      'List the fill history of a document already saved via save_document — every completed ' +
+      'fill_document_field/fill_document_field_batch output that is still on disk, oldest to newest, each with a ' +
+      'timestamp, a short description of what was filled (e.g. "row 2", "fieldName: Date"), and its output path. ' +
+      'Use this to find and resend an earlier fill (an "undo") — pass the chosen output path directly to the ' +
+      'existing send_file tool; this tool never sends or deletes anything itself. Capped at the 20 most recent ' +
+      'fills per document; an entry whose output file was manually deleted is silently dropped from the list. A ' +
+      'document that was only ever saved/discovery-called (never actually filled) reports an empty history, not ' +
+      'an error. If "document" matches more than one saved document, returns a numbered candidate list instead ' +
+      '(same handshake as list_documents/fill_document_field).',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        document: {
+          type: 'string',
+          description:
+            'Name/slug/topic of the saved document to list fill history for (same matching as list_documents).',
+        },
+      },
+      required: ['document'],
+    },
+  },
+  handler: (args) => listDocumentVersionsImpl(args, { baseDir: '/workspace/agent' }),
+};
+
+registerTools([saveDocument, listDocuments, fillDocumentField, fillDocumentFieldBatch, saveSignature, listDocumentVersions]);

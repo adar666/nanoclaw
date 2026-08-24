@@ -42,6 +42,10 @@ A pain to solve: right now a user who sends a Word or PDF file to their agent ge
   - **intent:** A user can name multiple saved documents (by list, or "all documents matching X") plus one value and one set of targeting args, and the agent applies CAP-3's fill logic to every resolved document in a single call, reporting each document's success or failure — never a silent partial batch. Reuses CAP-3's per-document targeting unchanged; never a per-document value or per-document targeting override in this capability.
   - **success:** Given several saved documents and a shared field/value, one `fill_document_field_batch` call fills all of them and returns a combined report naming every target's outcome (output path on success, exact reason on failure) — a document that fails to resolve or fails to fill does not stop or roll back the others.
 
+- **CAP-8**
+  - **intent:** Every completed fill (`fill_document_field` or `fill_document_field_batch`, single-call or one target within a batch) is indexed into a small per-document JSON history (`memory/documents/.fill-history/<slug>.json`, capped at the 20 most recent entries per document, oldest dropped first). A `list_document_versions` tool returns that document's ordered fill history — timestamp, a short description of what was filled, and the still-on-disk output path for each entry still present on disk — so a user who wants an earlier fill back after a bad edit can recall it and have the agent resend it via the existing `send_file` tool. No new delivery/restore mechanism, and the stored canonical raw file and extracted text are never touched by this capability, same as every other capability in this file.
+  - **success:** Given a document filled three times, `list_document_versions` returns all three in order (oldest to newest) with real, still-sendable output paths; resending the second-most-recent one via `send_file` delivers the pre-last-edit output. A document only ever discovery-called (never actually filled) reports an empty history, not an error. A manually-deleted output file's entry is silently dropped rather than offered as recoverable.
+
 ## Constraints
 
 - PDF value-filling must use an overlay/stamp technique — draw the new text on top of the existing page and save as a new PDF. Parsing and reflowing PDF text in place is ruled out entirely (user-mandated, see `row-targeting-matrix.md`).
@@ -69,6 +73,7 @@ A pain to solve: right now a user who sends a Word or PDF file to their agent ge
 - Signature verification, authentication, or any legal-validity claim about a stamped signature — this is convenience image-placement, not a digital-signature/e-signing product.
 - General-purpose background removal (photos, busy backgrounds) — CAP-5 is scoped to a simple ink-on-plain-background signature image.
 - Cross-agent-group signature sharing — each group that should be able to stamp with a signature needs it saved there separately.
+- Reverting the stored canonical document (CAP-8) — a fill has never touched the stored raw file or extracted text in the first place, so "undo" means recalling and resending an already-produced fill output, never mutating stored state.
 
 ## Success signal
 

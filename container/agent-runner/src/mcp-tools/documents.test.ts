@@ -23,6 +23,8 @@ import {
   sofficeConvertArgs,
   saveSignatureImpl,
   saveSignature,
+  listDocumentVersionsImpl,
+  listDocumentVersions,
 } from './documents.js';
 
 // ---------------------------------------------------------------------------
@@ -4042,5 +4044,278 @@ describe('fill_document_field — existing single-call tool untouched by the bat
     expect(result.isError).toBeFalsy();
     const outPath = extractOutPath(result.content[0].text);
     expect(fs.existsSync(outPath)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// list_document_versions (spec 2-3) — fill history index over the exact
+// output files writeFillOutput already produces.
+// ---------------------------------------------------------------------------
+
+function fillHistoryFilePath(baseDirArg: string, slug: string): string {
+  return path.join(baseDirArg, 'memory', 'documents', '.fill-history', `${slug}.json`);
+}
+
+interface FillHistoryEntryFixture {
+  timestamp: string;
+  outputPath: string;
+  target: string;
+}
+
+function readFillHistoryRaw(baseDirArg: string, slug: string): FillHistoryEntryFixture[] {
+  return JSON.parse(fs.readFileSync(fillHistoryFilePath(baseDirArg, slug), 'utf-8'));
+}
+
+function writeFillHistoryRaw(baseDirArg: string, slug: string, entries: FillHistoryEntryFixture[]): void {
+  const p = fillHistoryFilePath(baseDirArg, slug);
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, JSON.stringify(entries, null, 2));
+}
+
+describe('list_document_versions tool metadata', () => {
+  it('declares document as the only required argument', () => {
+    expect(listDocumentVersions.tool.name).toBe('list_document_versions');
+    expect(listDocumentVersions.tool.inputSchema).toMatchObject({ required: ['document'] });
+  });
+});
+
+describe('list_document_versions — document resolution', () => {
+  it('errors clearly when no saved document matches', async () => {
+    const result = await listDocumentVersionsImpl({ document: 'nonexistent' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('nonexistent');
+  });
+
+  it('returns a numbered candidate list (not an error) when the reference is ambiguous', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('Report A.docx', buildDocx(['A'])) }, opts());
+    await saveDocumentImpl({ path: writeInboxFile('Report B.docx', buildDocx(['B'])) }, opts());
+
+    const result = await listDocumentVersionsImpl({ document: 'report' }, opts());
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('report-a');
+    expect(result.content[0].text).toContain('report-b');
+  });
+
+  it('requires a non-empty document argument', async () => {
+    const result = await listDocumentVersionsImpl({}, opts());
+    expect(result.isError).toBe(true);
+  });
+});
+
+describe('list_document_versions — document never filled', () => {
+  it('reports an empty history plainly, not an error', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('letter.docx', buildDocx(['Hello'])) }, opts());
+
+    const result = await listDocumentVersionsImpl({ document: 'letter' }, opts());
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('No fill history');
+  });
+});
+
+describe('list_document_versions — a document filled three times', () => {
+  it('returns all three, oldest to newest, with real still-sendable output paths and targets', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
+
+    const r1 = await fillDocumentFieldImpl({ document: 'report', row: 1, value: 'first' }, opts());
+    const r2 = await fillDocumentFieldImpl({ document: 'report', row: 1, value: 'second' }, opts());
+    const r3 = await fillDocumentFieldImpl({ document: 'report', row: 1, value: 'third' }, opts());
+    const p1 = extractOutPath(r1.content[0].text);
+    const p2 = extractOutPath(r2.content[0].text);
+    const p3 = extractOutPath(r3.content[0].text);
+    expect(fs.existsSync(p1)).toBe(true);
+    expect(fs.existsSync(p2)).toBe(true);
+    expect(fs.existsSync(p3)).toBe(true);
+
+    const result = await listDocumentVersionsImpl({ document: 'report' }, opts());
+    expect(result.isError).toBeFalsy();
+    const text = result.content[0].text;
+
+    const idx1 = text.indexOf(p1);
+    const idx2 = text.indexOf(p2);
+    const idx3 = text.indexOf(p3);
+    expect(idx1).toBeGreaterThan(-1);
+    expect(idx2).toBeGreaterThan(-1);
+    expect(idx3).toBeGreaterThan(-1);
+    expect(idx1).toBeLessThan(idx2);
+    expect(idx2).toBeLessThan(idx3);
+    expect(text).toContain('row 1');
+  });
+});
+
+describe('list_document_versions — a listed output file was manually deleted', () => {
+  it('silently drops the deleted entry, never lists it as recoverable', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
+
+    const r1 = await fillDocumentFieldImpl({ document: 'report', row: 1, value: 'X' }, opts());
+    const p1 = extractOutPath(r1.content[0].text);
+    const r2 = await fillDocumentFieldImpl({ document: 'report', row: 1, value: 'Y' }, opts());
+    const p2 = extractOutPath(r2.content[0].text);
+
+    fs.unlinkSync(p1);
+
+    const result = await listDocumentVersionsImpl({ document: 'report' }, opts());
+    expect(result.isError).toBeFalsy();
+    const text = result.content[0].text;
+    expect(text).not.toContain(p1);
+    expect(text).toContain(p2);
+  });
+});
+
+describe('list_document_versions — history exceeds the cap', () => {
+  it('drops the oldest entry from the index on the 21st fill; its .document-fills file is untouched on disk', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
+    const slug = 'report';
+
+    const fillsDir = path.join(baseDir, '.document-fills');
+    fs.mkdirSync(fillsDir, { recursive: true });
+    const seeded: FillHistoryEntryFixture[] = [];
+    for (let i = 1; i <= 20; i++) {
+      const p = path.join(fillsDir, `seed-${i}.docx`);
+      fs.writeFileSync(p, 'dummy');
+      seeded.push({ timestamp: new Date(2020, 0, i).toISOString(), outputPath: p, target: `row ${i}` });
+    }
+    writeFillHistoryRaw(baseDir, slug, seeded);
+    const oldestPath = seeded[0].outputPath;
+
+    const result21 = await fillDocumentFieldImpl({ document: 'report', row: 1, value: 'newest' }, opts());
+    expect(result21.isError).toBeFalsy();
+    const newestPath = extractOutPath(result21.content[0].text);
+
+    const historyAfter = readFillHistoryRaw(baseDir, slug);
+    expect(historyAfter.length).toBe(20);
+    expect(historyAfter.some((e) => e.outputPath === oldestPath)).toBe(false);
+    expect(historyAfter.some((e) => e.outputPath === newestPath)).toBe(true);
+
+    // Dropping an entry from the index must not delete its underlying .document-fills file.
+    expect(fs.existsSync(oldestPath)).toBe(true);
+
+    const listResult = await listDocumentVersionsImpl({ document: 'report' }, opts());
+    expect(listResult.content[0].text).not.toContain(oldestPath);
+    expect(listResult.content[0].text).toContain(newestPath);
+  });
+});
+
+describe('list_document_versions — a batch fill completes', () => {
+  it('the batch-produced fill appears in history identically to a single-call fill', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
+    await saveDocumentImpl({ path: writeInboxFile('letter.docx', buildDocxWithTables([[['c1', 'd1']]])) }, opts());
+
+    const batchResult = await fillDocumentFieldBatchImpl({ documents: ['report', 'letter'], row: 1, value: 'X' }, opts());
+    expect(batchResult.isError).toBeFalsy();
+    expect(batchResult.content[0].text).toContain('2/2 succeeded');
+
+    const reportHistory = await listDocumentVersionsImpl({ document: 'report' }, opts());
+    expect(reportHistory.isError).toBeFalsy();
+    expect(reportHistory.content[0].text).toContain('row 1');
+    expect(reportHistory.content[0].text).toContain('.document-fills');
+
+    const letterHistory = await listDocumentVersionsImpl({ document: 'letter' }, opts());
+    expect(letterHistory.isError).toBeFalsy();
+    expect(letterHistory.content[0].text).toContain('row 1');
+  });
+});
+
+describe('list_document_versions — a discovery/prompt call or per-item batch failure records no entry', () => {
+  it('a bare discovery call (no row/lineNumber) records nothing', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
+
+    const discovery = await fillDocumentFieldImpl({ document: 'report' }, opts());
+    expect(discovery.content[0].text).not.toContain('New file at');
+
+    const history = await listDocumentVersionsImpl({ document: 'report' }, opts());
+    expect(history.content[0].text).toContain('No fill history');
+  });
+
+  it('a discovery/prompt response within a batch call records nothing for that document', async () => {
+    await saveDocumentImpl(
+      { path: writeInboxFile('mixed.docx', buildDocxRawBody([tableXml([['a1', 'b1']]), bodyParagraphXml('שם: ___________')])) },
+      opts(),
+    );
+
+    const batchResult = await fillDocumentFieldBatchImpl({ documents: ['mixed'] }, opts());
+    expect(batchResult.isError).toBeFalsy();
+    expect(batchResult.content[0].text).toContain('0/1 succeeded');
+
+    const history = await listDocumentVersionsImpl({ document: 'mixed' }, opts());
+    expect(history.content[0].text).toContain('No fill history');
+  });
+});
+
+function writeFillHistoryFileRaw(baseDirArg: string, slug: string, data: unknown): void {
+  const p = fillHistoryFilePath(baseDirArg, slug);
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, JSON.stringify(data));
+}
+
+describe('list_document_versions — a fill-history write failure does not mask a successful fill', () => {
+  it('the fill itself still reports success (New file at ...) even though history recording fails', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
+
+    // Blocks recordFillHistory's own fs.mkdirSync(dir, { recursive: true })
+    // deterministically (EEXIST: a file already occupies the directory's
+    // path) — no chmod/permission dependency, which wouldn't reliably fail
+    // when running as root.
+    const historyDir = path.join(baseDir, 'memory', 'documents', '.fill-history');
+    fs.writeFileSync(historyDir, 'blocking this path from being a directory');
+
+    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, value: 'X' }, opts());
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('New file at');
+    const outPath = extractOutPath(result.content[0].text);
+    expect(fs.existsSync(outPath)).toBe(true);
+  });
+});
+
+describe('list_document_versions — corrupted/malformed history file', () => {
+  it('a non-array JSON value returns a clean "no history" result, not an error', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
+    writeFillHistoryFileRaw(baseDir, 'report', { not: 'an array' });
+
+    const result = await listDocumentVersionsImpl({ document: 'report' }, opts());
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('No fill history');
+  });
+
+  it('an array with one well-formed entry and one entry missing a required field returns only the well-formed one', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
+
+    const fillsDir = path.join(baseDir, '.document-fills');
+    fs.mkdirSync(fillsDir, { recursive: true });
+    const goodPath = path.join(fillsDir, 'report-filled-good.docx');
+    fs.writeFileSync(goodPath, 'dummy');
+
+    writeFillHistoryFileRaw(baseDir, 'report', [
+      { timestamp: '2026-01-01T00:00:00.000Z', outputPath: goodPath, target: 'row 1 = "good"' },
+      { timestamp: '2026-01-02T00:00:00.000Z', target: 'row 2 = "missing outputPath"' }, // malformed: no outputPath
+    ]);
+
+    const result = await listDocumentVersionsImpl({ document: 'report' }, opts());
+    expect(result.isError).toBeFalsy();
+    const text = result.content[0].text;
+    expect(text).toContain(goodPath);
+    expect(text).toContain('row 1 = "good"');
+    expect(text).not.toContain('missing outputPath');
+  });
+});
+
+describe('list_document_versions — concurrent fills of the same document', () => {
+  it('the per-slug lock serializes the read-modify-write; both entries survive', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
+
+    const [r1, r2] = await Promise.all([
+      fillDocumentFieldImpl({ document: 'report', row: 1, value: 'A' }, opts()),
+      fillDocumentFieldImpl({ document: 'report', row: 1, value: 'B' }, opts()),
+    ]);
+    expect(r1.isError).toBeFalsy();
+    expect(r2.isError).toBeFalsy();
+
+    const history = readFillHistoryRaw(baseDir, 'report');
+    expect(history.length).toBe(2);
+
+    const p1 = extractOutPath(r1.content[0].text);
+    const p2 = extractOutPath(r2.content[0].text);
+    const recordedPaths = history.map((e) => e.outputPath);
+    expect(recordedPaths).toContain(p1);
+    expect(recordedPaths).toContain(p2);
   });
 });

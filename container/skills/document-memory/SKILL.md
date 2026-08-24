@@ -1,6 +1,6 @@
 ---
 name: document-memory
-description: Save a Word (.docx or legacy .doc), PDF, or image (.jpg/.jpeg/.png) file the user sends into this agent group's persistent memory, so its content can be recalled in a later, unrelated conversation without resending the file. Also fill a value into a table row, form field, or line of a document already saved this way and send back a new file, or recall/answer questions about what a previously saved document says. Also save a PNG image of a handwritten signature as a reusable, background-removed asset, and stamp a saved signature into a saved PDF, .docx, or .doc. Use when the user sends a Word/PDF/image attachment and asks to save/remember/keep it, asks to fill in / complete a blank on a document already saved, asks what a saved document says/contains, asks to summarize/recall a document already saved, sends a signature image and asks to save/remember it for reuse, or asks to sign/stamp a saved document with a saved signature.
+description: Save a Word (.docx or legacy .doc), PDF, or image (.jpg/.jpeg/.png) file the user sends into this agent group's persistent memory, so its content can be recalled in a later, unrelated conversation without resending the file. Also fill a value into a table row, form field, or line of a document already saved this way and send back a new file, or recall/answer questions about what a previously saved document says. Also list a document's fill history and resend an earlier fill (an "undo"). Also save a PNG image of a handwritten signature as a reusable, background-removed asset, and stamp a saved signature into a saved PDF, .docx, or .doc. Use when the user sends a Word/PDF/image attachment and asks to save/remember/keep it, asks to fill in / complete a blank on a document already saved, asks what a saved document says/contains, asks to summarize/recall a document already saved, wants to undo a bad edit or get an earlier version of a filled document back, sends a signature image and asks to save/remember it for reuse, or asks to sign/stamp a saved document with a saved signature.
 ---
 
 # Saving a document to memory
@@ -365,6 +365,72 @@ target in the batch failed.
   one file type and one targeting shape; a mismatched file type in the mix
   just shows up as a per-item failure for that document instead of
   succeeding.
+
+# Undoing a bad edit / recalling an earlier fill
+
+## When to use this
+
+The user wants an earlier version of a filled document back — "undo that",
+"give me the version before I changed the date", "what did I have before
+the last edit" — for a document you've filled one or more times via
+`fill_document_field`/`fill_document_field_batch`. There is no separate
+"restore"/"undo" tool: `list_document_versions` returns the still-on-disk
+output path of each past fill, and you resend the one the user wants with
+the existing `send_file` tool, exactly like after a fresh fill.
+
+**Important:** this only recalls a past *fill output* — it never reverts
+the stored document itself. Filling a document has never touched the
+stored raw file or its extracted text, so there is nothing there to
+"undo"; the user's actual ask ("give me a version from before") is
+answered by resending an earlier already-produced file, not by mutating
+anything in memory.
+
+## Workflow
+
+1. **Call `mcp__nanoclaw__list_document_versions({ document })`** — same
+   free-text matching as `fill_document_field`'s `document` argument
+   (slug/filename/description). If the reference is ambiguous, it returns
+   the same numbered candidate list every other tool in this skill uses —
+   relay it and re-call with the exact slug once the user picks.
+2. **Read the report.** One line per past fill, oldest to newest, each
+   with a timestamp, a short description of what was filled (e.g. "row
+   2", "fieldName: Date"), and its output path. A document that was only
+   ever saved (never actually filled) reports an empty history — say so
+   plainly rather than implying there's something to undo.
+   - An entry whose output file was deleted from disk some other way is
+     already dropped from this list — you'll never see or offer a path
+     that can't actually be resent.
+   - Only the 20 most recent fills per document are kept — if the user
+     wants something older than that, say the history doesn't go back
+     that far rather than guessing.
+3. **Pick the entry the user means** — usually "the one before the last
+   edit" is the second-to-last line in the list (the most recent entry is
+   what's currently in effect; the one before it is the pre-last-edit
+   version). If it's unclear which past fill they mean, relay the list
+   and ask them to point at one (by its target description or position)
+   rather than guessing.
+4. **Resend it yourself.** Call `send_file({ to, path })` with the chosen
+   entry's output path — `list_document_versions` never sends anything
+   itself.
+
+```
+mcp__nanoclaw__list_document_versions({ document: "intake-form" })
+```
+
+## What NOT to do
+
+- Don't invent a "restore" or "revert" step — there isn't one. The stored
+  document is never touched by this; you're only resending a file that
+  was already produced and is still sitting on disk.
+- Don't call this for a document that was never filled — check
+  `list_documents`/the concept file first if you're not sure whether it's
+  ever actually been through `fill_document_field`.
+- Don't forget `send_file` — `list_document_versions` only reports paths,
+  it never delivers anything.
+- Don't offer an entry the tool didn't list — a deleted output is already
+  filtered out; if the user insists on something older than what's shown,
+  say plainly that it's no longer available (past the 20-entry cap, or
+  its file is gone).
 
 # Recalling a saved document's content
 
