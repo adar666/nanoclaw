@@ -288,6 +288,84 @@ to the user.
 - Don't forget the `send_file` call after a successful fill — the new file
   sits on disk until you do.
 
+# Filling the same value into many saved documents at once
+
+## When to use this
+
+The user asks to put the **same value into the same field/target across
+several saved documents in one go** — "put today's date on all three
+contracts", "fill in Ada's name on the intake form and the waiver", "set the
+signature date on every invoice matching Q3". This is `fill_document_field_batch`
+— a single call that applies one `value` and one set of targeting args
+(`table`/`row`/`column`, `fieldName`, `lineNumber`, `pixelX`/`pixelY`)
+identically to every resolved document. It reuses exactly the same
+per-document targeting logic as `fill_document_field` (same auto-detection
+by file type, same table/text-line/AcroForm/pixel mechanics) — everything
+in the sections above about targeting still applies per document. It does
+**not** support a different value or different targeting per document in
+the batch — for that, call `fill_document_field` separately per document
+instead.
+
+## Picking the target set
+
+Give **exactly one** of:
+
+- `documents: [...]` — a list of names/slugs/topics, e.g. the user naming
+  several documents explicitly ("the report and the letter"). Each entry is
+  matched the same way `fill_document_field`'s own `document` argument is
+  matched. An entry that matches nothing, or matches more than one saved
+  document, is a **per-item failure** named in the combined report — it does
+  not stop the rest of the batch.
+- `matchQuery: "..."` — one substring query, e.g. the user saying "all
+  documents matching X" / "every invoice" / "all three contracts" when they
+  mean a topic rather than a list of exact names. Every saved document that
+  query matches becomes a target. If it matches zero documents, the whole
+  call errors (nothing to iterate) — relay that plainly rather than
+  guessing which documents were meant.
+
+Giving both, or neither, is rejected before any fill runs.
+
+## Reading the report
+
+One call, one combined text report: an `N/M succeeded` summary line, then
+one line naming each target's outcome — its output path on success, the
+exact failure reason otherwise (no match, ambiguous, wrong-type targeting
+args for that document's file type, or any other per-document fill error).
+Every target is named; nothing is silently dropped, and one document's
+failure never rolls back another's already-completed fill in the same call.
+
+```
+mcp__nanoclaw__fill_document_field_batch({ documents: ["report", "letter"], row: 2, value: "16/08/2026" })
+mcp__nanoclaw__fill_document_field_batch({ matchQuery: "invoice", fieldName: "Date", value: "16/08/2026" })
+```
+
+## After a batch fill
+
+The tool never sends anything itself. **Loop `send_file({ to, path })`
+yourself, once per successful output path** in the report — skip any target
+that failed (there's no file to send for those; relay its failure reason to
+the user instead). Don't stop delivering the successes just because one
+target in the batch failed.
+
+## What NOT to do
+
+- Don't use this for a different value or different target per document —
+  that's still one `fill_document_field` call per document.
+- Don't give both `documents` and `matchQuery`, or neither — pick the one
+  that matches how the user described the target set.
+- Don't skip relaying a per-item failure — the report names every target
+  for a reason; a partial batch is not a silent success.
+- Don't forget to loop `send_file` for every successful path in the
+  report — a batch of three successes needs three `send_file` calls, not
+  one.
+- Don't batch across incompatible file types in one call — e.g. don't mix
+  `.docx` table targets with `.pdf` AcroForm targets in the same
+  `documents`/`matchQuery` call. Every target gets the same targeting args,
+  so a batch is only fully effective when every resolved document shares
+  one file type and one targeting shape; a mismatched file type in the mix
+  just shows up as a per-item failure for that document instead of
+  succeeding.
+
 # Recalling a saved document's content
 
 ## When to use this

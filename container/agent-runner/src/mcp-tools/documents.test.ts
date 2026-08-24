@@ -18,6 +18,8 @@ import {
   listDocuments,
   fillDocumentFieldImpl,
   fillDocumentField,
+  fillDocumentFieldBatchImpl,
+  fillDocumentFieldBatch,
   sofficeConvertArgs,
   saveSignatureImpl,
   saveSignature,
@@ -3739,5 +3741,306 @@ describe('fill_document_field — signature stamping, stored canonical copy neve
     await fillDocumentFieldImpl({ document: 'letter', lineNumber: 1, signatureName: 'uriel' }, opts());
 
     expect(fs.readFileSync(rawPath).equals(rawBefore)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// fill_document_field_batch (spec 2-2)
+// ---------------------------------------------------------------------------
+
+describe('fill_document_field_batch tool metadata', () => {
+  it('has no required arguments (documents/matchQuery exclusivity is handler-enforced)', () => {
+    expect(fillDocumentFieldBatch.tool.name).toBe('fill_document_field_batch');
+    expect(fillDocumentFieldBatch.tool.inputSchema.required ?? []).toEqual([]);
+  });
+});
+
+describe('fill_document_field_batch — all targets resolve and fill successfully', () => {
+  it('reports N/N succeeded with each output path, via documents[]', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
+    await saveDocumentImpl({ path: writeInboxFile('letter.docx', buildDocxWithTables([[['c1', 'd1']]])) }, opts());
+
+    const result = await fillDocumentFieldBatchImpl({ documents: ['report', 'letter'], row: 1, value: 'X' }, opts());
+    expect(result.isError).toBeFalsy();
+    const text = result.content[0].text;
+    expect(text).toContain('2/2 succeeded');
+    expect(text).toContain('report');
+    expect(text).toContain('letter');
+    expect(text).toContain('New file at');
+
+    // Both output files actually landed on disk and contain the fill.
+    const matches = [...text.matchAll(/New file at (\S+) — call send_file/g)].map((m) => m[1]);
+    expect(matches.length).toBe(2);
+    for (const outPath of matches) {
+      expect(fs.existsSync(outPath)).toBe(true);
+    }
+  });
+
+  it('reports N/N succeeded via matchQuery, one target per match', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('invoice-a.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
+    await saveDocumentImpl({ path: writeInboxFile('invoice-b.docx', buildDocxWithTables([[['c1', 'd1']]])) }, opts());
+
+    const result = await fillDocumentFieldBatchImpl({ matchQuery: 'invoice', row: 1, value: 'X' }, opts());
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('2/2 succeeded');
+  });
+});
+
+describe('fill_document_field_batch — mixed success/failure across the batch', () => {
+  it('fills the existing document, names the missing one as a per-item failure, no batch abort', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
+
+    const result = await fillDocumentFieldBatchImpl({ documents: ['report', 'missing-doc'], row: 1, value: 'X' }, opts());
+    expect(result.isError).toBeFalsy();
+    const text = result.content[0].text;
+    expect(text).toContain('1/2 succeeded');
+    expect(text).toContain('New file at');
+    expect(text).toContain('No saved document matches "missing-doc".');
+  });
+});
+
+describe('fill_document_field_batch — an entry in documents is itself ambiguous', () => {
+  it('reports that entry as a per-item failure; other entries still processed', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('Report A.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
+    await saveDocumentImpl({ path: writeInboxFile('Report B.docx', buildDocxWithTables([[['c1', 'd1']]])) }, opts());
+    await saveDocumentImpl({ path: writeInboxFile('letter.docx', buildDocxWithTables([[['e1', 'f1']]])) }, opts());
+
+    const result = await fillDocumentFieldBatchImpl({ documents: ['report', 'letter'], row: 1, value: 'X' }, opts());
+    expect(result.isError).toBeFalsy();
+    const text = result.content[0].text;
+    expect(text).toContain('1/2 succeeded');
+    expect(text).toContain('ambiguous, be more specific');
+    expect(text).toContain('letter');
+    expect(text).toContain('New file at');
+  });
+});
+
+describe('fill_document_field_batch — matchQuery matches zero documents', () => {
+  it('returns a whole-call error rather than an empty/silent success report', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
+
+    const result = await fillDocumentFieldBatchImpl({ matchQuery: 'nonexistent', row: 1, value: 'X' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('No saved document matches "nonexistent".');
+  });
+});
+
+describe('fill_document_field_batch — neither or both of documents/matchQuery given', () => {
+  it('rejects an empty call before attempting any fill', async () => {
+    const result = await fillDocumentFieldBatchImpl({ row: 1, value: 'X' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('Provide exactly one of documents or matchQuery');
+    expect(fs.existsSync(path.join(baseDir, '.document-fills'))).toBe(false);
+  });
+
+  it('rejects a call giving both before attempting any fill', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
+
+    const result = await fillDocumentFieldBatchImpl(
+      { documents: ['report'], matchQuery: 'report', row: 1, value: 'X' },
+      opts(),
+    );
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('Provide exactly one of documents or matchQuery');
+    expect(fs.existsSync(path.join(baseDir, '.document-fills'))).toBe(false);
+  });
+});
+
+describe('fill_document_field_batch — targeting args do not apply to one document\'s file type', () => {
+  it('reports that document as a per-item failure with the existing validation error text; others unaffected', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
+
+    const pdfBytes = await buildAcroFormPdf('Name');
+    const pdfPath = writeInboxFile('form.pdf', pdfBytes);
+    await saveDocumentImpl({ path: pdfPath }, opts());
+    await saveDocumentImpl({ path: pdfPath, extractedText: 'A form with a Name field.' }, opts());
+
+    const result = await fillDocumentFieldBatchImpl(
+      { documents: ['report', 'form'], fieldName: 'Name', value: 'Ada Lovelace' },
+      opts(),
+    );
+    expect(result.isError).toBeFalsy();
+    const text = result.content[0].text;
+    expect(text).toContain('1/2 succeeded');
+    expect(text).toContain("These arguments don't apply to a .docx document: fieldName.");
+    expect(text).toContain('New file at');
+  });
+});
+
+describe('fill_document_field_batch — never touches the stored canonical files', () => {
+  it('leaves both stored raw copies untouched after a successful batch fill', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
+    await saveDocumentImpl({ path: writeInboxFile('letter.docx', buildDocxWithTables([[['c1', 'd1']]])) }, opts());
+
+    const reportRaw = path.join(baseDir, 'memory', 'documents', 'files', 'report.docx');
+    const letterRaw = path.join(baseDir, 'memory', 'documents', 'files', 'letter.docx');
+    const reportBefore = fs.readFileSync(reportRaw);
+    const letterBefore = fs.readFileSync(letterRaw);
+
+    await fillDocumentFieldBatchImpl({ documents: ['report', 'letter'], row: 1, value: 'X' }, opts());
+
+    expect(fs.readFileSync(reportRaw).equals(reportBefore)).toBe(true);
+    expect(fs.readFileSync(letterRaw).equals(letterBefore)).toBe(true);
+  });
+});
+
+describe('fill_document_field_batch — one target throws instead of returning err(), earlier successes are preserved', () => {
+  it('reports the earlier success even though a later target corrupts partway through the loop', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('good.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
+    await saveDocumentImpl({ path: writeInboxFile('corrupt.docx', buildDocxWithTables([[['c1', 'd1']]])) }, opts());
+
+    // Corrupt the stored raw copy directly (not the inbox source) so fillDocx's
+    // unguarded `JSZip.loadAsync` throws instead of `fillOneDocument` returning
+    // a handled err() — this is the real, uncaught-exception shape the fix
+    // targets, not a validation-level failure.
+    const corruptRaw = path.join(baseDir, 'memory', 'documents', 'files', 'corrupt.docx');
+    fs.writeFileSync(corruptRaw, Buffer.from('not a zip file at all'));
+
+    const result = await fillDocumentFieldBatchImpl({ documents: ['good', 'corrupt'], row: 1, value: 'X' }, opts());
+    expect(result.isError).toBeFalsy();
+    const text = result.content[0].text;
+    expect(text).toContain('1/2 succeeded');
+    expect(text).toContain('good: OK');
+    expect(text).toContain('New file at');
+    expect(text).toContain('corrupt: FAILED');
+  });
+});
+
+describe('fill_document_field_batch — signatureName is not supported', () => {
+  it('rejects the whole call before any fill runs', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
+    writeSavedSignature('uriel', buildSignaturePng({ width: 20, height: 10, ink: { x: 2, y: 2, w: 10, h: 5 } }));
+
+    const result = await fillDocumentFieldBatchImpl(
+      { documents: ['report'], row: 1, signatureName: 'uriel' },
+      opts(),
+    );
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('signatureName is not supported by fill_document_field_batch');
+    expect(fs.existsSync(path.join(baseDir, '.document-fills'))).toBe(false);
+  });
+});
+
+describe('fill_document_field_batch — duplicate documents[] entries resolving to the same document', () => {
+  it('fills and reports the document once, not twice', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
+
+    const result = await fillDocumentFieldBatchImpl({ documents: ['report', 'report'], row: 1, value: 'X' }, opts());
+    expect(result.isError).toBeFalsy();
+    const text = result.content[0].text;
+    expect(text).toContain('1/1 succeeded');
+    expect(text.match(/report: OK/g)?.length).toBe(1);
+  });
+
+  it('also dedupes when two different query strings resolve to the same document', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('quarterly-report.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
+
+    const result = await fillDocumentFieldBatchImpl(
+      { documents: ['quarterly-report', 'report'], row: 1, value: 'X' },
+      opts(),
+    );
+    expect(result.isError).toBeFalsy();
+    const text = result.content[0].text;
+    expect(text).toContain('1/1 succeeded');
+    expect(text.match(/quarterly-report: OK/g)?.length).toBe(1);
+  });
+});
+
+describe('fill_document_field_batch — batch-size cap', () => {
+  it('rejects a matchQuery match set larger than the limit, before any fill runs', async () => {
+    for (let i = 0; i < 26; i++) {
+      // eslint-disable-next-line no-await-in-loop
+      await saveDocumentImpl(
+        { path: writeInboxFile(`invoice-${i}.docx`, buildDocxWithTables([[['a1', 'b1']]])) },
+        opts(),
+      );
+    }
+
+    const result = await fillDocumentFieldBatchImpl({ matchQuery: 'invoice', row: 1, value: 'X' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('exceeding the 25-document limit');
+    expect(fs.existsSync(path.join(baseDir, '.document-fills'))).toBe(false);
+  });
+});
+
+describe('fill_document_field_batch — resolveBatchTargets input-shape validation', () => {
+  it('rejects a non-array documents value', async () => {
+    const result = await fillDocumentFieldBatchImpl({ documents: 'report', row: 1, value: 'X' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('documents must be a non-empty array of non-empty strings.');
+  });
+
+  it('rejects an empty documents array', async () => {
+    const result = await fillDocumentFieldBatchImpl({ documents: [], row: 1, value: 'X' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('documents must be a non-empty array of non-empty strings.');
+  });
+
+  it('rejects a documents array containing a blank/non-string entry', async () => {
+    const blankEntry = await fillDocumentFieldBatchImpl({ documents: ['report', '   '], row: 1, value: 'X' }, opts());
+    expect(blankEntry.isError).toBe(true);
+    expect(blankEntry.content[0].text).toContain('documents must be a non-empty array of non-empty strings.');
+
+    const nonStringEntry = await fillDocumentFieldBatchImpl({ documents: ['report', 42], row: 1, value: 'X' }, opts());
+    expect(nonStringEntry.isError).toBe(true);
+    expect(nonStringEntry.content[0].text).toContain('documents must be a non-empty array of non-empty strings.');
+  });
+
+  it('rejects an empty-string matchQuery', async () => {
+    const result = await fillDocumentFieldBatchImpl({ matchQuery: '   ', row: 1, value: 'X' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('matchQuery must be a non-empty string.');
+  });
+
+  it('rejects a non-string matchQuery', async () => {
+    const result = await fillDocumentFieldBatchImpl({ matchQuery: 42, row: 1, value: 'X' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('matchQuery must be a non-empty string.');
+  });
+});
+
+describe('fill_document_field_batch — every documents[] entry fails to resolve', () => {
+  it('is a soft 0/N report, not a whole-call error', async () => {
+    const result = await fillDocumentFieldBatchImpl({ documents: ['missing-a', 'missing-b'], row: 1, value: 'X' }, opts());
+    expect(result.isError).toBeFalsy();
+    const text = result.content[0].text;
+    expect(text).toContain('0/2 succeeded');
+    expect(text).toContain('No saved document matches "missing-a".');
+    expect(text).toContain('No saved document matches "missing-b".');
+  });
+});
+
+describe('fill_document_field_batch — a discovery/prompt response does not count as a success', () => {
+  it('reports FAILED and excludes it from the succeeded count', async () => {
+    const original = buildDocxRawBody([tableXml([['a1', 'b1']]), bodyParagraphXml('שם: ___________')]);
+    await saveDocumentImpl({ path: writeInboxFile('mixed.docx', original) }, opts());
+
+    // No row/table/lineNumber at all -> fillDocx returns docxDiscoveryResponse's
+    // ok(TABLE_ROW_REQUIRED_MESSAGE...) — a real, non-error ok() with no
+    // FILL_SUCCESS_MARKER, since nothing was actually filled.
+    const result = await fillDocumentFieldBatchImpl({ documents: ['mixed'] }, opts());
+    expect(result.isError).toBeFalsy();
+    const text = result.content[0].text;
+    expect(text).toContain('0/1 succeeded');
+    expect(text).toContain('mixed: FAILED');
+    expect(text).toContain('row is required');
+    expect(text).not.toContain('New file at');
+  });
+});
+
+describe('fill_document_field — existing single-call tool untouched by the batch addition', () => {
+  it('still declares document as the only required argument, unchanged', () => {
+    expect(fillDocumentField.tool.name).toBe('fill_document_field');
+    expect(fillDocumentField.tool.inputSchema).toMatchObject({ required: ['document'] });
+  });
+
+  it('still fills a single document exactly as before', async () => {
+    const original = buildDocxWithTables([[['a1', 'b1']]]);
+    await saveDocumentImpl({ path: writeInboxFile('report.docx', original) }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, value: 'X' }, opts());
+    expect(result.isError).toBeFalsy();
+    const outPath = extractOutPath(result.content[0].text);
+    expect(fs.existsSync(outPath)).toBe(true);
   });
 });

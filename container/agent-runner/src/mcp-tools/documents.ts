@@ -2811,6 +2811,69 @@ function presentArgNames(args: Record<string, unknown>, keys: readonly string[])
   return keys.filter((k) => args[k] !== undefined);
 }
 
+/**
+ * Per-document fill body, shared by fill_document_field (single call, Story
+ * 1.2 onward) and fill_document_field_batch (spec 2-2) — takes an
+ * already-resolved DocumentMeta and `filesDir`, applies the exact same
+ * file-type auto-detection, DOCX_ONLY_ARGS/PDF_ONLY_ARGS validation, and
+ * fillDocx/fillDoc/fillPdf dispatch fill_document_field has always used.
+ * Document *resolution* (turning a free-text query into a DocumentMeta,
+ * including the ambiguous/not-found handshake) is deliberately the caller's
+ * job, not this helper's — fill_document_field and the batch tool resolve
+ * differently (resolveDocument's single-match-only contract vs. the batch
+ * tool's per-entry/matchQuery resolution), so folding resolution in here
+ * would force one shape onto both.
+ */
+async function fillOneDocument(
+  meta: DocumentMeta,
+  filesDir: string,
+  args: Record<string, unknown>,
+  opts: FillOpts,
+  // Only affects the log line's prefix (so a batch-triggered fill is
+  // distinguishable from a single-call fill in nanoclaw.log) — never
+  // affects behavior. Defaults to the single-call tool's own name since
+  // that's this function's original, still-primary caller.
+  callerLabel: string = 'fill_document_field',
+): Promise<ReturnType<typeof ok> | ReturnType<typeof err>> {
+  if (meta.ambiguousExtensions) {
+    return err(
+      `Multiple files found for document "${meta.slug}" (${meta.ambiguousExtensions.join(', ')}) — this ` +
+        'shouldn\'t normally happen. Check memory/documents/files/ for this slug manually before retrying.',
+    );
+  }
+
+  if (IMAGE_EXTENSIONS.has(meta.ext)) {
+    return err(
+      `"${meta.slug}" is a saved image (.${meta.ext}) — fill_document_field only fills/stamps a .docx, .doc, ` +
+        'or .pdf document. There is no field/target to fill on a plain image.',
+    );
+  }
+
+  if (meta.ext === 'pdf') {
+    const wrongArgs = presentArgNames(args, DOCX_ONLY_ARGS);
+    if (wrongArgs.length > 0) {
+      return err(`These arguments don't apply to a .pdf document: ${wrongArgs.join(', ')}.`);
+    }
+  } else {
+    const wrongArgs = presentArgNames(args, PDF_ONLY_ARGS);
+    if (wrongArgs.length > 0) {
+      return err(`These arguments don't apply to a .${meta.ext} document: ${wrongArgs.join(', ')}.`);
+    }
+  }
+
+  const rawPath = path.join(filesDir, `${meta.slug}.${meta.ext}`);
+  if (!fs.existsSync(rawPath)) return err(`Saved raw file for "${meta.slug}" is missing.`);
+
+  const result =
+    meta.ext === 'docx'
+      ? await fillDocx(rawPath, meta, args, opts)
+      : meta.ext === 'doc'
+        ? await fillDoc(rawPath, meta, args, opts)
+        : await fillPdf(rawPath, meta, args, opts);
+  log(`${callerLabel}: ${meta.slug} (${meta.ext}) -> ${'isError' in result && result.isError ? 'error' : 'ok'}`);
+  return result;
+}
+
 export async function fillDocumentFieldImpl(
   args: Record<string, unknown>,
   opts: FillOpts,
@@ -2836,44 +2899,7 @@ export async function fillDocumentFieldImpl(
       );
     }
 
-    const meta = resolution.meta;
-    if (meta.ambiguousExtensions) {
-      return err(
-        `Multiple files found for document "${meta.slug}" (${meta.ambiguousExtensions.join(', ')}) — this ` +
-          'shouldn\'t normally happen. Check memory/documents/files/ for this slug manually before retrying.',
-      );
-    }
-
-    if (IMAGE_EXTENSIONS.has(meta.ext)) {
-      return err(
-        `"${meta.slug}" is a saved image (.${meta.ext}) — fill_document_field only fills/stamps a .docx, .doc, ` +
-          'or .pdf document. There is no field/target to fill on a plain image.',
-      );
-    }
-
-    if (meta.ext === 'pdf') {
-      const wrongArgs = presentArgNames(args, DOCX_ONLY_ARGS);
-      if (wrongArgs.length > 0) {
-        return err(`These arguments don't apply to a .pdf document: ${wrongArgs.join(', ')}.`);
-      }
-    } else {
-      const wrongArgs = presentArgNames(args, PDF_ONLY_ARGS);
-      if (wrongArgs.length > 0) {
-        return err(`These arguments don't apply to a .${meta.ext} document: ${wrongArgs.join(', ')}.`);
-      }
-    }
-
-    const rawPath = path.join(filesDir, `${meta.slug}.${meta.ext}`);
-    if (!fs.existsSync(rawPath)) return err(`Saved raw file for "${meta.slug}" is missing.`);
-
-    const result =
-      meta.ext === 'docx'
-        ? await fillDocx(rawPath, meta, args, opts)
-        : meta.ext === 'doc'
-          ? await fillDoc(rawPath, meta, args, opts)
-          : await fillPdf(rawPath, meta, args, opts);
-    log(`fill_document_field: ${meta.slug} (${meta.ext}) -> ${'isError' in result && result.isError ? 'error' : 'ok'}`);
-    return result;
+    return await fillOneDocument(resolution.meta, filesDir, args, opts);
   } catch (e) {
     return err(`fill_document_field failed: ${e instanceof Error ? e.message : String(e)}`);
   }
@@ -2969,6 +2995,273 @@ export const fillDocumentField: McpToolDefinition = {
   handler: (args) => fillDocumentFieldImpl(args, { baseDir: '/workspace/agent' }),
 };
 
+// ---------------------------------------------------------------------------
+// fill_document_field_batch (spec 2-2) — applies one value/targeting-args
+// set, identically, across many already-resolved saved documents in a
+// single call. Reuses fillOneDocument (the exact per-document fill body
+// fill_document_field itself uses) — no parallel targeting implementation.
+// Every target's outcome (success or failure) is named in the single
+// combined report; one document's failure never aborts or rolls back
+// another's already-completed fill in the same batch call.
+// ---------------------------------------------------------------------------
+
+interface BatchTarget {
+  /** The `documents[]` entry as given, or the resolved slug for a `matchQuery` match — labels this target's report line even when resolution itself failed. */
+  label: string;
+  meta?: DocumentMeta;
+  /** Set only when resolution itself failed (not-found / ambiguous) — meta is undefined in that case. */
+  resolutionFailure?: string;
+}
+
+/**
+ * Upper bound on resolved (post-dedup) targets in one batch call — processed
+ * strictly sequentially with zero partial visibility until the whole call
+ * finishes, so an unbounded `matchQuery` (or a very long `documents[]`)
+ * could otherwise run for a very long time with nothing to show for it.
+ * 25 is a deliberately generous placeholder for "many files, one value" (the
+ * story's own framing), not a hard technical ceiling — narrow matchQuery or
+ * split into smaller batches beyond it.
+ */
+const MAX_BATCH_TARGETS = 25;
+
+/**
+ * Turns the batch call's `documents`/`matchQuery` input into a flat list of
+ * per-document targets, or a whole-call error when the input itself is
+ * malformed (neither/both given) or `matchQuery` matches nothing (nothing
+ * to iterate). A `documents[]` entry that fails to resolve (0 or 2+
+ * matches) is NOT a whole-call error here — it becomes a target with
+ * `resolutionFailure` set, reported per-item by the caller instead.
+ */
+function resolveBatchTargets(
+  documentsDir: string,
+  filesDir: string,
+  args: Record<string, unknown>,
+): { targets: BatchTarget[] } | { error: string } {
+  const documentsRaw = args.documents;
+  const matchQueryRaw = args.matchQuery;
+  const hasDocuments = documentsRaw !== undefined;
+  const hasMatchQuery = matchQueryRaw !== undefined;
+
+  if (hasDocuments === hasMatchQuery) {
+    return { error: 'Provide exactly one of documents or matchQuery' };
+  }
+
+  if (hasDocuments) {
+    if (
+      !Array.isArray(documentsRaw) ||
+      documentsRaw.length === 0 ||
+      !documentsRaw.every((d) => typeof d === 'string' && d.trim() !== '')
+    ) {
+      return { error: 'documents must be a non-empty array of non-empty strings.' };
+    }
+
+    // Two different documents[] entries (the same string given twice, or two
+    // aliases/queries that happen to resolve to the same saved document)
+    // must not fill or report the same document twice — first occurrence
+    // wins, later duplicates are silently dropped (not reported as a
+    // failure; they're not wrong, just redundant with an entry already
+    // included). Only applies to entries that actually resolved to a
+    // DocumentMeta — a resolution failure has no slug to dedupe by, and
+    // every such entry is still independently reported.
+    const seenSlugs = new Set<string>();
+    const targets: BatchTarget[] = [];
+    for (const raw of documentsRaw as string[]) {
+      const query = raw.trim();
+      const resolution = resolveDocument(documentsDir, filesDir, query);
+      if (resolution.kind === 'not-found') {
+        targets.push({ label: query, resolutionFailure: `No saved document matches "${query}".` });
+        continue;
+      }
+      if (resolution.kind === 'candidates') {
+        targets.push({
+          label: query,
+          resolutionFailure: `Multiple saved documents match "${query}" — ambiguous, be more specific.`,
+        });
+        continue;
+      }
+      if (seenSlugs.has(resolution.meta.slug)) continue;
+      seenSlugs.add(resolution.meta.slug);
+      targets.push({ label: resolution.meta.slug, meta: resolution.meta });
+    }
+    return { targets };
+  }
+
+  if (typeof matchQueryRaw !== 'string' || matchQueryRaw.trim() === '') {
+    return { error: 'matchQuery must be a non-empty string.' };
+  }
+  const matchQuery = matchQueryRaw.trim();
+  const matches = matchDocuments(documentsDir, filesDir, matchQuery);
+  if (matches.length === 0) {
+    return { error: `No saved document matches "${matchQuery}".` };
+  }
+  return { targets: matches.map((meta) => ({ label: meta.slug, meta })) };
+}
+
+export async function fillDocumentFieldBatchImpl(
+  args: Record<string, unknown>,
+  opts: FillOpts,
+): Promise<ReturnType<typeof ok> | ReturnType<typeof err>> {
+  try {
+    // Out of scope for this capability (CAP-7 reuses CAP-3's plain-value
+    // targeting, not CAP-6's signature stamping) — reject up front rather
+    // than silently letting it flow through to fillOneDocument unblocked,
+    // which would work but isn't a documented/supported combination here.
+    if (args.signatureName !== undefined) {
+      const error =
+        'signatureName is not supported by fill_document_field_batch — call fill_document_field once per ' +
+        'document for signature stamping.';
+      log(`fill_document_field_batch: rejected — ${error}`);
+      return err(error);
+    }
+
+    const documentsDir = path.join(opts.baseDir, 'memory', 'documents');
+    const filesDir = path.join(documentsDir, 'files');
+
+    const resolved = resolveBatchTargets(documentsDir, filesDir, args);
+    if ('error' in resolved) {
+      log(`fill_document_field_batch: rejected — ${resolved.error}`);
+      return err(resolved.error);
+    }
+    const { targets } = resolved;
+
+    if (targets.length > MAX_BATCH_TARGETS) {
+      const error =
+        `Batch would fill ${targets.length} documents, exceeding the ${MAX_BATCH_TARGETS}-document limit — ` +
+        'narrow matchQuery or split into smaller batches.';
+      log(`fill_document_field_batch: rejected — ${error}`);
+      return err(error);
+    }
+
+    let succeeded = 0;
+    const lines: string[] = [];
+
+    for (const target of targets) {
+      if (!target.meta) {
+        lines.push(`- ${target.label}: FAILED — ${target.resolutionFailure}`);
+        continue;
+      }
+
+      // fillOneDocument normally *returns* err() for a handled failure, but
+      // an unguarded throw deep in one file-type's fill path (e.g. a
+      // corrupted .docx failing JSZip.loadAsync) is possible too. Per this
+      // spec's own frozen Boundary ("one document's fill failure must never
+      // abort or roll back another document's already-completed fill"),
+      // that throw must be caught right here, per-target — letting it
+      // propagate to the outer try/catch would discard the whole report,
+      // including every success already recorded earlier in this same loop.
+      let text: string;
+      let isCompletedFill: boolean;
+      try {
+        const result = await fillOneDocument(target.meta, filesDir, args, opts, 'fill_document_field_batch');
+        text = typeof result.content[0]?.text === 'string' ? result.content[0].text : '';
+        // A completed fill always writes a new file and says so via
+        // FILL_SUCCESS_MARKER (see withDocConversionNote's own comment on
+        // why this is the correct signal) — a bare `!isError` check alone
+        // would wrongly count a discovery/prompt response (e.g. missing
+        // lineNumber for this one document) as a success, even though
+        // nothing was actually filled and there is no output path to
+        // report.
+        isCompletedFill = !('isError' in result && result.isError) && text.includes(FILL_SUCCESS_MARKER);
+      } catch (e) {
+        text = e instanceof Error ? e.message : String(e);
+        isCompletedFill = false;
+      }
+
+      if (isCompletedFill) {
+        succeeded += 1;
+        lines.push(`- ${target.meta.slug}: OK — ${text}`);
+      } else {
+        lines.push(`- ${target.meta.slug}: FAILED — ${text}`);
+      }
+    }
+
+    log(`fill_document_field_batch: ${succeeded}/${targets.length} succeeded`);
+    return ok(`${succeeded}/${targets.length} succeeded\n\n${lines.join('\n')}`);
+  } catch (e) {
+    return err(`fill_document_field_batch failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+export const fillDocumentFieldBatch: McpToolDefinition = {
+  tool: {
+    name: 'fill_document_field_batch',
+    description:
+      'Fill the same value into the same target across many documents already saved via save_document, in one ' +
+      "call — reuses fill_document_field's exact per-document targeting logic (table/row/column, lineNumber, " +
+      'fieldName, pixelX/pixelY — same auto-detection by file type) for every target, and produces one new file ' +
+      'per document (the stored copies are never modified). Give either "documents" (a list of names/slugs/' +
+      'topics, each independently resolved the same way fill_document_field resolves "document") or ' +
+      '"matchQuery" (one substring query — every saved document it matches becomes a target) — never both, never ' +
+      "neither. One document's failure (not found, ambiguous, wrong-type targeting args, etc.) never stops the " +
+      "rest — every target's outcome is named in the single combined report this tool returns (an N/M-succeeded " +
+      'summary line, then one line per document: its output path on success, the exact failure reason ' +
+      'otherwise). Call send_file yourself for each successful output path — this tool never sends anything ' +
+      'itself. Never a per-document value or per-document targeting override — one value, one set of targeting ' +
+      `args, applied identically to every resolved document. Resolved targets are capped at ${MAX_BATCH_TARGETS} ` +
+      'per call — a larger matchQuery match set is rejected up front; narrow the query or split into smaller ' +
+      'batches. Does not support signatureName (signature stamping) — call fill_document_field once per document ' +
+      'for that.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        documents: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Names/slugs/topics of the saved documents to fill — each independently matched the same way ' +
+            'fill_document_field matches "document" (0 matches or 2+ matches for one entry is a per-item ' +
+            'failure named in the report, not a whole-batch error). Mutually exclusive with matchQuery; give ' +
+            'exactly one of the two.',
+        },
+        matchQuery: {
+          type: 'string',
+          description:
+            'A single substring query (same matching as list_documents) — every saved document it matches ' +
+            'becomes a fill target. Zero matches is a whole-call error (nothing to iterate). Mutually exclusive ' +
+            'with documents; give exactly one of the two.',
+        },
+        value: {
+          type: 'string',
+          description: 'The value to write into every resolved document. Required on the call that performs the fill.',
+        },
+        table: {
+          type: 'integer',
+          description: '.docx only: 1-indexed table number, applied to every resolved .docx/.doc target.',
+        },
+        row: {
+          type: 'integer',
+          description:
+            '.docx only: 1-indexed row number within the target table, applied to every resolved .docx/.doc target.',
+        },
+        column: {
+          type: 'integer',
+          description:
+            '.docx only: 1-indexed column (cell) within the target row, applied to every resolved .docx/.doc target.',
+        },
+        fieldName: {
+          type: 'string',
+          description: '.pdf only: an AcroForm field name, applied to every resolved .pdf target.',
+        },
+        lineNumber: {
+          type: 'integer',
+          description:
+            '1-indexed detected line, applied to every resolved target (a .pdf text-layer line or a .docx ' +
+            'fill-in-the-blank paragraph) — same numbering as a discovery call for a single document.',
+        },
+        pixelX: {
+          type: 'number',
+          description: '.pdf, scanned only: x pixel position, applied to every resolved scanned-PDF target.',
+        },
+        pixelY: {
+          type: 'number',
+          description: '.pdf, scanned only: y pixel position, applied to every resolved scanned-PDF target.',
+        },
+      },
+    },
+  },
+  handler: (args) => fillDocumentFieldBatchImpl(args, { baseDir: '/workspace/agent' }),
+};
+
 export const saveDocument: McpToolDefinition = {
   tool: {
     name: 'save_document',
@@ -3004,4 +3297,4 @@ export const saveDocument: McpToolDefinition = {
   handler: (args) => saveDocumentImpl(args, { baseDir: '/workspace/agent', workspaceRoot: '/workspace' }),
 };
 
-registerTools([saveDocument, listDocuments, fillDocumentField, saveSignature]);
+registerTools([saveDocument, listDocuments, fillDocumentField, fillDocumentFieldBatch, saveSignature]);
