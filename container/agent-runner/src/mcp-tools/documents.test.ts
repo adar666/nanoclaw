@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, mock } from 'bun:test';
 import { execFileSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
@@ -22,6 +22,43 @@ import {
   saveSignatureImpl,
   saveSignature,
 } from './documents.js';
+
+// ---------------------------------------------------------------------------
+// tesseract.js mock (spec-2-1) — real OCR needs network access on first use
+// (fetches `eng.traineddata` from a CDN, per documents.ts's `ocrPngText`
+// comment) and takes real wall-clock time even once cached, neither of which
+// belongs in this suite. tesseract.js is a dependency added specifically for
+// `documents.ts`'s scanned-PDF OCR path and has no other consumer anywhere
+// in this codebase (verified), so mocking its module here for the whole test
+// process is safe — no other test file relies on the real implementation.
+// `documents.ts` only ever imports it dynamically (`await import('tesseract
+// .js')`) inside `ocrPngText`, so this mock just needs to be registered
+// before that call happens at runtime, not before documents.ts's own
+// (static) import at the top of this file.
+//
+// `mockOcrResult` is mutable, set per test before calling saveDocumentImpl,
+// and reset to a safe default in beforeEach below. `lastCreateWorkerCall`
+// captures the args documents.ts's `ocrPngText` actually passed to
+// `createWorker`, so a test can assert the Bun-specific workerPath/cachePath
+// wiring is real rather than just trusting an ignored mock call — a broken
+// computation there would otherwise still show a fully green suite.
+// ---------------------------------------------------------------------------
+
+let mockOcrResult: { text: string } | { error: string } = { text: '' };
+let lastCreateWorkerCall: { langs: unknown; oem: unknown; options: { workerPath?: string; cachePath?: string } } | undefined;
+
+mock.module('tesseract.js', () => ({
+  createWorker: async (langs: unknown, oem: unknown, options: { workerPath?: string; cachePath?: string }) => {
+    lastCreateWorkerCall = { langs, oem, options };
+    return {
+      recognize: async () => {
+        if ('error' in mockOcrResult) throw new Error(mockOcrResult.error);
+        return { data: { text: mockOcrResult.text, confidence: mockOcrResult.text.trim() ? 90 : 0 } };
+      },
+      terminate: async () => {},
+    };
+  },
+}));
 
 // ---------------------------------------------------------------------------
 // Test fixtures — hand-rolled, dependency-free builders so these tests don't
@@ -294,6 +331,8 @@ beforeEach(() => {
   inboxDir = path.join(tmpRoot, 'inbox', 'msg1');
   fs.mkdirSync(baseDir, { recursive: true });
   fs.mkdirSync(inboxDir, { recursive: true });
+  mockOcrResult = { text: '' };
+  lastCreateWorkerCall = undefined;
 });
 
 afterEach(() => {
@@ -387,15 +426,81 @@ describe('save_document — happy path, PDF with text layer', () => {
   });
 });
 
-describe('save_document — scanned PDF, no text layer', () => {
-  it('first call renders page 1 and asks the agent to read it, without saving anything yet', async () => {
+describe('save_document — scanned PDF, no text layer, OCR reads it', () => {
+  it('single call: renders page 1, OCRs it, saves the OCR text, and deletes the render', async () => {
+    mockOcrResult = { text: 'What OCR read from the rendered page.' };
+    const filePath = writeInboxFile('scan.pdf', buildMinimalPdf(null));
+
+    const result = await saveDocumentImpl({ path: filePath }, opts());
+
+    expect(result.isError).toBeFalsy();
+    const concept = fs.readFileSync(path.join(baseDir, 'memory', 'documents', 'scan.md'), 'utf-8');
+    expect(concept).toContain('What OCR read from the rendered page.');
+    expect(fs.existsSync(path.join(baseDir, 'memory', 'documents', 'files', 'scan.pdf'))).toBe(true);
+
+    // The render PNG is cleaned up once its OCR text is safely written out —
+    // it never persists past a successful save (spec Boundaries).
+    const renderDir = path.join(baseDir, '.document-renders');
+    expect(fs.existsSync(renderDir) ? fs.readdirSync(renderDir).length : 0).toBe(0);
+  });
+
+  it('wires createWorker with both languages, a real workerPath, and the expected cachePath', async () => {
+    mockOcrResult = { text: 'legible text' };
+    const filePath = writeInboxFile('scan.pdf', buildMinimalPdf(null));
+
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    expect(lastCreateWorkerCall).toBeDefined();
+    expect(lastCreateWorkerCall!.langs).toBe('eng+heb');
+    // Not a fake/placeholder path — this must resolve to a real file on
+    // disk, or the Bun-specific worker-resolution fix this test exists to
+    // guard has silently regressed.
+    expect(fs.existsSync(lastCreateWorkerCall!.options.workerPath!)).toBe(true);
+    expect(lastCreateWorkerCall!.options.workerPath).toMatch(/worker-script[/\\]node[/\\]index\.js$/);
+    expect(lastCreateWorkerCall!.options.cachePath).toBe(path.join(baseDir, '.ocr-cache'));
+  });
+
+  it('treats a near-empty (but non-empty) OCR result as no readable text, per the Ask-First halt', async () => {
+    // A stray single character from a blank/noisy page is not real content
+    // — must route through the same halt as a truly empty OCR result,
+    // never get silently saved as if it were legible text.
+    mockOcrResult = { text: '.' };
+    const filePath = writeInboxFile('scan.pdf', buildMinimalPdf(null));
+
+    const result = await saveDocumentImpl({ path: filePath }, opts());
+
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('found little to no readable text');
+    expect(fs.existsSync(path.join(baseDir, 'memory', 'documents', 'scan.md'))).toBe(false);
+
+    // Same as the fully-empty case: the render survives for a possible
+    // vision-fallback follow-up.
+    const renderDir = path.join(baseDir, '.document-renders');
+    expect(fs.readdirSync(renderDir).length).toBe(1);
+  });
+
+  it('rejects a non-string extractedText with a clear error instead of silently proceeding', async () => {
+    const filePath = writeInboxFile('scan.pdf', buildMinimalPdf(null));
+
+    const result = await saveDocumentImpl({ path: filePath, extractedText: 12345 }, opts());
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('extractedText must be a string');
+  });
+});
+
+describe('save_document — scanned PDF, OCR finds no readable text (Ask-First halt)', () => {
+  it('halts instead of saving, asks the user, and leaves the render in place for a possible vision fallback', async () => {
+    mockOcrResult = { text: '' };
     const filePath = writeInboxFile('scan.pdf', buildMinimalPdf(null));
 
     const result = await saveDocumentImpl({ path: filePath }, opts());
 
     expect(result.isError).toBeFalsy();
     expect(result.content[0].text).toContain('no extractable text layer');
+    expect(result.content[0].text).toContain('found little to no readable text');
     expect(result.content[0].text).toContain('save_document again');
+    expect(result.content[0].text).toContain('extractedText: ""');
     // Transparency: the response must disclose that only page 1 was captured.
     expect(result.content[0].text).toContain('page 1 only');
     // The render path in the message must be derived from the injected
@@ -404,10 +509,12 @@ describe('save_document — scanned PDF, no text layer', () => {
     expect(result.content[0].text).toContain(path.join(baseDir, '.document-renders'));
     expect(result.content[0].text).not.toContain('/workspace/agent/');
 
-    // No partial memory entry from the first (render-only) call.
+    // No partial memory entry from the halted call.
     expect(fs.existsSync(path.join(baseDir, 'memory', 'documents', 'scan.md'))).toBe(false);
     expect(fs.existsSync(path.join(baseDir, 'memory', 'documents', 'files', 'scan.pdf'))).toBe(false);
 
+    // The render must survive the halt — a vision-fallback follow-up needs
+    // to be able to read it.
     const renderDir = path.join(baseDir, '.document-renders');
     expect(fs.existsSync(renderDir)).toBe(true);
     const rendered = fs.readdirSync(renderDir);
@@ -415,7 +522,8 @@ describe('save_document — scanned PDF, no text layer', () => {
     expect(rendered[0]).toMatch(/\.png$/);
   });
 
-  it('renders the same deterministic filename on repeated first calls for the same file', async () => {
+  it('renders the same deterministic filename on repeated halted calls for the same file', async () => {
+    mockOcrResult = { text: '' };
     const filePath = writeInboxFile('scan.pdf', buildMinimalPdf(null));
 
     const r1 = await saveDocumentImpl({ path: filePath }, opts());
@@ -432,7 +540,8 @@ describe('save_document — scanned PDF, no text layer', () => {
     expect(secondRendered).toEqual(firstRendered);
   });
 
-  it('second call, with extractedText, completes the save and deletes the render PNG', async () => {
+  it('follow-up call with real extractedText (vision fallback) completes the save and deletes the render', async () => {
+    mockOcrResult = { text: '' };
     const filePath = writeInboxFile('scan.pdf', buildMinimalPdf(null));
 
     await saveDocumentImpl({ path: filePath }, opts());
@@ -453,13 +562,39 @@ describe('save_document — scanned PDF, no text layer', () => {
     expect(fs.readdirSync(renderDir).length).toBe(0);
   });
 
-  it('rejects a non-string extractedText with a clear error instead of silently re-rendering', async () => {
+  it('follow-up call with extractedText: "" accepts the placeholder instead of the vision fallback', async () => {
+    mockOcrResult = { text: '' };
     const filePath = writeInboxFile('scan.pdf', buildMinimalPdf(null));
 
-    const result = await saveDocumentImpl({ path: filePath, extractedText: 12345 }, opts());
+    await saveDocumentImpl({ path: filePath }, opts());
+    const renderDir = path.join(baseDir, '.document-renders');
+
+    const result = await saveDocumentImpl({ path: filePath, extractedText: '' }, opts());
+
+    expect(result.isError).toBeFalsy();
+    const concept = fs.readFileSync(path.join(baseDir, 'memory', 'documents', 'scan.md'), 'utf-8');
+    expect(concept).toContain('_(no text extracted)_');
+    expect(fs.existsSync(path.join(baseDir, 'memory', 'documents', 'files', 'scan.pdf'))).toBe(true);
+
+    // Still cleaned up — the render has served its purpose either way.
+    expect(fs.readdirSync(renderDir).length).toBe(0);
+  });
+
+  it('surfaces an OCR engine failure as a clear error, never a silent/partial write, and cleans up the render', async () => {
+    mockOcrResult = { error: 'simulated OCR engine crash' };
+    const filePath = writeInboxFile('scan.pdf', buildMinimalPdf(null));
+
+    const result = await saveDocumentImpl({ path: filePath }, opts());
 
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain('extractedText must be a string');
+    expect(result.content[0].text).toContain('Could not OCR scanned PDF page');
+    expect(fs.existsSync(path.join(baseDir, 'memory'))).toBe(false);
+
+    // Unlike the near-empty halt (which deliberately keeps the render for a
+    // vision-fallback follow-up), a genuine OCR engine failure has no
+    // follow-up flow that needs it — it must not be left orphaned.
+    const renderDir = path.join(baseDir, '.document-renders');
+    expect(fs.existsSync(renderDir) ? fs.readdirSync(renderDir).length : 0).toBe(0);
   });
 });
 

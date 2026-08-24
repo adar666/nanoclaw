@@ -18,14 +18,14 @@ CAP-3 ("fill row X with value Y") must resolve to one of four mechanisms dependi
 
 ## Content extraction & positioning — hybrid approach (researched, best practice)
 
-Applies to both CAP-1 (extracting content into memory) and CAP-3 (locating where to overlay a value on a PDF). No new OCR-engine dependency (e.g. Tesseract) is added.
+Applies to both CAP-1 (extracting content into memory) and CAP-3 (locating where to overlay a value on a PDF). **Amended by spec-2-1 (2026-08-24):** CAP-1's scanned-PDF *extraction* now runs `tesseract.js` (English and Hebrew) server-side on the page-1 render, in the same `save_document` call, instead of relying solely on the agent's own multimodal reading — see spec-2-1's Boundaries and Spec Change Log for the exact scope (page 1 only, PDFs only) and the empty/near-empty-OCR fallback that still uses agent vision-reading. CAP-3's *positioning* (below) is unrelated and unchanged — no OCR engine is used for locating an overlay target; that remains the agent's own visual estimate.
 
-| Source has a text layer? | Extraction | Positioning (for overlay) |
+| Source has a text layer? | Extraction (CAP-1) | Positioning (CAP-3, for overlay) |
 |---|---|---|
 | Yes (Word always; PDF when present) | Direct structured text extraction | Use a PDF text-extraction API that returns per-text-item coordinates/bounding boxes (PDF points, y-axis bottom-up) to locate the target line precisely. |
-| No (scanned/image-only PDF) | Render the page to an image; the agent itself (already multimodal) reads the content directly from the image — no separate OCR engine | The agent visually estimates the target region from the same rendered image; the estimate is converted into PDF point-coordinate space using the known page dimensions and the image's render scale factor. |
+| No (scanned/image-only PDF) | Render page 1 to an image; `tesseract.js` OCRs it server-side (English + Hebrew). If OCR comes back empty/near-empty, falls back to the agent itself (already multimodal) reading the content directly from the image. | The agent visually estimates the target region from the same rendered image; the estimate is converted into PDF point-coordinate space using the known page dimensions and the image's render scale factor. Unchanged by spec-2-1 — never OCR-assisted. |
 
-Rationale: 2026 industry practice for scanned-document extraction increasingly favors vision-capable LLMs over traditional OCR engines for exactly this reason — the agent understands document context, not just pixel-level character shapes, and this container already has a multimodal agent and existing page/image-rendering usage (`agent-browser`) to build on, so no new engine-class dependency is needed purely for this.
+Rationale (extraction, as amended): a page-1 OCR pass gives a single deterministic call and real, reproducible text instead of a transcription that varies by model turn and disappears once the render is deleted — see spec-2-1's Design Notes for the full tradeoff against the original "no new OCR engine" decision. Rationale (positioning, unchanged): 2026 industry practice for scanned-document *positioning* still favors a vision-capable LLM's own contextual estimate over trying to derive coordinates from OCR output — the agent understands document context, not just pixel-level character shapes, and this container already has a multimodal agent and existing page/image-rendering usage (`agent-browser`) to build on, so no OCR-derived-coordinate mechanism was added for this.
 
 ## Disambiguation (applies to CAP-2 and CAP-3)
 

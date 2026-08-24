@@ -1,52 +1,39 @@
-# Epic 2 Context: Calendar Hardening & Extensions
+# Epic 2 Context: Document Memory Hardening & Extensions
 
 <!-- Compiled from planning artifacts. Edit freely. Regenerate with compile-epic-context if planning docs change. -->
 
 ## Goal
 
-Epic 1 shipped the core Google Calendar loop (create, read, update, delete on Uriel's or Devorah's calendar from chat). Epic 2 hardens and extends that loop without touching its core mechanism: it guards event creation against silent duplicates, adds recurring-event support, opens the calendar set beyond the original two people via a config-driven registry, and auto-resolves guests the agent already half-knows from household memory. None of this blocks anything already shipped in Epic 1 — all four stories extend the existing `calendar.ts` tools in place.
+Epic 1 shipped the core document-memory + fill-in-editing feature (save, recall, and fill Word/PDF documents, plus signature stamping). Epic 2 is a **backlog of story stubs** — not yet spec'd or estimated — covering four capabilities that were deliberately deferred during Epic 1 rather than built then: real OCR for scanned PDFs (today's fallback is page-1-only agent-vision reading, not searchable OCR text), filling the same value across multiple saved documents in one request, recovering a prior version after a fill/edit, and refreshing what's remembered about a document after it's been edited (today a fill never touches the stored raw copy or extracted text — recall always reflects the as-saved original). None of these block anything already shipped in Epic 1. Before implementing any one of these stories, run `bmad-spec` (or hand it to `bmad-build` for a lighter touch) in a fresh session to elaborate its stub-level acceptance criteria into a real spec.
 
 ## Stories
 
-- Story 2.1: Idempotency guard on event creation
-- Story 2.2: Recurring events
-- Story 2.3: Calendars beyond Uriel's and Devorah's
-- Story 2.4: Automatic guest-list validation against household memory
+- Story 2.1: OCR Fallback for Scanned PDFs
+- Story 2.2: Multi-File / Batch Fill Operations
+- Story 2.3: Version History / Undo for Edited Documents
+- Story 2.4: Auto-Refresh Stored Raw/Extracted Text After an Edit
 
 ## Requirements & Constraints
 
-- A duplicate or retried `create_calendar_event` call must never silently double-book — it must decline, dedupe, or ask.
-- A user must be able to create a recurring event ("every Thursday at 3pm") through the same tool used for single events.
-- A calendar beyond the original two named people must be reachable through the same four tools, addable via configuration, never a code change.
-- A guest named by first name only (not a full email) must be checked against household memory automatically, not only when the agent happens to already have it in context.
-- Google Calendar only; credentials never pass through chat, code, or env vars — routed exclusively through the OneCLI Gateway proxy.
-- The target calendar is always an explicit selection, never inferred when ambiguous — this holds for any calendar in the registry, hardcoded or config-added.
-- All calendar writes are triggered by an explicit same-turn user chat instruction — no autonomous/background writes.
-- Non-goals: free-busy conflict detection or scheduling suggestions; editing or cancelling a single occurrence of a recurring series independently of the whole series (creation-only for now — flagged as not yet structurally enforced, see Cross-Story Dependencies).
-- The idempotency check is scoped per-calendar, not global — a near-identical event on two different calendars is not treated as a duplicate.
-- Known, accepted limit: the duplicate-creation guard is best-effort, not atomic — two genuinely concurrent create calls can both pass the pre-check before either write lands. No server-side idempotency-key primitive exists to close this fully; not being built now given this system's household scale.
+- **Story 2.1 (OCR):** A scanned/image-only PDF with no text layer must yield real, recallable OCR'd text — not just a rendered-page image the agent reads once in its own multimodal turn (today's behavior, and only for page 1; multi-page scanned support was also explicitly deferred out of Epic 1). This is in tension with Epic 1's own "no new OCR-engine dependency" decision, which was scoped as a deliberate no-Tesseract-class-engine constraint for that build — revisiting it for this story is an explicit, informed decision to make, not an oversight to silently reverse.
+- **Story 2.2 (batch fill):** Today's `fill_document_field` (and the whole spec this feature was built from) is explicitly scoped to one named document at a time — batch/multi-file fill is a real scope expansion, not a bug fix. A batch operation must report per-file success/failure clearly; a partial batch must never fail silently.
+- **Story 2.3 (version history/undo):** No version history was ever in scope for Epic 1's spec. Note Epic 1's own non-goals explicitly excluded "version-conflict resolution across overlapping edit requests" — this story should treat that boundary as still open, not assume it's now included.
+- **Story 2.4 (auto-refresh after edit):** Currently, a fill/edit writes only a new output file for delivery — the stored canonical raw file and stored extracted text under `memory/documents/` are never modified, so a later recall (`list_documents`/content Q&A) still describes the pre-edit original. This was a deliberate default ("neither" — a re-save is treated as a separate, unspecified action), not an oversight; this story is where that default gets revisited.
+- All four stories inherit Epic 1's ambiguity-handling rule: when the target saved document is ambiguous, present a numbered candidate list and wait for the user's pick — never guess.
 
 ## Technical Decisions
 
-- All four calendar tools (`create`/`list`/`update`/`delete_calendar_event`) live in `container/agent-runner/src/mcp-tools/calendar.ts`, registered via the existing `McpToolDefinition` + `registerTools()` convention. No new HTTP client dependency — direct `fetch()` against Google Calendar REST API v3 through the container's `HTTPS_PROXY`.
-- **Duplicate guard (idempotency):** before the `POST`, run a `GET` bracketed by `timeMin`/`timeMax` around the requested start. A hit requires same `calendarId` + same timezone-normalized instant (never raw-string time comparison — two equal local numerals with different `timeZone` values are different instants) + case-insensitive-trimmed title match + candidate has no `recurrence` field set + candidate `created` within the last 10 minutes. On a hit, call `askUserQuestion` directly, in-process — "create anyway" vs. "skip, likely already exists" — never silently decide. This mirrors `delete_calendar_event`'s existing in-process-confirmation pattern (a `confirm`-style argument was already tried and rejected there after a live incident showed the agent could self-authorize past it).
-- **Recurrence:** extend `create_calendar_event` with an optional `recurrence` argument — a single RFC5545 `RRULE` string. The handler wraps it as `recurrence: [recurrenceArg]` in the request body (Google's `Event.recurrence` field is an array of strings, not a bare string). No new tool, no new NL-to-RRULE dependency — the agent constructs the RRULE itself. Omitting the argument leaves single-occurrence behavior unchanged.
-- **Calendar registry:** the `calendar` argument moves from a closed `uriel`/`devorah` enum to a DB-backed registry (`name → {calendarId, ownerEmail}`), following the same pattern as `src/db/container-configs.ts` (a DB row, not a `.ts` constants file — a source-file change would need a rebuild + service restart per this project's rebuild rules, which a DB write avoids). A newly added calendar's owner grants access the same way Devorah already does — native Google Calendar sharing with the one connected account, no second OAuth grant. Every existing hardcoded `uriel`/`devorah` reference (in `calendar.ts`, `container/skills/calendar/SKILL.md`, any validation/enum code) needs sweeping to the open registry.
-- **Guest auto-validation:** before constructing the `attendees` array, every guest token that isn't already a valid email string is looked up automatically against `groups/household/memory/household/people.md` — not only when the agent already has it in context.
-- **Ordering rule (load-bearing across stories):** when a single `create_calendar_event` call needs both a guest-resolution question (Story 2.4) and a duplicate-check question (Story 2.1), guest resolution always resolves first, the duplicate check runs second — the two questions are never asked simultaneously.
-- Every event `dateTime` continues to carry an explicit `timeZone` resolved via the existing `resolveGroupTimezone` convention — this is what makes the idempotency guard's instant-normalized comparison correct, not a second timezone mechanism.
-- Sender-to-calendar resolution ("my calendar") continues to read from `groups/household/memory/household/people.md`, never a hardcoded name — the same memory file Story 2.4's guest lookup also reads.
-
-## UX & Interaction Patterns
-
-- Ambiguous matches (multiple candidate events, multiple candidate guests) are always presented as a numbered list with the tool waiting for a pick — never a guess, matching the precedent already established for event disambiguation.
-- Any blocking confirmation a tool needs (duplicate-creation hit, unmatched/ambiguous guest) is issued via `askUserQuestion` called directly inside the tool handler, in-process — never gated behind an agent-settable boolean argument the agent could self-authorize past. This lesson came from a live incident on the delete-confirmation flow and applies to every new blocking check added in this epic.
-- An unmatched guest name (no household-memory match at all) is asked for directly and blocks rather than silently proceeding without an email.
+- The whole feature's storage shape (unchanged, and any Epic 2 story should build on it rather than restructure it): raw file at `memory/documents/files/<slug>.<ext>`, one concept file `memory/documents/<slug>.md` (`type: saved-document`, description, source filename, saved date), one summary line appended to `memory/index.md`, plus a `memory/documents/index.md`. All per-agent-group, never cross-group.
+- All three existing MCP tools (`save_document`, `list_documents`, `fill_document_field`) live in `container/agent-runner/src/mcp-tools/documents.ts`; any Epic 2 addition should follow the same `McpToolDefinition`/`registerTools()` convention and reuse the existing shared slug-generation helper rather than reinventing one.
+- Any shared per-group index file (`memory/index.md`, `memory/documents/index.md`) must go through the existing locked read-modify-write pattern — concurrent sessions of the same group can write at the same time.
+- PDF filling only ever draws (AcroForm field set, or overlay-on-top) — parsing/reflowing PDF text in place remains permanently out of scope regardless of what Epic 2 adds.
+- Errors for an unresolvable target use this codebase's existing MCP error shape (`{ content: [...], isError: true }`) — never an approximate or partial write.
+- Delivery of any produced/updated file goes through the existing `send_file` MCP tool / outbox path — no new outbound delivery mechanism.
+- Library stack already in the base image and available to build on: `pdf-lib`, `pdfjs-dist`, `@hyzyla/pdfium` (PDF), `jszip` (docx), `word-extractor` + `libreoffice-writer` (`.doc`), `pngjs` (signature assets). Adding a genuinely new dependency (e.g. an OCR engine for Story 2.1) means another container base-image rebuild + service restart, same cost class as Epic 1 paid.
 
 ## Cross-Story Dependencies
 
-- Story order follows a dependency shape: 2.1 (idempotency) touches the same `create_calendar_event` path every other story in this epic also touches, so it goes first; then 2.2 (recurrence); then 2.3 (registry, which the other stories' calendar-argument resolution depends on); then 2.4 (guest validation — lowest-risk, most independent, but must respect the ordering rule against 2.1).
-- Story 2.1's duplicate-match check must exclude any candidate event with a `recurrence` field set, so Story 2.2's recurring events don't cause false-positive duplicate matches against later occurrences.
-- Story 2.3's registry change is a superseding rule for Story 2.1 and 2.2's calendar-argument handling — any calendar in the registry (not just the original two) must get the same idempotency and recurrence handling with no special-casing.
-- Story 2.4 and Story 2.1 can both need to ask a question on the same `create_calendar_event` call — 2.4's guest question must resolve before 2.1's duplicate question runs (see Technical Decisions).
-- Open, unresolved before Story 2.2 ships: whether `list_calendar_events` exposes individual occurrence `eventId`s for a recurring series (`singleEvents=true` semantics) — if so, `update_calendar_event`/`delete_calendar_event` need an explicit decision on whether to refuse single-occurrence edits, since that's currently a prose-only non-goal, not structurally enforced.
+- All four stories build on Epic 1's shipped `save_document` / `list_documents` / `fill_document_field` tools and storage shape — none are reachable without that foundation, which is already merged and live.
+- Story 2.3 (version history) and Story 2.4 (auto-refresh after edit) both touch the same open question — what happens to stored document state after a fill — and should be scoped with awareness of each other to avoid landing conflicting designs (e.g. auto-refresh overwriting the very "prior version" 2.3 would need to keep).
+- Story 2.2 (batch fill) would call the same per-document fill logic Story 2.4 might change the post-fill behavior of — sequence-sensitive if both are picked up close together.
+- Story 2.1 (OCR) requires its own separate scoping decision (whether to add a real OCR engine dependency at all) before implementation can start; it does not block or depend on the other three.

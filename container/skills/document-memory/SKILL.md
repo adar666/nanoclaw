@@ -24,26 +24,38 @@ it.
    This runs synchronously — you get a real result back in the same turn,
    no waiting, no follow-up message to expect later.
 
-2. **Two possible outcomes:**
-   - **Saved.** The tool copied the file into memory, extracted its text,
-     and recorded it — you're done. Tell the user it's saved and can be
-     asked about later without resending it.
-   - **Scanned PDF or plain image, needs your own reading.** If the PDF has
-     no text layer (a scan/photo of a document, not a real text layer) or
-     the file is a `.jpg`/`.jpeg`/`.png` image, the tool tells you it needs
-     you to read it yourself instead of saving anything yet — no memory
-     entry exists at this point. For a scanned PDF it renders page 1 to a
-     PNG first and gives you that path; for a plain image, the uploaded
-     file itself is already what to look at, no rendering needed. **Read it
-     yourself** with your own Read tool (you're multimodal — this is not a
-     separate OCR step, it's you looking at the image), then call
-     `save_document` again with the *same* `path` argument plus an
-     `extractedText` argument containing what you read (a description, any
-     readable text, numbers, a barcode, etc.). That second call completes
-     the save. **For a scanned PDF, only page 1 is ever rendered/read** —
-     for a multi-page scanned PDF, later pages are not captured; if the
-     document is more than one page, say so rather than implying you saved
-     the whole thing.
+2. **Three possible outcomes:**
+   - **Saved.** The tool copied the file into memory, extracted its text
+     (for a scanned PDF, page 1 was rendered and OCR'd automatically —
+     English and Hebrew — in this same call — you don't need to read
+     anything yourself), and recorded it — you're done. Tell the user it's
+     saved and can be asked about later without resending it. **For a
+     scanned PDF, only page 1 is ever rendered/OCR'd** — for a multi-page
+     scanned PDF, later pages are not captured; if the document is more
+     than one page, say so rather than implying you saved the whole thing.
+   - **Scanned PDF, OCR found little to no readable text.** Rare — a
+     genuinely blank/unreadable page 1, or a page in a language other than
+     English/Hebrew. The tool renders page 1 to a PNG, tries OCR, and when
+     that comes back empty or near-empty tells you so instead of saving
+     anything yet — no memory entry exists at this point. Ask the user how
+     to proceed:
+     either **read the rendered image yourself** with your own Read tool
+     (you're multimodal — this is a fallback for this one case, not the
+     normal path) and call `save_document` again with the *same* `path`
+     argument plus an `extractedText` argument containing what you read, or
+     call `save_document` again with the same `path` and
+     `extractedText: ""` to save it with a placeholder note instead. Either
+     follow-up call completes the save.
+   - **Plain image, needs your own reading.** For a `.jpg`/`.jpeg`/`.png`
+     upload, the tool always tells you it needs you to read it yourself
+     instead of saving anything yet — no memory entry exists at this point.
+     The uploaded file itself is already what to look at, no rendering
+     needed. **Read it yourself** with your own Read tool (you're
+     multimodal — this is not a separate OCR step, it's you looking at the
+     image), then call `save_document` again with the *same* `path`
+     argument plus an `extractedText` argument containing what you read (a
+     description, any readable text, numbers, a barcode, etc.). That second
+     call completes the save.
 
 3. **Unsupported file type.** The tool declines cleanly with an error — no
    partial memory entry is ever created for a type it doesn't handle. Relay
@@ -64,15 +76,17 @@ it.
 - Don't call this for `.xlsx` or plain text — only `.docx`/`.doc`/`.pdf`/
   images (`.jpg`/`.jpeg`/`.png`) are in scope. Decline those plainly
   instead of calling the tool.
-- Don't try to OCR a scanned PDF or an image yourself some other way — the
-  render-and-read (PDF) or direct-read (image) flow above already handles
-  it.
+- Don't try to OCR a scanned PDF or an image yourself some other way — a
+  scanned PDF is OCR'd automatically by the tool itself, and a plain image
+  is read directly by you (no separate OCR step) via the flows above.
 - A saved image cannot be filled/stamped via `fill_document_field` — there's
   no target to fill on a plain photo. That tool is for `.docx`/`.doc`/`.pdf`
   only.
-- Don't claim a document is saved before the tool actually confirms it (the
-  scanned-PDF first call is *not* a save — only the follow-up call with
-  `extractedText` is).
+- Don't claim a document is saved before the tool actually confirms it. A
+  scanned PDF normally saves in its one and only call (OCR ran inline), but
+  when OCR comes back with little to no readable text that call is *not* a save — only the follow-up
+  call (with real `extractedText`, or `extractedText: ""` for the
+  placeholder) is. Same for a plain image: its first call is never a save.
 
 # Filling a value into a saved document
 

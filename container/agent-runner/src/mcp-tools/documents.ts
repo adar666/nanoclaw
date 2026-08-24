@@ -9,11 +9,18 @@
  *
  *   - `.pdf` with a text layer: `pdfjs-dist` extracts the text directly.
  *   - `.pdf` with no text layer (scanned/image-only): `@hyzyla/pdfium`
- *     renders page 1 (page 1 only — later pages are not captured) to a PNG
- *     and the tool asks the *agent's own* multimodal turn to read it —
- *     never a tool-embedded OCR call. The agent reads the image (its own
- *     Read tool) and calls `save_document` again on the same path with an
- *     `extractedText` argument to finish.
+ *     renders page 1 (page 1 only — later pages are not captured) to a PNG,
+ *     and `tesseract.js` OCRs that PNG in-process (English and Hebrew) — a
+ *     single deterministic call, not a round trip through the agent's own
+ *     multimodal turn (spec 2-1, which deliberately reverses this file's
+ *     earlier "never a tool-embedded OCR call" stance — see SPEC.md's
+ *     amended constraint and spec-2-1's Spec Change Log). If OCR comes back
+ *     empty/near-empty (a genuinely blank or unreadable page, or a page in
+ *     neither supported language), the tool halts instead of writing a
+ *     blank concept file: it asks the agent to either read the
+ *     still-present render itself and call back with `extractedText` (the
+ *     old vision-fallback path, now only reached on this one edge case), or
+ *     call back with `extractedText: ""` to accept today's placeholder.
  *   - `.docx`: text is pulled out of `word/document.xml` (body paragraphs
  *     only — headers, footers, footnotes, and text boxes are not read) by
  *     shelling out to the `unzip` CLI (already in the base image for other
@@ -405,8 +412,10 @@ function hasTextLayer(text: string): boolean {
 // WASM, zero runtime dependencies — its README example uses `sharp` to
 // encode PNG, but that's only a devDependency of the example, not a
 // dependency of the package, so a small hand-rolled encoder below avoids
-// pulling it in). The agent's own multimodal turn reads the image; this
-// tool never does OCR itself (AD-4).
+// pulling it in). As of spec-2-1, `tesseract.js` OCRs the render directly
+// (see `ocrPngText` below) instead of asking the agent's own multimodal
+// turn to transcribe it — that vision-read path is now only reached when
+// OCR itself comes back empty/near-empty (spec-2-1's Ask-First case).
 // ---------------------------------------------------------------------------
 
 const CRC_TABLE = (() => {
@@ -510,6 +519,105 @@ function renderFileNameFor(resolvedPath: string, originalFilename: string): stri
 }
 
 // ---------------------------------------------------------------------------
+// OCR (spec-2-1): tesseract.js reads the page-1 render produced above,
+// server-side and deterministically — this is the one deliberate exception
+// to this codebase's otherwise-standing "no dedicated OCR engine" stance
+// (SPEC.md, amended; see spec-2-1's Spec Change Log). English and Hebrew
+// (`createWorker('eng+heb')`, operator decision, step-04) — a scanned page
+// in a language other than those two may still OCR poorly or not at all,
+// which is exactly the case the empty/near-empty Ask-First halt in
+// saveDocumentImpl below is for. A fresh worker per call (init + terminate)
+// matches this file's existing pattern of not holding any resource open
+// across separate MCP tool invocations (@hyzyla/pdfium's
+// library/document lifecycle above does the same).
+//
+// Two Bun-specific behaviors, confirmed live (not documented by
+// tesseract.js itself), drive the options passed below:
+//
+//   - `workerPath`: tesseract.js's Node worker computes its own default
+//     workerPath from `__dirname` inside its `defaultOptions.js`. Under
+//     Bun, `import('tesseract.js')` resolves that module through Bun's
+//     global package cache rather than this project's on-disk
+//     node_modules, so the resulting `__dirname` has no project
+//     node_modules among its ancestors — the spawned worker thread's own
+//     `require('regenerator-runtime/runtime')` then fails with "Cannot
+//     find module". Passing `workerPath` explicitly, anchored at *this*
+//     file's own real location (always two directories above
+//     node_modules here, in dev and in the mounted-in-production layout
+//     alike), points the worker at a copy that does have this project's
+//     node_modules as an ancestor, resolving correctly. (tesseract.js's own
+//     package.json declares `"main": "src/index.js"` — `src/` genuinely is
+//     the package's shipped Node runtime layout, not a dev-only path.)
+//   - `cachePath`: without it, tesseract.js writes `<lang>.traineddata`
+//     into `process.cwd()` — which would otherwise land loose inside the
+//     agent's own workspace. Pointing it at a dedicated directory under
+//     `baseDir` keeps it out of the way and lets a second OCR call in the
+//     same group reuse the already-downloaded language data instead of
+//     fetching it again. Unlike `.document-renders` (deleted after every
+//     call, success or halt), `.ocr-cache` is a *reusable* cache and is
+//     never deleted by this tool — `eng.traineddata`/`heb.traineddata`
+//     stay there indefinitely once fetched, by design, not an oversight.
+//
+// `eng.traineddata` and `heb.traineddata` (a few MB each) are fetched from a
+// public CDN (`cdn.jsdelivr.net`) the first time each language is needed for
+// a given cacheDir — a real, new runtime dependency on outbound network
+// access the first time this path is exercised, not present in any of this
+// tool's other extraction paths. Not gated behind a Dockerfile change
+// (matches the spec's no-Dockerfile-change constraint, which is about the
+// *code* dependency, not this data fetch), but worth knowing if OCR ever
+// fails specifically on a fresh cacheDir with no network reachable.
+//
+// Bounds both worker init (which includes that first-time language-data
+// fetch) and the recognize() call itself in one combined budget — a stuck
+// fetch or a stalled OCR pass must not block save_document indefinitely.
+const OCR_TIMEOUT_MS = 60_000;
+// ---------------------------------------------------------------------------
+
+async function ocrPngText(pngPath: string, ocrOpts: { cacheDir: string }): Promise<string> {
+  const work = (async () => {
+    const tesseractModule = await import('tesseract.js');
+    const createWorker = tesseractModule.createWorker ?? tesseractModule.default?.createWorker;
+    if (typeof createWorker !== 'function') {
+      throw new Error('tesseract.js module shape unexpected — no createWorker export found');
+    }
+
+    const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+    const workerPath = path.join(moduleDir, '..', '..', 'node_modules', 'tesseract.js', 'src', 'worker-script', 'node', 'index.js');
+
+    fs.mkdirSync(ocrOpts.cacheDir, { recursive: true });
+
+    const worker = await createWorker('eng+heb', undefined, { workerPath, cachePath: ocrOpts.cacheDir });
+    try {
+      const { data } = await worker.recognize(pngPath);
+      return (data.text ?? '').trim();
+    } finally {
+      // A terminate() failure must never mask/replace the real
+      // result/error already being returned/thrown above — best effort
+      // only, logged not propagated.
+      try {
+        await worker.terminate();
+      } catch (e) {
+        log(`OCR worker terminate() failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+  })();
+
+  return withTimeout(work, OCR_TIMEOUT_MS, 'OCR (worker init + recognition)');
+}
+
+// Anything shorter than this (after stripping all whitespace) is treated as
+// "no readable text" for the Ask-First halt below — not just a literally
+// empty string. A blank/noisy scanned page can OCR to a stray single
+// character rather than a true empty string; a small floor catches that
+// without needing tesseract's own per-word confidence score (which would
+// add real plumbing for a case this floor already resolves).
+const OCR_NEAR_EMPTY_THRESHOLD = 3;
+
+function isNearEmptyOcrText(text: string): boolean {
+  return text.replace(/\s+/g, '').length < OCR_NEAR_EMPTY_THRESHOLD;
+}
+
+// ---------------------------------------------------------------------------
 // save_document
 // ---------------------------------------------------------------------------
 
@@ -570,32 +678,73 @@ export async function saveDocumentImpl(
         const renderPath = path.join(renderDir, renderFileNameFor(resolvedPath, originalFilename));
 
         if (extractedText === undefined) {
+          // First call for this path (or a retry after an earlier halt below
+          // — renderFileNameFor is deterministic, so this re-renders the
+          // same file in place rather than accumulating a new PNG per
+          // retry). Render page 1, then OCR it directly: this collapses
+          // what used to be a two-call agent-vision round trip into a
+          // single deterministic call for the common case (spec-2-1).
           let dims: { width: number; height: number };
           try {
             dims = await renderFirstPageToPng(resolvedPath, renderPath);
           } catch (e) {
             return err(`Could not render scanned PDF page: ${e instanceof Error ? e.message : String(e)}`);
           }
-          return ok(
-            'This PDF has no extractable text layer (scanned/image-only). ' +
-              `I rendered page 1 (page 1 only — later pages are not captured), ${dims.width}x${dims.height}px, ` +
-              `to ${renderPath}. Read that image yourself, then call save_document again with the same path ` +
-              `("${filePath}") and an "extractedText" argument containing what you read, to finish saving this ` +
-              'document to memory.',
-          );
-        }
 
-        bodyText = extractedText;
-        renderPathToCleanup = renderPath;
+          let ocrText: string;
+          try {
+            const ocrCacheDir = path.join(opts.baseDir, '.ocr-cache');
+            ocrText = await ocrPngText(renderPath, { cacheDir: ocrCacheDir });
+          } catch (e) {
+            // Unlike the near-empty halt below, there's no follow-up flow
+            // that needs this render — a genuine OCR engine failure (as
+            // opposed to a successful-but-empty OCR) has nothing for a
+            // vision-fallback follow-up to read differently, so clean up
+            // now rather than leaving it orphaned in .document-renders.
+            try {
+              fs.unlinkSync(renderPath);
+            } catch {
+              // best effort
+            }
+            return err(`Could not OCR scanned PDF page: ${e instanceof Error ? e.message : String(e)}`);
+          }
+
+          if (isNearEmptyOcrText(ocrText)) {
+            // Ask-First (spec-2-1): a genuinely blank/unreadable page, or an
+            // OCR result too short to be real content (a stray character
+            // from noise is not "readable text") — do NOT delete the
+            // render, since the vision-fallback choice below needs it
+            // still on disk to read.
+            return ok(
+              'This PDF has no extractable text layer (scanned/image-only), and OCR on page 1 (page 1 only — ' +
+                `later pages are not captured), ${dims.width}x${dims.height}px, at ${renderPath} found little ` +
+                'to no readable text — the page may be genuinely blank or unreadable. Ask the user how to ' +
+                'proceed: either read that rendered image yourself and call save_document again with the same path ' +
+                `("${filePath}") and an "extractedText" argument containing what you read, or call ` +
+                'save_document again with the same path and extractedText: "" to save it with a placeholder ' +
+                'note instead of blank/guessed text.',
+            );
+          }
+
+          bodyText = ocrText;
+          renderPathToCleanup = renderPath;
+        } else {
+          // Follow-up call after the Ask-First halt above: the agent either
+          // read the still-present render itself (real text) or is
+          // confirming the placeholder (extractedText === ""). Either way,
+          // the render has served its purpose and is cleaned up below.
+          bodyText = extractedText;
+          renderPathToCleanup = renderPath;
+        }
       }
     } else if (IMAGE_EXTENSIONS.has(ext)) {
       // No rendering step — the uploaded file already IS the image to look
-      // at. Same two-call vision-read pattern as a scanned PDF page: first
-      // call (no extractedText) points the agent at the file and asks it to
-      // read it and call back; second call (extractedText given) finishes
-      // the save. resolvedPath stays valid for both calls (it's the
-      // original inbox file, never moved) so there's nothing to render or
-      // clean up.
+      // at. Always a two-call vision-read pattern (unlike a scanned PDF,
+      // which is now single-call in the common case — spec-2-1): first call
+      // (no extractedText) points the agent at the file and asks it to read
+      // it and call back; second call (extractedText given) finishes the
+      // save. resolvedPath stays valid for both calls (it's the original
+      // inbox file, never moved) so there's nothing to render or clean up.
       if (extractedText === undefined) {
         return ok(
           `This is an image (${ext}) — I can't extract its content myself. Read it yourself at "${filePath}", ` +
@@ -2825,9 +2974,11 @@ export const saveDocument: McpToolDefinition = {
     name: 'save_document',
     description:
       "Save a Word (.docx or legacy .doc), PDF, or image (.jpg/.jpeg/.png) file to this agent group's persistent " +
-      'memory: copies the raw file, extracts its text (for an image or scanned PDF, asks you to read it yourself ' +
-      'and call back with extractedText), and records an entry in memory/index.md so it can be recalled later ' +
-      'without resending it. Declines cleanly for any other file type.',
+      "memory: copies the raw file, extracts its text (a scanned/image-only PDF's page 1 is OCR'd automatically " +
+      '(English and Hebrew) in the same call; a plain image asks you to read it yourself and call back with ' +
+      'extractedText — and so does a scanned PDF in the rare case OCR finds little to no readable text), and ' +
+      'records an entry in memory/index.md so it can be recalled later without resending it. Declines cleanly ' +
+      'for any other file type.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -2841,8 +2992,10 @@ export const saveDocument: McpToolDefinition = {
         extractedText: {
           type: 'string',
           description:
-            'Only used on a follow-up call: the text you read yourself from a rendered page image after a prior ' +
-            'save_document call on the same path asked you to read one and call back.',
+            'Only used on a follow-up call: for a plain image, the text you read yourself from it; for a ' +
+            'scanned PDF whose page-1 OCR came back with little to no readable text, either the text you read ' +
+            'yourself from the still-present render, or "" to accept a placeholder note instead — after a prior ' +
+            'save_document call on the same path asked you to read/decide and call back.',
         },
       },
       required: ['path'],
