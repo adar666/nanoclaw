@@ -5,12 +5,11 @@
  *
  * Schema follows `_bmad-output/specs/spec-eval-harness/scenario-format.md`
  * exactly: `judging` is the discriminated union documented there
- * (`deterministic` | `llmJudge`) — `cli.ts` only ever executes the
- * `deterministic` branch (Story 1.6's `judgeDeterministic`); an `llmJudge`
- * scenario is loaded fine (this module doesn't reject it) but produces a
- * distinct, clearly-labeled report entry rather than being silently skipped
- * or run through the wrong judge. `judge/llm.ts` (Epic 2) plugs into that
- * branch later with zero changes needed here.
+ * (`deterministic` | `llmJudge`) — `cli.ts` executes both branches for real
+ * (`deterministic` via Story 1.6's `judgeDeterministic`, `llmJudge` via
+ * Epic 2's `judge/llm.ts`, wired in Story 2.3), with zero changes needed to
+ * this module for either — this module only loads/registers scenarios, it
+ * never judges them.
  *
  * A scenario set is registered as a *factory* (`agentGroupId => ScenarioSet`),
  * not a precomputed constant: `agentGroupId` is only known once

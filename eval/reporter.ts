@@ -16,12 +16,23 @@ import { fileURLToPath } from 'url';
 import type { ScenarioTurnStatus } from './runner.js';
 
 /**
- * `'unsupported'` is this module's own outcome (an `llmJudge` scenario `cli.ts`
- * didn't execute) — distinct from every real turn status. `'judge-error'` is a
- * second synthetic outcome: the turn itself completed, but the scenario's own
- * `check` function threw (review finding — a throwing check is a
- * scenario-authoring bug, `judge/deterministic.ts` never catches it, and
- * `cli.ts` must not let that propagate and abort the whole run).
+ * `'judge-error'` is a synthetic outcome distinct from every real turn
+ * status: the turn itself completed, but judging itself failed — either a
+ * `deterministic` scenario's own `check` function threw (review finding — a
+ * throwing check is a scenario-authoring bug, `judge/deterministic.ts` never
+ * catches it) or an `llmJudge` scenario's `judgeLlm` call threw (its own
+ * documented failure modes — an incomplete judge turn, an unparseable
+ * reply). Either way `cli.ts` must not let that propagate and abort the
+ * whole run.
+ *
+ * `'unsupported'` is a second synthetic outcome, now dead in practice —
+ * `cli.ts` executes both `deterministic` and `llmJudge` scenarios for real
+ * as of Story 2.3, so nothing produces it anymore. Kept in the type (rather
+ * than removed) since this module is domain/status-agnostic by design
+ * (AD-2/AD-5: it serializes whatever `Report` it's given, never validates
+ * specific status strings) — an existing `reporter.test.ts` case still
+ * exercises it directly as a generic "some non-standard status string"
+ * example, unrelated to whether any real producer emits it today.
  */
 export type ReportEntryStatus = ScenarioTurnStatus | 'unsupported' | 'judge-error';
 

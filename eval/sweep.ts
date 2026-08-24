@@ -20,6 +20,7 @@
  */
 import type { OutboundMessage } from '../src/db/session-db.js';
 import { log } from '../src/log.js';
+import { truncateForError } from './error-text.js';
 import { withEvalLock } from './lock.js';
 import { runScenarioTurn } from './runner.js';
 import { EVAL_THREAD_PREFIX } from './session.js';
@@ -54,13 +55,6 @@ const SWEEP_PROMPT = [
  * former should be forgiven.
  */
 const SWEEP_PATTERN = /\bSWEEP:\s*(REMOVED\s+(\d+)|CLEAN)\b/gi;
-
-/** Bounds how much of a pathological/verbose reply lands in a thrown error message — logs/error trackers shouldn't take an unbounded string. */
-const MAX_ERROR_TEXT_CHARS = 500;
-
-function truncateForError(text: string, max = MAX_ERROR_TEXT_CHARS): string {
-  return text.length > max ? `${text.slice(0, max)}… (truncated, ${text.length} chars total)` : text;
-}
 
 /** Every `messages_out` row's `content.text`, joined — the same parse-or-skip-malformed-rows shape `judge/llm.ts` and `guest-resolution.scenarios.ts` both use. */
 function transcriptText(transcript: OutboundMessage[]): string {

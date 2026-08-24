@@ -21,6 +21,7 @@
  * (the `cli.ts` wiring), not this one's.
  */
 import type { OutboundMessage } from '../../src/db/session-db.js';
+import { truncateForError } from '../error-text.js';
 import type { RunOptions } from '../runner.js';
 import { runScenarioTurn } from '../runner.js';
 import { findTrailingMatch } from '../text-matching.js';
@@ -46,13 +47,6 @@ export interface LlmJudgeResult {
  * live for `sweep.ts`'s identical pattern).
  */
 const VERDICT_PATTERN = /VERDICT:\s*(PASS|FAIL)\b/gi;
-
-/** Bounds how much of a pathological/verbose judge reply lands in a thrown error message — logs/error trackers shouldn't take an unbounded string. */
-const MAX_ERROR_TEXT_CHARS = 500;
-
-function truncateForError(text: string, max = MAX_ERROR_TEXT_CHARS): string {
-  return text.length > max ? `${text.slice(0, max)}… (truncated, ${text.length} chars total)` : text;
-}
 
 /**
  * Everything after the LAST case-insensitive "REASONING:" label, to the end
