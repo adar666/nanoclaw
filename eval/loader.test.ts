@@ -57,6 +57,21 @@ describe('loadScenarios', () => {
     expect(scenario!.cleanup).toBeDefined();
   });
 
+  it(
+    'guest-resolution-known-name\'s cleanup confirm() also accepts an honest "nothing to delete" reply, not just a ' +
+      "real deletion (regression — live re-verification found this scenario's own cleanup turn can hit the same " +
+      '"nothing was actually created" case ambiguous-name already handled, and confirm() had no branch for it at all)',
+    () => {
+      const set = loadScenarios('guest-resolution', AG);
+      const scenario = set.scenarios.find((s) => s.id === 'guest-resolution-known-name')!;
+
+      expect(scenario.cleanup!.confirm([outboundMsg('נמחק בהצלחה')])).toBe(true);
+      expect(scenario.cleanup!.confirm([outboundMsg('אין אירוע למחוק, לא נוצר אירוע בשיחה הזו')])).toBe(true);
+      expect(scenario.cleanup!.confirm([outboundMsg('לא נמחק, האירוע עדיין קיים')])).toBe(false);
+      expect(scenario.cleanup!.confirm([outboundMsg('לא ברור לי מה קרה')])).toBe(false);
+    },
+  );
+
   it('guest-resolution-ambiguous-name\'s cleanup confirm() accepts both a real deletion and an honest "nothing to delete" reply — a passing run creates no event at all (regression)', () => {
     const set = loadScenarios('guest-resolution', AG);
     const scenario = set.scenarios.find((s) => s.id === 'guest-resolution-ambiguous-name')!;

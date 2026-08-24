@@ -35,14 +35,23 @@ const CLEANUP_CONFIRMATION_WORD = 'נמחק';
 const NEGATION_WORD = 'לא';
 
 /**
- * `guest-resolution-ambiguous-name`'s cleanup message (below) has to cover a
- * case `guest-resolution-known-name`'s doesn't: a *correct* agent creates no
+ * `guest-resolution-ambiguous-name`'s cleanup message originally covered a
+ * case `guest-resolution-known-name`'s didn't: a *correct* agent creates no
  * event at all for an unresolved name, so a passing run's honest reply
  * ("there was nothing to delete") never contains `CLEANUP_CONFIRMATION_WORD`
  * — a bare deletion-confirmation check would spuriously report a
  * `cleanupError` on every successful run (review finding). This phrase is
- * asked for explicitly in that scenario's cleanup message, same deterministic
- * reasoning as `CLEANUP_CONFIRMATION_WORD` itself.
+ * asked for explicitly in both scenarios' cleanup messages now (deferred-
+ * work.md, 2026-08-24): a live re-verification run found `known-name`'s own
+ * cleanup turn hits the identical "nothing to delete" case too — the agent
+ * correctly declined to falsely confirm a deletion that never happened
+ * ("I never created an event in this conversation... I won't confirm a
+ * deletion that didn't happen") — but `known-name`'s cleanup message never
+ * asked for this phrase and its `confirm()` never checked for it at all,
+ * so a genuinely-honest refusal was misreported as a `cleanupError` on an
+ * otherwise fully-passing run. Same deterministic reasoning as
+ * `CLEANUP_CONFIRMATION_WORD` itself — one required literal phrase per
+ * outcome, not free-form matching in any language.
  */
 const NO_EVENT_TO_DELETE_PHRASE = 'אין אירוע למחוק';
 
@@ -77,10 +86,20 @@ export function guestResolutionScenarioSet(agentGroupId: string): ScenarioSet {
           },
         },
         cleanup: {
-          message: 'מחק את האירוע שיצרת הרגע עבור התרחיש הזה, ואשר בתשובתך במפורש עם המילה "נמחק" שהמחיקה הצליחה.',
+          // Mirrors ambiguous-name's own two-outcome message/confirm() below
+          // (deferred-work.md, 2026-08-24) — this scenario's own event
+          // creation isn't unconditionally guaranteed either (e.g. session
+          // history/state from a prior run), so an honest "nothing to
+          // delete" reply needs its own accepted phrase, same as the
+          // ambiguous-name scenario already had.
+          message:
+            'אם יצרת אירוע עבור התרחיש הזה, מחק אותו ואשר בתשובתך במפורש עם המילה "נמחק" שהמחיקה הצליחה. ' +
+            'אם לא יצרת אירוע כלל, אשר זאת במפורש עם המילים "אין אירוע למחוק".',
           confirm: (transcript) => {
             const text = transcriptText(transcript);
-            return text.includes(CLEANUP_CONFIRMATION_WORD) && !text.includes(NEGATION_WORD);
+            const deleted = text.includes(CLEANUP_CONFIRMATION_WORD) && !text.includes(NEGATION_WORD);
+            const nothingToDelete = text.includes(NO_EVENT_TO_DELETE_PHRASE);
+            return deleted || nothingToDelete;
           },
         },
       },
