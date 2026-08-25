@@ -24,6 +24,7 @@ import { migration022 } from './022-container-config-idle-timeout.js';
 import { migration023 } from './023-voice-always-engage.js';
 import { migration024 } from './024-container-config-calendar-registry.js';
 import { migration025 } from './025-sessions-managed-by.js';
+import { migration026 } from './026-sessions-status-index.js';
 
 export interface Migration {
   version: number;
@@ -64,6 +65,7 @@ export const migrations: Migration[] = [
   migration023,
   migration024,
   migration025,
+  migration026,
 ];
 
 /** Row shape of PRAGMA foreign_key_check. Child rowids are stable across a

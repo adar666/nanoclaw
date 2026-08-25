@@ -21,7 +21,19 @@ import { openInboundDb, writeSessionMessage } from './session-manager.js';
  */
 export function restartAgentGroupContainers(agentGroupId: string, reason: string, wakeMessage?: string): number {
   const sessions = getSessionsByAgentGroup(agentGroupId).filter(
-    (s) => s.status === 'active' && isContainerRunning(s.id),
+    (s) =>
+      s.status === 'active' &&
+      // Eval-harness sessions (migration 025's managed_by='eval' marker) are
+      // spawned and torn down by the separate `eval/` CLI process, never
+      // this host process — `isContainerRunning` below already can't see
+      // them (its activeContainers map is host-process-local), so this
+      // filter is currently a no-op in practice. Kept explicit rather than
+      // relying on that incidental process-boundary fact (deferred-work.md
+      // finding): `ncl groups restart --id <eval-group>` should never be in
+      // the business of touching an eval run regardless of which process
+      // happens to know about its container today.
+      s.managed_by !== 'eval' &&
+      isContainerRunning(s.id),
   );
 
   for (const session of sessions) {

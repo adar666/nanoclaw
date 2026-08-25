@@ -21,7 +21,7 @@
 import { EVAL_CLI_ONESHOT_TOKEN, killAllActiveContainers } from '../src/container-runner.js';
 import { log } from '../src/log.js';
 import { truncateForError } from './error-text.js';
-import { withEvalLock } from './lock.js';
+import { releaseEvalLockIfOwned, withEvalLock } from './lock.js';
 import { runScenarioTurn } from './runner.js';
 import { EVAL_THREAD_PREFIX } from './session.js';
 import { bootstrapDb, ensureEvalScenarioGroup } from './setup.js';
@@ -35,6 +35,14 @@ export interface SweepResult {
 
 /** Distinct from any scenario's own thread id (`${EVAL_THREAD_PREFIX}:<scenario-id>`) and from the judge's (`${EVAL_THREAD_PREFIX}:judge:<scenario-id>`). */
 const SWEEP_THREAD_ID = `${EVAL_THREAD_PREFIX}:sweep`;
+
+/**
+ * A sweep is one turn (`runScenarioTurn`'s own 5-minute default timeout), but
+ * `lock.ts`'s 30s default `staleMs` is still sized for `documents.ts`'s
+ * sub-second critical sections, not a real container turn — generous margin
+ * over the turn timeout, same reasoning as `cli.ts`'s own `RUN_LOCK_STALE_MS`.
+ */
+const SWEEP_LOCK_STALE_MS = 10 * 60 * 1000; // 10 minutes
 
 const SWEEP_PROMPT = [
   'List every event on your calendar, then delete each one you find — leave nothing behind.',
@@ -111,6 +119,10 @@ export async function runSweep(): Promise<SweepResult> {
   const handleInterrupt = (signal: 'SIGINT' | 'SIGTERM'): void => {
     console.error(`eval: received ${signal} — tearing down eval containers before exit`);
     killAllActiveContainers(`eval sweep interrupted (${signal})`, EVAL_CLI_ONESHOT_TOKEN);
+    // See cli.ts's identical comment: process.exit() doesn't drain pending
+    // promises, so withEvalLock's own release logic never runs — release the
+    // lock here explicitly before exiting.
+    releaseEvalLockIfOwned();
     process.exit(signal === 'SIGINT' ? 130 : 143);
   };
   const onSigint = (): void => handleInterrupt('SIGINT');
@@ -148,7 +160,7 @@ export async function runSweep(): Promise<SweepResult> {
       log.info('Eval sweep completed', { removedCount, agentGroupId: group.id });
 
       return { removedCount, agentReplyText };
-    });
+    }, { staleMs: SWEEP_LOCK_STALE_MS });
   } finally {
     // See runCli's identical finally in cli.ts / killAllActiveContainers's
     // own doc comment: an eval container left running past its own
