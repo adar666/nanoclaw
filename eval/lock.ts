@@ -126,7 +126,14 @@ export async function withLock<T>(lockPath: string, fn: () => T | Promise<T>, op
       if (attempt === maxAttempts - 1) {
         throw new Error(`Timed out waiting for lock: ${lockPath}`);
       }
-      await new Promise((resolve) => setTimeout(resolve, retryMs));
+      // Up to 50% random jitter on top of retryMs (deferred-work.md finding)
+      // — the fixed-interval retry this mirrored from documents.ts risks
+      // every waiter retrying in lockstep after a release, all losing the
+      // exclusive-create race but one. Low-value against this module's real
+      // traffic (at most a couple of concurrent eval invocations), but cheap
+      // and harmless to add.
+      const jitteredDelay = retryMs + Math.floor(Math.random() * retryMs * 0.5);
+      await new Promise((resolve) => setTimeout(resolve, jitteredDelay));
     }
   }
 
