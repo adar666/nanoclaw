@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 08-20-2026 10:40
-last_updated: 08-22-2026 09:00
+last_updated: 08-25-2026 00:00
 project: nanoclaw-v2 (eval-harness)
 project_key: NOKEY
 tracking_system: file-system
@@ -43,14 +43,14 @@ development_status:
   1-5-host-sweep-exclusion-for-eval-sessions: done
   1-6-deterministic-judging: done
   1-7-cli-entry-point-cleanup-and-report: done
-  epic-1-retrospective: optional
+  epic-1-retrospective: done
 
   epic-2: done
   2-1-judge-s-own-isolated-agent-group: done
   2-2-llm-judge-verdict-with-reasoning: done
   2-3-ambiguous-name-scenario-and-full-report: done
-  epic-2-retrospective: optional
+  epic-2-retrospective: done
 
   epic-3: done
   3-1-standalone-stale-event-sweep: done
-  epic-3-retrospective: optional
+  epic-3-retrospective: done
