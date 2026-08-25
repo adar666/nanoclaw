@@ -35,22 +35,22 @@ project_key: NOKEY
 tracking_system: file-system
 story_location: _bmad-output/implementation-artifacts
 development_status:
-  epic-1: in-progress
-  1-1-scaffold-the-isolated-eval-agent-group-and-safety-checks: review
-  1-2-calendar-isolation-and-household-people-md-mount-for-the-eva: review
-  1-3-run-exclusivity-lock: review
-  1-4-spawn-the-real-container-and-capture-the-outbound-transcript: review
-  1-5-host-sweep-exclusion-for-eval-sessions: review
-  1-6-deterministic-judging: review
-  1-7-cli-entry-point-cleanup-and-report: review
+  epic-1: done
+  1-1-scaffold-the-isolated-eval-agent-group-and-safety-checks: done
+  1-2-calendar-isolation-and-household-people-md-mount-for-the-eva: done
+  1-3-run-exclusivity-lock: done
+  1-4-spawn-the-real-container-and-capture-the-outbound-transcript: done
+  1-5-host-sweep-exclusion-for-eval-sessions: done
+  1-6-deterministic-judging: done
+  1-7-cli-entry-point-cleanup-and-report: done
   epic-1-retrospective: optional
 
-  epic-2: in-progress
-  2-1-judge-s-own-isolated-agent-group: review
-  2-2-llm-judge-verdict-with-reasoning: review
-  2-3-ambiguous-name-scenario-and-full-report: review
+  epic-2: done
+  2-1-judge-s-own-isolated-agent-group: done
+  2-2-llm-judge-verdict-with-reasoning: done
+  2-3-ambiguous-name-scenario-and-full-report: done
   epic-2-retrospective: optional
 
-  epic-3: in-progress
-  3-1-standalone-stale-event-sweep: review
+  epic-3: done
+  3-1-standalone-stale-event-sweep: done
   epic-3-retrospective: optional

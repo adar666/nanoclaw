@@ -11,6 +11,7 @@
  * exactly what a real container would have done in response.
  */
 import fs from 'fs';
+import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const TEST_ROOT = '/tmp/nanoclaw-eval-runner-test';
@@ -83,10 +84,14 @@ beforeEach(() => {
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
   fs.mkdirSync(TEST_ROOT, { recursive: true });
   runMigrations(initTestDb());
+  // folder must be exactly "eval" — assertIsEvalGroup (safety.ts) verifies
+  // agentGroupId resolves to one of the two provisioned eval groups
+  // (folder "eval" or "eval-judge"), not an arbitrary agent group, before
+  // runScenarioTurn does anything else.
   createAgentGroup({
     id: AG,
     name: 'Eval Runner Test',
-    folder: 'eval-runner-test',
+    folder: 'eval',
     agent_provider: null,
     created_at: new Date().toISOString(),
   });
@@ -233,5 +238,45 @@ describe('runScenarioTurn', () => {
     // finding — the original order created the session first) — no session
     // should exist for this agent group at all.
     expect(getSessionsByAgentGroup(AG)).toEqual([]);
+  });
+
+  it('throws before creating a session, writing anything, or waking a container when the agent group is not one of the two provisioned eval groups, even with zero destinations', async () => {
+    const NOT_EVAL_AG = 'ag-eval-runner-test-not-eval';
+    createAgentGroup({
+      id: NOT_EVAL_AG,
+      name: 'Some Production Group',
+      folder: 'some-production-group',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+
+    const threadId = `${EVAL_THREAD_PREFIX}:turn-blocked-by-group-identity`;
+    await expect(
+      runScenarioTurn(NOT_EVAL_AG, threadId, 'should never send', { timeoutMs: 2_000 }),
+    ).rejects.toThrow(/not one of the two provisioned eval groups/);
+
+    expect(wakeContainer).not.toHaveBeenCalled();
+    expect(getSessionsByAgentGroup(NOT_EVAL_AG)).toEqual([]);
+  });
+});
+
+// AD-4's TOCTOU close (deferred-work.md, 2026-08-25): a real behavioral test
+// would need to inject a destination row into the narrow synchronous window
+// between the top-of-function check and the pre-spawn re-check — both
+// resolveEvalSession and writeSessionMessage run in that window, but neither
+// is mocked here (both run for real, matching this file's own convention),
+// so there's no seam to hook a side effect into mid-call without mocking
+// session-manager.js's live ESM bindings, which this file's existing tests
+// deliberately avoid. Guarded structurally instead, the same convention
+// container-runner.test.ts's own "ordering invariant" tests already use for
+// exactly this shape of thing.
+describe('spawn-path re-check (structural — TOCTOU close, AD-4)', () => {
+  it('re-checks assertIsEvalGroup + assertNoDestinations immediately before wakeContainer, not only once at the top of the function', () => {
+    const src = fs.readFileSync(path.join(process.cwd(), 'eval', 'runner.ts'), 'utf-8');
+    const wakeCall = src.indexOf('await wakeContainer(session)');
+    expect(wakeCall).toBeGreaterThan(-1);
+    const before = src.slice(0, wakeCall);
+    expect(before.match(/assertIsEvalGroup\(agentGroupId\)/g)).toHaveLength(2);
+    expect(before.match(/assertNoDestinations\(agentGroupId\)/g)).toHaveLength(2);
   });
 });

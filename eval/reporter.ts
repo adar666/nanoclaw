@@ -59,6 +59,16 @@ export interface Report {
   startedAt: string;
   finishedAt: string;
   entries: ScenarioReportEntry[];
+  /**
+   * Set only when `cli.ts`'s scenario loop was cut short by a structural
+   * (AD-4) throw out of `runOneScenario`/`runScenarioTurn` itself — a spawn
+   * failure or malformed opts, not a per-scenario verdict. `entries` reflects
+   * only the scenarios that finished before the abort; any scenario after it
+   * in the set was never attempted. Absent (never `false`) on a normal run.
+   */
+  aborted?: boolean;
+  /** The structural failure's message. Set only alongside `aborted: true`. */
+  abortError?: string;
 }
 
 export const REPORTS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'reports');

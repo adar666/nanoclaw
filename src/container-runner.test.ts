@@ -1,14 +1,23 @@
 import fs from 'fs';
 import path from 'path';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  clearActiveContainersForTest,
+  EVAL_CLI_ONESHOT_TOKEN,
   getActiveContainerCount,
   hardeningArgs,
   isRetryableMountRace,
   killAllActiveContainers,
+  registerActiveContainerForTest,
   resolveProviderName,
 } from './container-runner.js';
+import { stopContainer } from './container-runtime.js';
+
+vi.mock('./container-runtime.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./container-runtime.js')>();
+  return { ...actual, stopContainer: vi.fn() };
+});
 
 describe('resolveProviderName', () => {
   it('prefers session over container config', () => {
@@ -180,20 +189,76 @@ describe('hardeningArgs', () => {
 });
 
 describe('killAllActiveContainers', () => {
-  // Every genuinely-populated case (a real spawnContainer call, which sets
-  // activeContainers) needs a real `spawn()`/Docker call this file's own
-  // existing tests don't mock — out of scope here, matching this file's
-  // established convention of only testing this module's pure/structural
-  // functions directly. What's cheaply and safely testable without that:
-  // the no-op case, which is also the ONLY case this module's own real
-  // callers (eval/cli.ts, eval/sweep.ts) exercise in their own mocked unit
-  // tests — see cli.test.ts's/sweep.test.ts's own coverage of "is called
-  // exactly once" for the call-site contract; this only proves the function
-  // itself doesn't throw or misbehave against an empty map, which is this
-  // test file's own process-global state in every other test here too.
+  afterEach(() => {
+    clearActiveContainersForTest();
+    vi.mocked(stopContainer).mockReset();
+  });
+
   it('does nothing and does not throw when no container is currently tracked', () => {
     expect(getActiveContainerCount()).toBe(0);
-    expect(() => killAllActiveContainers('test')).not.toThrow();
+    expect(() => killAllActiveContainers('test', EVAL_CLI_ONESHOT_TOKEN)).not.toThrow();
     expect(getActiveContainerCount()).toBe(0);
+  });
+
+  it('rejects a caller that does not pass the exact structural token, even with real containers tracked', () => {
+    registerActiveContainerForTest('sess-guarded', {
+      process: { kill: vi.fn(), once: vi.fn() } as never,
+      containerName: 'container-guarded',
+    });
+
+    // @ts-expect-error — deliberately calling with a wrong/missing token to prove the guard rejects it at runtime, not just at the type level.
+    expect(() => killAllActiveContainers('test', 'not-the-real-token')).toThrow(/callerToken must be exactly/);
+    expect(stopContainer).not.toHaveBeenCalled();
+  });
+
+  // Real multi-container kill-loop coverage (deferred-work.md, 2026-08-25):
+  // the prior version of this test file only proved the function doesn't
+  // throw against an EMPTY activeContainers map — the actual kill loop over
+  // 2+ tracked containers was untested. registerActiveContainerForTest is a
+  // test-only hook (container-runner.ts) that populates activeContainers
+  // without a real spawn/Docker call, so this doesn't need a live runtime.
+  it('kills every tracked container, not just the first', () => {
+    const killA = vi.fn();
+    const killB = vi.fn();
+    registerActiveContainerForTest('sess-a', { process: { kill: killA, once: vi.fn() } as never, containerName: 'container-a' });
+    registerActiveContainerForTest('sess-b', { process: { kill: killB, once: vi.fn() } as never, containerName: 'container-b' });
+    expect(getActiveContainerCount()).toBe(2);
+
+    killAllActiveContainers('multi-kill test', EVAL_CLI_ONESHOT_TOKEN);
+
+    expect(stopContainer).toHaveBeenCalledWith('container-a');
+    expect(stopContainer).toHaveBeenCalledWith('container-b');
+    expect(stopContainer).toHaveBeenCalledTimes(2);
+  });
+
+  it("one container's kill failure does not stop the loop from attempting the rest", () => {
+    const killFail = vi.fn(() => {
+      throw new Error('SIGKILL also failed for this one');
+    });
+    const killOk = vi.fn();
+    vi.mocked(stopContainer).mockImplementation((name: string) => {
+      if (name === 'container-fail') throw new Error('docker stop failed');
+    });
+    // Registration order matters: the failing entry goes first, so a real
+    // regression (an unguarded loop) would abort before ever reaching the
+    // second, healthy entry.
+    registerActiveContainerForTest('sess-fail', {
+      process: { kill: killFail, once: vi.fn() } as never,
+      containerName: 'container-fail',
+    });
+    registerActiveContainerForTest('sess-ok', {
+      process: { kill: killOk, once: vi.fn() } as never,
+      containerName: 'container-ok',
+    });
+
+    expect(() => killAllActiveContainers('resilience test', EVAL_CLI_ONESHOT_TOKEN)).not.toThrow();
+
+    // container-fail: stopContainer threw, so killContainer's own fallback
+    // tried entry.process.kill('SIGKILL') — which itself threw too, proving
+    // even a total failure on one entry doesn't propagate out of the loop.
+    expect(killFail).toHaveBeenCalledWith('SIGKILL');
+    // container-ok: still reached and killed normally.
+    expect(stopContainer).toHaveBeenCalledWith('container-ok');
+    expect(killOk).not.toHaveBeenCalled(); // stopContainer succeeded for it — no fallback needed
   });
 });

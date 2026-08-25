@@ -6,6 +6,8 @@
  * rationale; this file goes one layer further and mocks `runScenarioTurn`
  * itself, since `judgeLlm` treats it as an opaque primitive).
  */
+import fs from 'fs';
+import path from 'path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../runner.js', () => ({
@@ -287,6 +289,31 @@ describe('judgeLlm', () => {
     expect(passedOpts).toBeUndefined();
   });
 
+  it('bounds the transcript embedded in the judge prompt for a pathologically large input transcript, rather than embedding it unbounded (deferred-work.md, 2026-08-25)', async () => {
+    vi.mocked(runScenarioTurn).mockResolvedValue(
+      turnResult('completed', [outboundRow('r1', 'VERDICT: PASS\nREASONING: ok.')]),
+    );
+    const hugeTranscript: OutboundMessage[] = [outboundRow('input-1', 'y'.repeat(50_000))];
+
+    await judgeLlm(JUDGE_AGENT_GROUP, 'system:eval:judge-22', hugeTranscript, RUBRIC);
+
+    const [, , message] = vi.mocked(runScenarioTurn).mock.calls[0];
+    expect(message.length).toBeLessThan(50_000);
+    expect(message).toContain('truncated');
+  });
+
+  it('does not truncate a normal-length input transcript at all', async () => {
+    vi.mocked(runScenarioTurn).mockResolvedValue(
+      turnResult('completed', [outboundRow('r1', 'VERDICT: PASS\nREASONING: ok.')]),
+    );
+
+    await judgeLlm(JUDGE_AGENT_GROUP, 'system:eval:judge-23', TRANSCRIPT, RUBRIC);
+
+    const [, , message] = vi.mocked(runScenarioTurn).mock.calls[0];
+    expect(message).toContain('What is the guest email?');
+    expect(message).not.toContain('truncated');
+  });
+
   it('returns { verdict, reasoning } — never a bare boolean', async () => {
     vi.mocked(runScenarioTurn).mockResolvedValue(
       turnResult('completed', [outboundRow('r1', 'VERDICT: FAIL\nREASONING: guessed instead of asking.')]),
@@ -298,5 +325,20 @@ describe('judgeLlm', () => {
     expect(result.verdict === 'pass' || result.verdict === 'fail').toBe(true);
     expect(typeof result.reasoning).toBe('string');
     expect(result.reasoning.length).toBeGreaterThan(0);
+  });
+});
+
+// findTrailingMatch's own sentence-boundary guard already rejects any match
+// a leading \b would additionally reject (a word char gluing directly onto
+// "VERDICT:" can never be the start of text nor immediately follow
+// sentence-ending punctuation + whitespace, so it always already fails
+// SENTENCE_START_BEFORE) — meaning there's no behavioral difference to
+// observe through judgeLlm's own pipeline. Guarded structurally instead,
+// matching this codebase's existing convention for exactly this shape of
+// thing (see container-runner.test.ts's own "ordering invariant" tests).
+describe('VERDICT_PATTERN word-boundary consistency (structural)', () => {
+  it('anchors with \\b before VERDICT:, matching the sibling SWEEP_PATTERN in sweep.ts (deferred-work.md, 2026-08-25)', () => {
+    const src = fs.readFileSync(path.join(process.cwd(), 'eval', 'judge', 'llm.ts'), 'utf-8');
+    expect(src).toMatch(/const VERDICT_PATTERN = \/\\bVERDICT:/);
   });
 });

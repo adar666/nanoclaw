@@ -44,6 +44,11 @@ vi.mock('./runner.js', () => ({
 
 vi.mock('../src/container-runner.js', () => ({
   killAllActiveContainers: vi.fn(),
+  // Matches container-runner.js's own real literal — cli.ts imports this
+  // constant to pass as killAllActiveContainers's required callerToken, so
+  // the mock must export it too or the real code sees `undefined` in its
+  // place.
+  EVAL_CLI_ONESHOT_TOKEN: 'eval-cli-oneshot',
 }));
 
 vi.mock('./judge/deterministic.js', () => ({
@@ -348,18 +353,46 @@ describe('runCli', () => {
       writtenReportDirs.push(path.join(REPORTS_DIR, report.runId));
 
       expect(mockedKillAllActiveContainers).toHaveBeenCalledTimes(1);
-      expect(mockedKillAllActiveContainers).toHaveBeenCalledWith(expect.any(String));
+      expect(mockedKillAllActiveContainers).toHaveBeenCalledWith(expect.any(String), 'eval-cli-oneshot');
     },
   );
 
-  it('still tears down every spawned container, and still propagates the error, when a scenario turn itself throws (a genuine AD-4 structural failure, not a per-scenario outcome)', async () => {
+  it('still tears down every spawned container, still propagates the error, and writes a partial report (aborted: true) before rethrowing rather than leaving zero diagnostic trail, when a scenario turn itself throws (a genuine AD-4 structural failure, not a per-scenario outcome)', async () => {
     const boom = new Error('runScenarioTurn: wakeContainer failed to spawn a container');
     mockedRunScenarioTurn.mockReset();
     mockedRunScenarioTurn.mockRejectedValueOnce(boom);
+    const before = fs.existsSync(REPORTS_DIR) ? fs.readdirSync(REPORTS_DIR) : [];
 
     await expect(runCli(['run', 'guest-resolution'])).rejects.toBe(boom);
 
     expect(mockedKillAllActiveContainers).toHaveBeenCalledTimes(1);
+
+    const after = fs.existsSync(REPORTS_DIR) ? fs.readdirSync(REPORTS_DIR) : [];
+    const newDirs = after.filter((d) => !before.includes(d));
+    expect(newDirs).toHaveLength(1);
+    writtenReportDirs.push(path.join(REPORTS_DIR, newDirs[0]));
+
+    const persisted = JSON.parse(fs.readFileSync(path.join(REPORTS_DIR, newDirs[0], 'report.json'), 'utf-8'));
+    expect(persisted.scenarioSetName).toBe('guest-resolution');
+    expect(persisted.aborted).toBe(true);
+    expect(persisted.abortError).toBe(boom.message);
+    expect(persisted.entries).toEqual([]); // the throw happened on the very first scenario, before any entry was pushed
+  });
+
+  it('reuses the exact same threadId for the cleanup turn as the main turn — a regression here would silently run cleanup in a fresh, context-free session', async () => {
+    queueTurns(
+      { status: 'completed', transcript: [outboundMsg('נוסף כאורח: adardevora@gmail.com')], sessionId: 's1' },
+      COMPLETED_CLEANUP,
+    );
+    mockedJudgeDeterministic.mockReturnValue({ passed: true, evidence: 'adardevora@gmail.com' });
+
+    const report = await runCli(['run', 'guest-resolution']);
+    writtenReportDirs.push(path.join(REPORTS_DIR, report.runId));
+
+    const [, mainThreadId] = mockedRunScenarioTurn.mock.calls[0];
+    const [, cleanupThreadId] = mockedRunScenarioTurn.mock.calls[1];
+    expect(cleanupThreadId).toBe(mainThreadId);
+    expect(mainThreadId).toBe(`${EVAL_THREAD_PREFIX}:guest-resolution-known-name`);
   });
 });
 

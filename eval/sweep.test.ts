@@ -32,6 +32,11 @@ vi.mock('./runner.js', () => ({
 
 vi.mock('../src/container-runner.js', () => ({
   killAllActiveContainers: vi.fn(),
+  // Matches container-runner.js's own real literal — sweep.ts imports this
+  // constant to pass as killAllActiveContainers's required callerToken, so
+  // the mock must export it too or the real code sees `undefined` in its
+  // place.
+  EVAL_CLI_ONESHOT_TOKEN: 'eval-cli-oneshot',
 }));
 
 import { killAllActiveContainers } from '../src/container-runner.js';
@@ -245,7 +250,7 @@ describe('runSweep', () => {
       await runSweep();
 
       expect(mockedKillAllActiveContainers).toHaveBeenCalledTimes(1);
-      expect(mockedKillAllActiveContainers).toHaveBeenCalledWith(expect.any(String));
+      expect(mockedKillAllActiveContainers).toHaveBeenCalledWith(expect.any(String), 'eval-cli-oneshot');
     },
   );
 
@@ -284,4 +289,65 @@ describe('runSweep', () => {
     await expect(runSweep()).rejects.toThrow(/Timed out waiting for lock/);
     expect(mockedRunScenarioTurn).not.toHaveBeenCalled();
   }, 10_000);
+
+  // Regression coverage for the SIGINT/SIGTERM structural backstop
+  // (deferred-work.md, 2026-08-25): runSweep's own `finally` block does NOT
+  // run when Node exits on an unhandled SIGINT — an operator hitting Ctrl-C
+  // mid-sweep is exactly how a real invocation gets interrupted, reopening
+  // the incident killAllActiveContainers itself was written to fix.
+  describe('SIGINT/SIGTERM structural backstop', () => {
+    it('registers SIGINT and SIGTERM handlers for the duration of the call, and removes them again once it finishes normally', async () => {
+      mockedRunScenarioTurn.mockResolvedValue(turnResult('completed', [outboundMsg('SWEEP: CLEAN')]));
+      const onSpy = vi.spyOn(process, 'on');
+      const offSpy = vi.spyOn(process, 'off');
+
+      await runSweep();
+
+      expect(onSpy.mock.calls.map((c) => c[0])).toEqual(expect.arrayContaining(['SIGINT', 'SIGTERM']));
+      expect(offSpy.mock.calls.map((c) => c[0])).toEqual(expect.arrayContaining(['SIGINT', 'SIGTERM']));
+
+      onSpy.mockRestore();
+      offSpy.mockRestore();
+    });
+
+    it(
+      'the registered SIGINT handler tears down every active container and calls process.exit(130), independent ' +
+        "of runSweep's own (never-reached, on an unhandled signal) finally block",
+      async () => {
+        let resolveTurn: (v: Awaited<ReturnType<typeof runScenarioTurn>>) => void = () => {};
+        mockedRunScenarioTurn.mockImplementation(
+          () =>
+            new Promise((resolve) => {
+              resolveTurn = resolve;
+            }),
+        );
+        const onSpy = vi.spyOn(process, 'on');
+        const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+
+        // process.on('SIGINT', ...) runs synchronously as part of calling
+        // runSweep() itself — before its first internal `await` — so the
+        // handler is already registered the instant this call returns, no
+        // need to wait on the (still-pending) sweep to progress any further.
+        const sweepPromise = runSweep();
+        const sigintHandler = onSpy.mock.calls.find((c) => c[0] === 'SIGINT')?.[1] as (() => void) | undefined;
+        expect(sigintHandler).toBeDefined();
+
+        sigintHandler!();
+
+        expect(mockedKillAllActiveContainers).toHaveBeenCalledWith(
+          expect.stringContaining('SIGINT'),
+          'eval-cli-oneshot',
+        );
+        expect(exitSpy).toHaveBeenCalledWith(130);
+
+        // Let the real call finish normally too, so its own lock file is
+        // released and it doesn't leak into a later test in this file.
+        resolveTurn(turnResult('completed', [outboundMsg('SWEEP: CLEAN')]));
+        await sweepPromise;
+
+        onSpy.mockRestore();
+        exitSpy.mockRestore();
+      },
+    );
+  });
 });

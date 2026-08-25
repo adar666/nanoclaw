@@ -18,8 +18,7 @@
  * (which never goes through `runCli`'s own DB bootstrap) still works against
  * an initialized central DB.
  */
-import { killAllActiveContainers } from '../src/container-runner.js';
-import type { OutboundMessage } from '../src/db/session-db.js';
+import { EVAL_CLI_ONESHOT_TOKEN, killAllActiveContainers } from '../src/container-runner.js';
 import { log } from '../src/log.js';
 import { truncateForError } from './error-text.js';
 import { withEvalLock } from './lock.js';
@@ -27,6 +26,7 @@ import { runScenarioTurn } from './runner.js';
 import { EVAL_THREAD_PREFIX } from './session.js';
 import { bootstrapDb, ensureEvalScenarioGroup } from './setup.js';
 import { findTrailingMatch } from './text-matching.js';
+import { transcriptText } from './transcript-text.js';
 
 export interface SweepResult {
   removedCount: number;
@@ -56,20 +56,6 @@ const SWEEP_PROMPT = [
  * former should be forgiven.
  */
 const SWEEP_PATTERN = /\bSWEEP:\s*(REMOVED\s+(\d+)|CLEAN)\b/gi;
-
-/** Every `messages_out` row's `content.text`, joined — the same parse-or-skip-malformed-rows shape `judge/llm.ts` and `guest-resolution.scenarios.ts` both use. */
-function transcriptText(transcript: OutboundMessage[]): string {
-  return transcript
-    .map((m) => {
-      try {
-        const parsed = JSON.parse(m.content) as { text?: unknown };
-        return typeof parsed.text === 'string' ? parsed.text : '';
-      } catch {
-        return '';
-      }
-    })
-    .join('\n');
-}
 
 /**
  * Parses `replyText` for the last `SWEEP: REMOVED <n>` or `SWEEP: CLEAN`
@@ -112,6 +98,26 @@ function parseSweepReply(replyText: string): number {
  *   actually received (truncated).
  */
 export async function runSweep(): Promise<SweepResult> {
+  // A `finally` block (see below) does NOT run when Node exits on an
+  // unhandled SIGINT/SIGTERM — an operator hitting Ctrl-C mid-sweep bypasses
+  // it entirely, reopening the exact incident killAllActiveContainers itself
+  // was written to fix (two real containers left running concurrently
+  // against the same session DB, found live 2026-08-24). These handlers are
+  // the structural backstop: an interruption at any point during this call
+  // still tears down every container this invocation spawned before the
+  // process exits. Removed again in the `finally` below so a second
+  // `runSweep()` call in the same process (this file's own test suite calls
+  // it many times) never accumulates duplicate listeners.
+  const handleInterrupt = (signal: 'SIGINT' | 'SIGTERM'): void => {
+    console.error(`eval: received ${signal} — tearing down eval containers before exit`);
+    killAllActiveContainers(`eval sweep interrupted (${signal})`, EVAL_CLI_ONESHOT_TOKEN);
+    process.exit(signal === 'SIGINT' ? 130 : 143);
+  };
+  const onSigint = (): void => handleInterrupt('SIGINT');
+  const onSigterm = (): void => handleInterrupt('SIGTERM');
+  process.on('SIGINT', onSigint);
+  process.on('SIGTERM', onSigterm);
+
   try {
     return await withEvalLock(async (): Promise<SweepResult> => {
       bootstrapDb();
@@ -151,6 +157,8 @@ export async function runSweep(): Promise<SweepResult> {
     // activeContainers map can't detect it — the exact gap that let two real
     // containers end up polling the identical session DB concurrently
     // (found live, 2026-08-24, during a pnpm eval sweep re-verification run).
-    killAllActiveContainers('eval sweep complete');
+    process.off('SIGINT', onSigint);
+    process.off('SIGTERM', onSigterm);
+    killAllActiveContainers('eval sweep complete', EVAL_CLI_ONESHOT_TOKEN);
   }
 }

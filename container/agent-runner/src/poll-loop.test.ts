@@ -636,6 +636,47 @@ describe('eval-run turn wiring (real processQuery)', () => {
     expect(pushes.some((p) => p.includes('not delivered — it was not wrapped'))).toBe(false);
     expect(evalLogRows()).toHaveLength(1);
   });
+
+  // Guards the `!routing.evalRun` clause in the `deliverErrorResult` call
+  // site (mirrors the identical `!routing.taskRun` clause, both added so an
+  // error-terminated turn's text — already captured by the auto-log write
+  // above — doesn't ALSO get written as a stray `kind: 'chat'` row, which
+  // would pollute an eval transcript `eval/runner.ts`'s readTranscript reads
+  // back for judging.
+  it('does not deliver a stray chat row for an eval-run turn that ends in an error with no <message> envelope — only the eval_log row exists', async () => {
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      yield { type: 'result', text: 'Spending limit reached mid-scenario.', isError: true };
+    }
+    const query: AgentQuery = { push: () => {}, end: () => {}, events: events(), abort: () => {} };
+
+    await processQuery(query, EVAL_ROUTING, ['eval-msg-1'], 'claude', undefined, 'prompt', undefined);
+
+    expect(getUndeliveredMessages().filter((m) => m.kind === 'chat')).toHaveLength(0);
+    const logs = evalLogRows();
+    expect(logs).toHaveLength(1);
+    expect(logs[0].text).toBe('Spending limit reached mid-scenario.');
+  });
+
+  // Guards evalBlockNudged (mirrors taskBlockNudged's own multi-result
+  // protection): an eval turn can pass through more than one 'result' event
+  // within a single processQuery call (e.g. the wrapping-retry corrective
+  // cycle exercised in the "still nudges" test above, for a non-eval turn) —
+  // autoAppendEvalLog must fire at most once per turn regardless.
+  it('writes at most one eval_log row even when the query yields a second result event before the follow-up-push reset', async () => {
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      yield { type: 'result', text: 'first answer' };
+      yield { type: 'result', text: 'a second result event within the same turn, before any follow-up push' };
+    }
+    const query: AgentQuery = { push: () => {}, end: () => {}, events: events(), abort: () => {} };
+
+    await processQuery(query, EVAL_ROUTING, ['eval-msg-1'], 'claude', undefined, 'prompt', undefined);
+
+    const logs = evalLogRows();
+    expect(logs).toHaveLength(1);
+    expect(logs[0].text).toBe('first answer'); // the FIRST result event's text wins, not the second
+  });
 });
 
 // --- Follow-up completion timing: crash-recovery correctness ---

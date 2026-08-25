@@ -319,9 +319,28 @@ export function killContainer(sessionId: string, reason: string, onExit?: () => 
 }
 
 /**
+ * Structural guard for `killAllActiveContainers`, supplementing (not
+ * replacing) its own doc comment below. A comment alone is exactly the
+ * pattern this codebase's own pitfalls file already documents as having
+ * caused a real incident elsewhere (`delete_calendar_event`'s confirm-trust
+ * bug: an agent-visible instruction saying "always confirm first" turned out
+ * not to hold once something depended on it actually being followed) — the
+ * fix there was to fold the guarantee into the callee itself rather than
+ * trust every caller to remember a rule written in prose. This function's
+ * only two real callers (`eval/cli.ts`, `eval/sweep.ts`) are both short-lived
+ * one-shot CLI processes; a future caller has to import and pass this exact
+ * literal deliberately, rather than accidentally inheriting host-process
+ * access via a plain `import { killAllActiveContainers } from
+ * './container-runner.js'`.
+ */
+export const EVAL_CLI_ONESHOT_TOKEN = 'eval-cli-oneshot' as const;
+
+/**
  * Kill every container this process is currently tracking (every session id
  * in `activeContainers`), synchronously in sequence (`killContainer` →
- * `stopContainer` is itself synchronous, `execSync` with a 1s grace).
+ * `stopContainer` is itself synchronous, `execSync` with a 1s grace). One
+ * container's kill failure is caught and logged, not left to abort the loop
+ * — every other tracked container still gets its own kill attempt.
  *
  * Intended for a short-lived, one-shot CLI process that must never leave a
  * container running past its own exit — the eval harness (`eval/cli.ts`,
@@ -345,11 +364,49 @@ export function killContainer(sessionId: string, reason: string, onExit?: () => 
  * `activeContainers` map — a fresh module instance in its own separate OS
  * process — only ever contains containers this same invocation itself
  * spawned.
+ *
+ * `callerToken` must be exactly `EVAL_CLI_ONESHOT_TOKEN` — see that
+ * constant's own doc comment for why this exists as a structural check, not
+ * just a naming convention.
  */
-export function killAllActiveContainers(reason: string): void {
-  for (const sessionId of [...activeContainers.keys()]) {
-    killContainer(sessionId, reason);
+export function killAllActiveContainers(reason: string, callerToken: typeof EVAL_CLI_ONESHOT_TOKEN): void {
+  if (callerToken !== EVAL_CLI_ONESHOT_TOKEN) {
+    throw new Error(
+      `killAllActiveContainers: callerToken must be exactly "${EVAL_CLI_ONESHOT_TOKEN}" — this function kills ` +
+        'every container this OS process is currently tracking, which is only ever safe from a short-lived, ' +
+        'one-shot CLI process (eval/cli.ts, eval/sweep.ts). Never call this from the long-running host process — ' +
+        "it would kill every session's container the host is currently serving, not just eval ones.",
+    );
   }
+  for (const sessionId of [...activeContainers.keys()]) {
+    try {
+      killContainer(sessionId, reason);
+    } catch (err) {
+      log.error('killAllActiveContainers: failed to kill one container — continuing with the rest', {
+        sessionId,
+        reason,
+        err,
+      });
+    }
+  }
+}
+
+/**
+ * Test-only hook: registers a container in `activeContainers` without a real
+ * spawn, so `killAllActiveContainers`'s actual multi-entry kill loop can be
+ * exercised in a unit test without a live Docker daemon. Not used by any
+ * production code path.
+ */
+export function registerActiveContainerForTest(
+  sessionId: string,
+  entry: { process: ChildProcess; containerName: string },
+): void {
+  activeContainers.set(sessionId, entry);
+}
+
+/** Test-only hook: clears every tracked container without going through a real `container.on('close', ...)` event. */
+export function clearActiveContainersForTest(): void {
+  activeContainers.clear();
 }
 
 /**

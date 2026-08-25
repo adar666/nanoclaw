@@ -19,7 +19,7 @@ import { randomUUID } from 'crypto';
 import { wakeContainer } from '../src/container-runner.js';
 import type { OutboundMessage } from '../src/db/session-db.js';
 import { openOutboundDb, writeSessionMessage } from '../src/session-manager.js';
-import { assertNoDestinations } from './safety.js';
+import { assertIsEvalGroup, assertNoDestinations } from './safety.js';
 import { resolveEvalSession } from './session.js';
 
 const DEFAULT_TIMEOUT_MS = 300_000;
@@ -82,7 +82,9 @@ export async function runScenarioTurn(
 
   // AD-4: loud failure before any write or spawn, not a silent skip — and
   // before resolveEvalSession, so a failed check never persists an orphaned
-  // session row for an agent group that turns out to have a destination.
+  // session row for an agent group that turns out not to be one of the two
+  // provisioned eval groups, or that turns out to have a destination.
+  assertIsEvalGroup(agentGroupId);
   assertNoDestinations(agentGroupId);
 
   const { session } = resolveEvalSession(agentGroupId, threadId);
@@ -95,6 +97,15 @@ export async function runScenarioTurn(
     content: JSON.stringify({ text: message }),
     trigger: 1,
   });
+
+  // Re-check immediately before the real spawn — closes the TOCTOU window
+  // between the checks above and this point (resolveEvalSession +
+  // writeSessionMessage both do real DB I/O in between). A destination added
+  // to this agent group, or a group-identity mixup, landing in that window
+  // must not slip an eval turn into a group's real memory/CLAUDE.md
+  // undetected — AD-4 again, one spawn-call closer to the actual container.
+  assertIsEvalGroup(agentGroupId);
+  assertNoDestinations(agentGroupId);
 
   const spawned = await wakeContainer(session);
   if (!spawned) {

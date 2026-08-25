@@ -356,6 +356,12 @@ export async function processQuery(
   // Once-per-turn guard for the task-run "<message> block was not delivered"
   // nudge — mirrors unwrappedNudged for chat turns.
   let taskBlockNudged = false;
+  // Once-per-turn guard for the eval-run auto-log write — mirrors
+  // taskBlockNudged. An eval scenario's turn can pass through multiple
+  // 'result' events (e.g. the wrapping-retry corrective cycle below), but
+  // autoAppendEvalLog must write at most one eval_log row per turn, not one
+  // per 'result' event.
+  let evalBlockNudged = false;
   // Prompt queue for the exchange hook — each result event consumes the
   // oldest unanswered prompt, except a wrapping-retry result, which answers
   // the same prompt again. Unused (and unmaintained) when the provider
@@ -463,6 +469,7 @@ export async function processQuery(
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
         unwrappedNudged = false;
         taskBlockNudged = false;
+        evalBlockNudged = false;
         query.push(prompt);
         archivePrompts.push(prompt);
         // pendingFollowUpIds already has these ids (claimed above, before
@@ -566,7 +573,10 @@ export async function processQuery(
           // A corrective retry handles delivery only; its result is not a
           // second run summary.
           if (routing.taskRun && !taskBlockNudged) autoAppendTaskLog(event.text, routing.inReplyTo);
-          if (routing.evalRun) autoAppendEvalLog(event.text, routing.inReplyTo);
+          if (routing.evalRun && !evalBlockNudged) {
+            autoAppendEvalLog(event.text, routing.inReplyTo);
+            evalBlockNudged = true;
+          }
           if (sent === 0 && event.isError === true && !routing.taskRun && !routing.evalRun) {
             // Non-retryable error turn (e.g. a 403 billing_error) with no
             // <message> envelope: deliver the notice instead of dropping it as

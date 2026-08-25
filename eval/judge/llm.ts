@@ -25,6 +25,7 @@ import { truncateForError } from '../error-text.js';
 import type { RunOptions } from '../runner.js';
 import { runScenarioTurn } from '../runner.js';
 import { findTrailingMatch } from '../text-matching.js';
+import { transcriptText } from '../transcript-text.js';
 
 export interface LlmJudgeResult {
   verdict: 'pass' | 'fail';
@@ -45,8 +46,15 @@ export interface LlmJudgeResult {
  * sentence) is correctly rejected instead of being laundered into a false
  * verdict (`spec-eval-trailing-match-guard.md`, this class of risk confirmed
  * live for `sweep.ts`'s identical pattern).
+ *
+ * `\b` before `VERDICT:` (added deferred-work.md, 2026-08-25) matches
+ * `sweep.ts`'s sibling `SWEEP_PATTERN`, which already anchors the same way —
+ * without it, a word character immediately preceding "VERDICT:" (e.g. an
+ * agent gluing text together with no space) could match here where the
+ * sibling parser wouldn't, an unintended inconsistency between two
+ * near-identical parsers built together.
  */
-const VERDICT_PATTERN = /VERDICT:\s*(PASS|FAIL)\b/gi;
+const VERDICT_PATTERN = /\bVERDICT:\s*(PASS|FAIL)\b/gi;
 
 /**
  * Everything after the LAST case-insensitive "REASONING:" label, to the end
@@ -68,32 +76,23 @@ function extractReasoning(replyText: string): string {
 }
 
 /**
- * Every `messages_out` row's `content.text`, joined — the same
- * parse-or-skip-malformed-rows shape every prior scenario/judging module
- * uses (see `guest-resolution.scenarios.ts`'s own `transcriptText`). Used
- * both to build the judge prompt (joining the *input* transcript) and to
- * parse the judge's own reply (joining its output transcript) — the two
- * directions share the exact same join semantics.
+ * Bounds the transcript text embedded in the judge prompt — protects against
+ * a pathologically large transcript blowing the judge's own context, since
+ * `buildJudgePrompt` used to embed `transcriptText(transcript)` completely
+ * unbounded. `truncateForError`'s default (`MAX_ERROR_TEXT_CHARS`, 500 —
+ * tuned for how much of a reply belongs in a thrown error/log line) is far
+ * too small for judge INPUT, where a normal multi-turn transcript can
+ * legitimately run into the thousands of characters; this cap is generous by
+ * comparison and should never truncate a normal-length transcript.
  */
-function transcriptText(transcript: OutboundMessage[]): string {
-  return transcript
-    .map((m) => {
-      try {
-        const parsed = JSON.parse(m.content) as { text?: unknown };
-        return typeof parsed.text === 'string' ? parsed.text : '';
-      } catch {
-        return '';
-      }
-    })
-    .join('\n');
-}
+const MAX_JUDGE_TRANSCRIPT_CHARS = 20_000;
 
 function buildJudgePrompt(transcript: OutboundMessage[], rubric: string): string {
   return [
     'You are judging a transcript from another AI agent against a rubric.',
     '',
     'Transcript:',
-    transcriptText(transcript),
+    truncateForError(transcriptText(transcript), MAX_JUDGE_TRANSCRIPT_CHARS),
     '',
     'Rubric:',
     rubric,

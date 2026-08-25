@@ -13,7 +13,7 @@
  * and, per the I/O matrix, is thrown before `withEvalLock` ever acquires —
  * a bad invocation touches no session, no container, no lock file.
  */
-import { killAllActiveContainers } from '../src/container-runner.js';
+import { EVAL_CLI_ONESHOT_TOKEN, killAllActiveContainers } from '../src/container-runner.js';
 import { log } from '../src/log.js';
 import { judgeDeterministic } from './judge/deterministic.js';
 import { judgeLlm } from './judge/llm.js';
@@ -202,10 +202,35 @@ export async function runCli(argv: string[]): Promise<Report> {
 
       const startedAt = new Date().toISOString();
       const entries: ScenarioReportEntry[] = [];
-      for (const scenario of scenarioSet.scenarios) {
-        const entry = await runOneScenario(scenario, judgeGroup.id);
-        printSummaryLine(entry);
-        entries.push(entry);
+      try {
+        for (const scenario of scenarioSet.scenarios) {
+          const entry = await runOneScenario(scenario, judgeGroup.id);
+          printSummaryLine(entry);
+          entries.push(entry);
+        }
+      } catch (err) {
+        // A structural (AD-4) failure out of runOneScenario/runScenarioTurn
+        // itself — spawn failure, malformed opts — used to propagate straight
+        // out of this loop uncaught: writeReport never ran, so scenarios
+        // after the one that threw were silently never attempted with no
+        // diagnostic trail at all, indistinguishable from the run never
+        // having been invoked. Write a partial report (every entry computed
+        // so far, plus `aborted: true`/`abortError`) before rethrowing, so an
+        // operator has something to look at instead of nothing.
+        const abortedAt = new Date().toISOString();
+        const message = err instanceof Error ? err.message : String(err);
+        const partial: Report = {
+          runId: makeRunId(),
+          scenarioSetName: scenarioSet.name,
+          startedAt,
+          finishedAt: abortedAt,
+          entries,
+          aborted: true,
+          abortError: message,
+        };
+        const reportPath = writeReport(partial);
+        console.error(`eval: scenario loop aborted by a structural failure — partial report written to ${reportPath}`);
+        throw err;
       }
       const finishedAt = new Date().toISOString();
 
@@ -237,7 +262,7 @@ export async function runCli(argv: string[]): Promise<Report> {
     // (found live, 2026-08-24). See killAllActiveContainers's own doc for why
     // this is safe only because this process's activeContainers map can only
     // ever contain containers this same invocation itself spawned.
-    killAllActiveContainers('eval run complete');
+    killAllActiveContainers('eval run complete', EVAL_CLI_ONESHOT_TOKEN);
   }
 
   const allPassed = report.entries.length > 0 && report.entries.every((e) => e.passed);
@@ -284,6 +309,24 @@ export async function dispatchEvalCli(argv: string[]): Promise<Report | SweepRes
 // eval/cli.ts`, via the "eval" package.json script), not when imported by
 // tests or other eval/ modules.
 if (import.meta.url === `file://${process.argv[1]}`) {
+  // runCli's own `finally` (see above) does NOT run when Node exits on an
+  // unhandled SIGINT/SIGTERM — an operator hitting Ctrl-C mid-run (the
+  // normal way to interrupt a real multi-minute eval run) bypasses it
+  // entirely, reopening the exact incident killAllActiveContainers itself
+  // was written to fix (two real containers left running concurrently
+  // against the same session DB, found live 2026-08-24). These handlers are
+  // the structural backstop, covering both `run` and `sweep` (this single
+  // process entry point is the only place either subcommand actually runs
+  // from — sweep.ts's own runSweep() carries an identical pair for the case
+  // where it's invoked directly, outside this process entry).
+  const handleInterrupt = (signal: 'SIGINT' | 'SIGTERM'): void => {
+    console.error(`eval: received ${signal} — tearing down eval containers before exit`);
+    killAllActiveContainers(`eval run interrupted (${signal})`, EVAL_CLI_ONESHOT_TOKEN);
+    process.exit(signal === 'SIGINT' ? 130 : 143);
+  };
+  process.on('SIGINT', () => handleInterrupt('SIGINT'));
+  process.on('SIGTERM', () => handleInterrupt('SIGTERM'));
+
   dispatchEvalCli(process.argv.slice(2)).catch((err) => {
     console.error(`eval: ${err instanceof Error ? err.message : String(err)}`);
     process.exitCode = 1;
