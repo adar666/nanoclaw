@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 08-16-2026 12:00
-last_updated: 08-24-2026
+last_updated: 08-25-2026 00:00
 project: nanoclaw-v2
 project_key: NOKEY
 tracking_system: file-system
@@ -51,7 +51,7 @@ development_status:
   2-2-multi-file-batch-fill-operations: done
   2-3-version-history-undo-for-edited-documents: done
   2-4-auto-refresh-stored-raw-extracted-text-after-an-edit: done
-  epic-2-retrospective: optional
+  epic-2-retrospective: done
 action_items:
   - id: "epic-1-retro-item-1-add-log-calls-to-list_documents-fill_doc"
     epic: 1
@@ -109,3 +109,25 @@ action_items:
     owner: "dev"
     status: done
     ref: "_bmad-output/implementation-artifacts/epic-1-retro-2026-08-16.md"
+  - id: "epic-2-retro-item-9-ocrpngtext-s-60s-timeout-does-not-cancel"
+    epic: 2
+    action: "ocrPngText's 60s timeout does not cancel the underlying tesseract worker;
+      orphaned background work and no coordination on concurrent .ocr-cache writes."
+    owner: "dev"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-2-retro-2026-08-25.md"
+  - id: "epic-2-retro-item-10-fillonedocument-has-accumulated-several"
+    epic: 2
+    action: "fillOneDocument has accumulated several distinct concerns (validation,
+      locking, snapshotting, dispatch, history recording, cleanup) across all 4 epic-2
+      stories - future refactor candidate."
+    owner: "dev"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-2-retro-2026-08-25.md"
+  - id: "epic-2-retro-item-11-fillonedocument-snapshot-then-dispatch-t"
+    epic: 2
+    action: "fillOneDocument snapshot-then-dispatch-then-delete assumes fillDocx/fillDoc/fillPdf
+      fully finish reading the input path before returning - never directly audited."
+    owner: "dev"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-2-retro-2026-08-25.md"
