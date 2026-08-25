@@ -344,7 +344,9 @@ export const createCalendarEvent: McpToolDefinition = {
       const recurringNote = eventBody.recurrence ? ' This would create a recurring series, not a single event.' : '';
       const confirmResult = await createHooks.confirmCreation(
         `This looks like it might already be on ${calendar}'s calendar — created ${ageDesc}:\n` +
-          `${formatConfirmationSummary(duplicate.event)}\n\nCreate "${title}" anyway?${recurringNote}`,
+          `${formatConfirmationSummary(duplicate.event)}\n\n` +
+          `What you're about to create:\n${formatNewEventSummary(eventBody)}\n\n` +
+          `Create "${title}" anyway?${recurringNote}`,
       );
       if ('error' in confirmResult) return confirmResult.error;
       if (!confirmResult.confirmed) {
@@ -1147,6 +1149,29 @@ function formatConfirmationSummary(ev: CalendarEventItem): string {
   const title = ev.summary?.trim() || '(no title)';
   let line = `${title} — ${formatEventTimeRange24h(ev.start, ev.end)}`;
   if (ev.location) line += ` @ ${ev.location}`;
+  return line;
+}
+
+/**
+ * Same idea as formatConfirmationSummary above, but for the NEW event
+ * `create_calendar_event`'s own duplicate-guard card is about to create —
+ * built from the local pre-POST `EventBody`, not a `CalendarEventItem` read
+ * back from the API (this event doesn't exist yet). Before this, the
+ * duplicate-confirmation question showed only the *existing* candidate's
+ * details, giving the user nothing to actually compare against for what
+ * they're about to create (deferred-work.md finding) — also surfaces
+ * description and guest count, which formatConfirmationSummary's own
+ * delete-confirmation use case never needed to.
+ */
+function formatNewEventSummary(eventBody: EventBody): string {
+  const title = eventBody.summary?.trim() || '(no title)';
+  let line = `${title} — ${formatEventTimeRange24h(eventBody.start, eventBody.end)}`;
+  if (eventBody.location) line += ` @ ${eventBody.location}`;
+  if (eventBody.description) line += ` — "${eventBody.description}"`;
+  if (eventBody.attendees && eventBody.attendees.length > 0) {
+    const noun = eventBody.attendees.length === 1 ? 'guest' : 'guests';
+    line += ` (${eventBody.attendees.length} ${noun})`;
+  }
   return line;
 }
 

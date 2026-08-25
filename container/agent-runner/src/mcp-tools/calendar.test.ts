@@ -724,6 +724,29 @@ describe('create_calendar_event MCP tool', () => {
       expect(result.content[0].text).toContain('https://calendar.google.com/event?eid=dup1');
     });
 
+    it('the duplicate-confirmation question also shows the NEW event\'s own details, not just the existing candidate\'s', async () => {
+      // deferred-work.md finding: previously the card showed only the
+      // existing candidate, giving the user nothing to compare the pending
+      // create against.
+      const { questions } = stubConfirmCreation({ confirmed: false });
+      stubFetchSequence([{ status: 200, body: { items: [baseDuplicateCandidate()] } }]);
+
+      await createCalendarEvent.handler({
+        calendar: 'uriel',
+        title: 'Team sync',
+        start,
+        end,
+        location: 'Room 4B',
+        description: 'Quarterly planning',
+        guests: ['a@example.com', 'b@example.com'],
+      });
+
+      expect(questions[0]).toContain('What you\'re about to create');
+      expect(questions[0]).toContain('Room 4B');
+      expect(questions[0]).toContain('Quarterly planning');
+      expect(questions[0]).toContain('2 guests');
+    });
+
     it('blocks on a possible-duplicate confirmation and skips (no POST) when the user declines', async () => {
       const { fn: confirmFn, questions } = stubConfirmCreation({ confirmed: false });
       const { fn } = stubFetchSequence([{ status: 200, body: { items: [baseDuplicateCandidate()] } }]);
