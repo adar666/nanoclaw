@@ -25,6 +25,7 @@ import {
   saveSignature,
   listDocumentVersionsImpl,
   listDocumentVersions,
+  describePdfReadError,
 } from './documents.js';
 
 // ---------------------------------------------------------------------------
@@ -430,6 +431,49 @@ describe('save_document — happy path, PDF with text layer', () => {
   });
 });
 
+describe('describePdfReadError', () => {
+  it('names a password-protected PDF distinctly, rather than surfacing pdfjs-dist\'s generic error text', () => {
+    const e = new Error('No password given');
+    e.name = 'PasswordException';
+    expect(describePdfReadError(e)).toBe('this PDF is password-protected and cannot be read — please provide an unprotected copy');
+  });
+
+  it('falls through to the plain error message for any other error', () => {
+    expect(describePdfReadError(new Error('Invalid PDF structure'))).toBe('Invalid PDF structure');
+    expect(describePdfReadError('a raw string throw')).toBe('a raw string throw');
+  });
+});
+
+describe('save_document — oversized raw file is refused before any extraction is attempted', () => {
+  it('rejects a file over the size cap with a clear error, never touches pdfjs-dist/unzip/OCR', async () => {
+    const filePath = path.join(inboxDir, 'huge.pdf');
+    // A sparse file: truncate to a size past the cap without actually
+    // allocating/writing that many real bytes — fast and light in a test.
+    fs.writeFileSync(filePath, '');
+    fs.truncateSync(filePath, 101 * 1024 * 1024);
+
+    const result = await saveDocumentImpl({ path: filePath }, opts());
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('File too large');
+    expect(result.content[0].text).toContain('101.0MB');
+    expect(fs.existsSync(path.join(baseDir, 'memory', 'documents', 'huge.md'))).toBe(false);
+  });
+
+  it('does not reject a file exactly at the cap for its size (the boundary is ">", not ">=")', async () => {
+    // Content doesn't matter for this boundary check — only whether
+    // resolveInboxPath's size gate itself lets a file of exactly the cap
+    // size through to the rest of the pipeline.
+    const filePath = path.join(inboxDir, 'at-cap.pdf');
+    fs.writeFileSync(filePath, '');
+    fs.truncateSync(filePath, 100 * 1024 * 1024);
+
+    const result = await saveDocumentImpl({ path: filePath }, opts());
+
+    expect(result.content[0]?.text).not.toContain('File too large');
+  });
+});
+
 describe('save_document — scanned PDF, no text layer, OCR reads it', () => {
   it('single call: renders page 1, OCRs it, saves the OCR text, and deletes the render', async () => {
     mockOcrResult = { text: 'What OCR read from the rendered page.' };
@@ -490,6 +534,44 @@ describe('save_document — scanned PDF, no text layer, OCR reads it', () => {
 
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain('extractedText must be a string');
+  });
+});
+
+describe('save_document — abandoned .document-renders/ entries are swept opportunistically', () => {
+  it('deletes an old (>1h) leftover render on a fresh scanned-PDF save, but never the one just created', async () => {
+    const renderDir = path.join(baseDir, '.document-renders');
+    fs.mkdirSync(renderDir, { recursive: true });
+    const abandoned = path.join(renderDir, 'some-other-scan-abandoned.png');
+    fs.writeFileSync(abandoned, 'stale png bytes');
+    const old = new Date(Date.now() - 2 * 60 * 60 * 1000); // 2h old
+    fs.utimesSync(abandoned, old, old);
+
+    mockOcrResult = { text: 'fresh OCR text' };
+    const filePath = writeInboxFile('scan.pdf', buildMinimalPdf(null));
+    const result = await saveDocumentImpl({ path: filePath }, opts());
+
+    expect(result.isError).toBeFalsy();
+    expect(fs.existsSync(abandoned)).toBe(false); // swept
+    // The fresh save's own render is cleaned up on the success path too
+    // (existing behavior, unchanged) — the dir ends up empty either way,
+    // but for two different reasons; assert via the concept file instead,
+    // which only exists if this call's own extraction actually succeeded.
+    expect(fs.existsSync(path.join(baseDir, 'memory', 'documents', 'scan.md'))).toBe(true);
+  });
+
+  it('does not touch a recent (<1h) leftover render — a same-conversation follow-up may still need it', async () => {
+    const renderDir = path.join(baseDir, '.document-renders');
+    fs.mkdirSync(renderDir, { recursive: true });
+    const recent = path.join(renderDir, 'some-other-scan-recent.png');
+    fs.writeFileSync(recent, 'recent png bytes');
+    const fresh = new Date(Date.now() - 5 * 60 * 1000); // 5 minutes old
+    fs.utimesSync(recent, fresh, fresh);
+
+    mockOcrResult = { text: 'fresh OCR text' };
+    const filePath = writeInboxFile('scan.pdf', buildMinimalPdf(null));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    expect(fs.existsSync(recent)).toBe(true); // not swept — still within the grace window
   });
 });
 
@@ -857,6 +939,44 @@ describe('save_document — stale lock recovery', () => {
     const lockPath = path.join(documentsDir, '.index.lock');
     fs.writeFileSync(lockPath, '999999'); // simulate a lock left by a crashed process
     const old = new Date(Date.now() - 60_000); // 60s ago, older than the 30s staleness threshold
+    fs.utimesSync(lockPath, old, old);
+
+    const filePath = writeInboxFile('report.docx', buildDocx(['Hello World']));
+    const result = await saveDocumentImpl({ path: filePath }, opts());
+
+    expect(result.isError).toBeFalsy();
+    expect(fs.existsSync(path.join(documentsDir, 'report.md'))).toBe(true);
+    expect(fs.existsSync(lockPath)).toBe(false);
+  });
+
+  it('reclaims a lock immediately when its holder pid is dead, even with a fresh mtime (does not wait out the staleness window)', async () => {
+    const documentsDir = path.join(baseDir, 'memory', 'documents');
+    fs.mkdirSync(documentsDir, { recursive: true });
+    const lockPath = path.join(documentsDir, '.index.lock');
+    fs.writeFileSync(lockPath, '999999'); // a pid essentially guaranteed dead in any real environment
+    // Deliberately fresh mtime — the mtime-based staleness check alone would
+    // NOT reclaim this lock (nowhere near the 30s threshold); only the
+    // pid-liveness check can, and it must not wait for the mtime window.
+
+    const filePath = writeInboxFile('report.docx', buildDocx(['Hello World']));
+    const start = Date.now();
+    const result = await saveDocumentImpl({ path: filePath }, opts());
+    const elapsedMs = Date.now() - start;
+
+    expect(result.isError).toBeFalsy();
+    expect(fs.existsSync(path.join(documentsDir, 'report.md'))).toBe(true);
+    // The mtime path alone would need ~30s (LOCK_STALE_MS) before it even
+    // starts retrying; finishing well under that proves the pid-liveness
+    // check fired instead, not a lucky race against mtime staleness.
+    expect(elapsedMs).toBeLessThan(5_000);
+  });
+
+  it('falls back to mtime-based staleness when the lock content is not a plain pid', async () => {
+    const documentsDir = path.join(baseDir, 'memory', 'documents');
+    fs.mkdirSync(documentsDir, { recursive: true });
+    const lockPath = path.join(documentsDir, '.index.lock');
+    fs.writeFileSync(lockPath, 'not-a-pid'); // pid-liveness check can't apply to this
+    const old = new Date(Date.now() - 60_000); // older than the 30s staleness threshold
     fs.utimesSync(lockPath, old, old);
 
     const filePath = writeInboxFile('report.docx', buildDocx(['Hello World']));

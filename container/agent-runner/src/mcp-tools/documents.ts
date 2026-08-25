@@ -142,6 +142,16 @@ function isPathInside(parent: string, child: string): boolean {
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }
 
+// No size check exists anywhere on a raw uploaded file before this file's
+// extraction/render/OCR pipeline runs on it (deferred-work.md finding) — the
+// only existing bound, extractDocxText's 64MB `maxBuffer` on the unzipped
+// word/document.xml payload, caps output size, not input. This caps the raw
+// input file itself: generous for a real household document (a legitimate
+// .docx/.pdf/.doc/.png is typically KB-to-few-MB), while bounding the
+// worst-case blast radius a pathological/adversarial input file (a zip bomb,
+// a PDF crafted to be slow to parse) can have before any processing starts.
+const MAX_INBOX_FILE_BYTES = 100 * 1024 * 1024; // 100MB
+
 function resolveInboxPath(
   filePath: string,
   workspaceRoot: string,
@@ -149,6 +159,18 @@ function resolveInboxPath(
 ): { path: string } | { error: string } {
   const resolved = path.isAbsolute(filePath) ? filePath : path.resolve(workspaceRoot, filePath);
   if (!fs.existsSync(resolved)) return { error: `File not found: ${filePath}` };
+
+  let size: number;
+  try {
+    size = fs.statSync(resolved).size;
+  } catch {
+    return { error: `File not found: ${filePath}` };
+  }
+  if (size > MAX_INBOX_FILE_BYTES) {
+    const mb = (size / (1024 * 1024)).toFixed(1);
+    const maxMb = MAX_INBOX_FILE_BYTES / (1024 * 1024);
+    return { error: `File too large (${mb}MB, max ${maxMb}MB) — refusing to process it.` };
+  }
 
   let realResolved: string;
   try {
@@ -231,6 +253,21 @@ const LOCK_RETRY_MS = 25;
 const LOCK_MAX_ATTEMPTS = 80; // ~2s worst case
 const LOCK_STALE_MS = 30_000;
 
+/**
+ * The standard POSIX liveness probe: `kill(pid, 0)` sends no actual signal,
+ * only checks whether a process exists and is signalable. `ESRCH` means no
+ * such process (dead); `EPERM` means it exists but we lack permission to
+ * signal it (still alive — a permission error is itself proof of existence).
+ */
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return errnoCode(e) === 'EPERM';
+  }
+}
+
 async function withLock<T>(lockPath: string, fn: () => T): Promise<T> {
   for (let attempt = 0; attempt < LOCK_MAX_ATTEMPTS; attempt++) {
     try {
@@ -240,7 +277,29 @@ async function withLock<T>(lockPath: string, fn: () => T): Promise<T> {
       if (errnoCode(e) !== 'EEXIST') throw e;
 
       // A crashed holder never releases its lock — recover instead of
-      // failing every save for this group forever.
+      // failing every save for this group forever. Two independent
+      // recovery signals, checked in order: (1) the holder's own pid
+      // (written as the lock file's content at acquire time) is no longer
+      // alive — reclaim immediately, a dead process is never coming back to
+      // release it, no need to wait out the mtime window at all (deferred-
+      // work.md finding: the mtime heuristic alone can't tell a genuinely
+      // crashed holder from one still legitimately working through a long
+      // critical section). (2) the pre-existing mtime-based staleness
+      // fallback, kept for when the pid check can't be trusted — its
+      // content isn't a plain pid, or (rare, but real) a live but unrelated
+      // process later reused that same pid number.
+      try {
+        const heldByPid = Number(fs.readFileSync(lockPath, 'utf-8'));
+        if (Number.isInteger(heldByPid) && heldByPid > 0 && !isPidAlive(heldByPid)) {
+          fs.unlinkSync(lockPath);
+          log(`withLock: reclaimed a lock held by dead pid ${heldByPid}: ${lockPath}`);
+          continue; // retry the exclusive-create immediately, no need to sleep
+        }
+      } catch {
+        // Lock vanished, or its content isn't a plain pid — fall through to
+        // the mtime-based check below.
+      }
+
       try {
         const st = fs.statSync(lockPath);
         if (Date.now() - st.mtimeMs > LOCK_STALE_MS) {
@@ -437,6 +496,17 @@ async function extractDocText(filePath: string): Promise<string> {
 // surfaced by the caller as a clear "Could not read PDF" error.
 // ---------------------------------------------------------------------------
 
+// Shared with renderFirstPageToPng below — neither pdfjs-dist nor
+// @hyzyla/pdfium has a built-in timeout, and a pathological PDF (deeply
+// nested object graph, adversarial input) could otherwise hang a call
+// indefinitely, the same class of gap DOC_TIMEOUT_MS/withTimeout already
+// closed for .doc extraction (deferred-work.md finding). Like that existing
+// use of withTimeout, this races the call against a timer without actually
+// cancelling the underlying work if the timer wins — pdfjs-dist/@hyzyla/pdfium
+// have no cancellation API to call into, so the real work keeps running in
+// the background until it settles on its own; best achievable without one.
+const PDF_TIMEOUT_MS = 30_000;
+
 async function extractPdfText(filePath: string): Promise<string> {
   const { getDocument } = await import('pdfjs-dist/legacy/build/pdf.mjs');
   const data = new Uint8Array(fs.readFileSync(filePath));
@@ -456,6 +526,24 @@ async function extractPdfText(filePath: string): Promise<string> {
   } finally {
     await loadingTask.destroy();
   }
+}
+
+/**
+ * pdfjs-dist rejects with a `PasswordException` (checked structurally by
+ * `.name` rather than importing the class — this file only ever reaches
+ * pdfjs-dist via a lazy dynamic import, so checking `.name` avoids threading
+ * an extra static import through just for this one check) when a PDF is
+ * encrypted and no `onPassword` callback was set on the loading task — never
+ * set here, so every encrypted PDF hits this path. Without this, an
+ * encrypted PDF surfaced the same generic "Could not read PDF: <pdfjs
+ * message>" text as any other malformed/corrupt PDF (deferred-work.md
+ * finding) — this names the actual, common, non-corrupt reason instead.
+ */
+export function describePdfReadError(e: unknown): string {
+  if (e instanceof Error && e.name === 'PasswordException') {
+    return 'this PDF is password-protected and cannot be read — please provide an unprotected copy';
+  }
+  return e instanceof Error ? e.message : String(e);
 }
 
 // pdfjs-dist's getTextContent() returns a genuinely empty items list only
@@ -535,6 +623,44 @@ function encodePng(rgba: Uint8Array, width: number, height: number): Buffer {
 
 /** 72-DPI-native PDF page rendered at 2x — legible enough for the agent to read text from. */
 const RENDER_SCALE = 2;
+
+// An abandoned Ask-First render (the agent's first save_document call halted
+// asking how to proceed, and no follow-up call ever arrived — a real,
+// unrecoverable-by-this-file scenario, e.g. the conversation just moved on)
+// previously lived in .document-renders/ forever: the only existing cleanup
+// runs on the success path or an OCR-failure catch, never on plain
+// abandonment (deferred-work.md finding). One hour comfortably covers any
+// real same-conversation follow-up while still reclaiming a truly abandoned
+// one well before it accumulates meaningfully.
+const ABANDONED_RENDER_MAX_AGE_MS = 60 * 60 * 1000;
+
+/**
+ * Deletes every file directly under `dir` older than `maxAgeMs` —
+ * best-effort: a missing `dir`, or a file vanishing between the `readdir`
+ * and the `stat`/`unlink` (another call's own cleanup, or a genuine
+ * concurrent sweep, got there first), is silently skipped rather than
+ * thrown. Called opportunistically at the start of a new scanned-PDF render
+ * rather than on any separate schedule — this file has no background/cron
+ * mechanism of its own to hang a real sweep off of.
+ */
+function sweepOldFiles(dir: string, maxAgeMs: number): void {
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(dir);
+  } catch {
+    return; // doesn't exist yet — nothing to sweep
+  }
+  const now = Date.now();
+  for (const name of entries) {
+    const p = path.join(dir, name);
+    try {
+      const st = fs.statSync(p);
+      if (st.isFile() && now - st.mtimeMs > maxAgeMs) fs.unlinkSync(p);
+    } catch {
+      // Best-effort — never let a sweep failure block the real operation.
+    }
+  }
+}
 
 async function renderFirstPageToPng(filePath: string, outPath: string): Promise<{ width: number; height: number }> {
   const { PDFiumLibrary } = await import('@hyzyla/pdfium');
@@ -864,15 +990,16 @@ export async function saveDocumentImpl(
     if (ext === 'pdf') {
       let pdfText: string;
       try {
-        pdfText = await extractPdfText(resolvedPath);
+        pdfText = await withTimeout(extractPdfText(resolvedPath), PDF_TIMEOUT_MS, 'PDF text extraction');
       } catch (e) {
-        return err(`Could not read PDF: ${e instanceof Error ? e.message : String(e)}`);
+        return err(`Could not read PDF: ${describePdfReadError(e)}`);
       }
 
       if (hasTextLayer(pdfText)) {
         bodyText = pdfText;
       } else {
         const renderDir = path.join(opts.baseDir, '.document-renders');
+        sweepOldFiles(renderDir, ABANDONED_RENDER_MAX_AGE_MS);
         const renderPath = path.join(renderDir, renderFileNameFor(resolvedPath, originalFilename));
 
         if (extractedText === undefined) {
@@ -884,7 +1011,7 @@ export async function saveDocumentImpl(
           // single deterministic call for the common case (spec-2-1).
           let dims: { width: number; height: number };
           try {
-            dims = await renderFirstPageToPng(resolvedPath, renderPath);
+            dims = await withTimeout(renderFirstPageToPng(resolvedPath, renderPath), PDF_TIMEOUT_MS, 'PDF page render');
           } catch (e) {
             return err(`Could not render scanned PDF page: ${e instanceof Error ? e.message : String(e)}`);
           }
@@ -2970,7 +3097,7 @@ async function pdfRenderForOverlay(
   const renderPath = path.join(opts.baseDir, '.document-fills', overlayRenderFileNameFor(meta.slug));
   let dims: { width: number; height: number };
   try {
-    dims = await renderFirstPageToPng(rawPath, renderPath);
+    dims = await withTimeout(renderFirstPageToPng(rawPath, renderPath), PDF_TIMEOUT_MS, 'PDF page render');
   } catch (e) {
     return err(`Could not render page for overlay targeting: ${e instanceof Error ? e.message : String(e)}`);
   }
@@ -3200,9 +3327,9 @@ async function fillPdf(
 
   let pdfText: string;
   try {
-    pdfText = await extractPdfText(rawPath);
+    pdfText = await withTimeout(extractPdfText(rawPath), PDF_TIMEOUT_MS, 'PDF text extraction');
   } catch (e) {
-    return err(`Could not read PDF: ${e instanceof Error ? e.message : String(e)}`);
+    return err(`Could not read PDF: ${describePdfReadError(e)}`);
   }
 
   // Priority 2: text layer with no matching field requested — line overlay.
