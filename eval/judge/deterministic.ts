@@ -24,6 +24,15 @@ import type { OutboundMessage } from '../../src/db/session-db.js';
 
 export interface DeterministicCheckContext {
   transcript: OutboundMessage[];
+  /**
+   * The scenario this check is judging, when the caller has one — `cli.ts`
+   * passes it; `deterministic.test.ts`'s own direct unit calls generally
+   * don't need to. Lets a `check()` function, or a future report line,
+   * self-identify which scenario it ran under (deferred-work.md finding —
+   * this context previously carried only `transcript`, with no scenario
+   * identity at all).
+   */
+  scenarioId?: string;
 }
 
 export interface DeterministicJudgeResult {
@@ -45,9 +54,9 @@ export interface DeterministicJudgeResult {
 export type DeterministicCheck = (ctx: DeterministicCheckContext) => boolean | DeterministicJudgeResult;
 
 /**
- * Calls `check({ transcript })`. A bare `boolean` return is normalized to
- * `{ passed: <value> }` (no evidence); an object return passes through
- * unchanged.
+ * Calls `check({ transcript, scenarioId })`. A bare `boolean` return is
+ * normalized to `{ passed: <value> }` (no evidence); an object return passes
+ * through unchanged.
  *
  * `DeterministicCheck`'s type already blocks a malformed return for any
  * correctly-typed scenario file, but this function's verdict is reported as
@@ -55,8 +64,12 @@ export type DeterministicCheck = (ctx: DeterministicCheckContext) => boolean | D
  * type-system gap (an `any` cast, a non-typechecked caller) shouldn't
  * silently become a false verdict. Guarded with a loud `TypeError` instead.
  */
-export function judgeDeterministic(transcript: OutboundMessage[], check: DeterministicCheck): DeterministicJudgeResult {
-  const result = check({ transcript });
+export function judgeDeterministic(
+  transcript: OutboundMessage[],
+  check: DeterministicCheck,
+  scenarioId?: string,
+): DeterministicJudgeResult {
+  const result = check({ transcript, scenarioId });
   if (typeof result === 'boolean') return { passed: result };
   if (result === null || typeof result !== 'object' || typeof result.passed !== 'boolean') {
     throw new TypeError(

@@ -110,9 +110,17 @@ export async function withLock<T>(lockPath: string, fn: () => T | Promise<T>, op
           attempt--; // guarantee a genuine re-acquire attempt, even on the last iteration (see fix #2 above)
           continue;
         }
-      } catch {
-        // Lock vanished between our failed create and this stat — another
-        // holder likely just released it; fall through to the normal retry.
+      } catch (staleCheckErr) {
+        // ENOENT here means the lock vanished between our failed create and
+        // this stat — another holder likely just released it, expected and
+        // silent; fall through to the normal retry either way. Any other
+        // error (permissions, I/O) is unexpected and previously vanished
+        // without a trace, surfacing only as an opaque "Timed out waiting
+        // for lock" — logged now so a persistent filesystem problem is
+        // distinguishable from ordinary contention.
+        if (errnoCode(staleCheckErr) !== 'ENOENT') {
+          log.warn('withLock: unexpected error checking lock staleness', { lockPath, err: staleCheckErr });
+        }
       }
 
       if (attempt === maxAttempts - 1) {
@@ -142,4 +150,24 @@ export async function withLock<T>(lockPath: string, fn: () => T | Promise<T>, op
 /** Convenience wrapper hardcoded to the eval group's own workspace lock. */
 export function withEvalLock<T>(fn: () => T | Promise<T>, opts?: LockOptions): Promise<T> {
   return withLock(EVAL_LOCK_PATH, fn, opts);
+}
+
+/**
+ * Best-effort, synchronous release of `EVAL_LOCK_PATH` if — and only if —
+ * this process's own pid still owns it (same fencing check `withLock`'s own
+ * `finally` uses). For a `SIGINT`/`SIGTERM` handler calling `process.exit()`
+ * directly: Node does not drain pending promises on exit, so a lock held
+ * inside an in-flight `withEvalLock(fn)` call would otherwise never reach
+ * `withLock`'s own release logic, leaving the next invocation to wait out the
+ * full `staleMs` window even though this process is already gone. Never
+ * throws — a signal handler has nowhere useful to report a failure to.
+ */
+export function releaseEvalLockIfOwned(): void {
+  try {
+    if (fs.readFileSync(EVAL_LOCK_PATH, 'utf-8') === String(process.pid)) {
+      fs.unlinkSync(EVAL_LOCK_PATH);
+    }
+  } catch {
+    // Not held by us (or gone already) — nothing to release.
+  }
 }

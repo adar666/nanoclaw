@@ -247,7 +247,11 @@ describe('runCli', () => {
 
     expect(report.entries[0].passed).toBe(true); // cleanup outcome doesn't flip the scenario verdict
     expect(report.entries[0].cleanupError).toMatch(/did not confirm/);
-    expect(process.exitCode).toBe(0); // aggregate is based on `passed`, not cleanupError (both scenarios pass)
+    // Exit code 2: every verdict passed, but at least one scenario's cleanup
+    // didn't confirm success — distinct from 1 (an actual verdict failure)
+    // and 0 (fully clean), so a caller scripting on exit code alone can tell
+    // "clean" apart from "passed, but check cleanup" (deferred-work.md finding).
+    expect(process.exitCode).toBe(2);
   });
 
   it('records a cleanupError when the cleanup turn itself fails/times out', async () => {

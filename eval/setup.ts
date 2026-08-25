@@ -19,7 +19,28 @@ import { getContainerConfig, updateContainerConfigJson } from '../src/db/contain
 import { runMigrations } from '../src/db/migrations/index.js';
 import { readEnvFile } from '../src/env.js';
 import { initGroupFilesystem } from '../src/group-init.js';
+import { log } from '../src/log.js';
 import type { AgentGroup } from '../src/types.js';
+
+/**
+ * Mirrors `src/container-config.ts`'s own module-private `safeJsonParse` —
+ * fall back to `fallback` and log instead of throwing uncaught on a
+ * hand-corrupted `container_configs` JSON column (deferred-work.md finding;
+ * that fix landed for `container-config.ts`/`groups.ts`'s own JSON columns
+ * but was never applied to these two functions' identical shape).
+ */
+function safeJsonParse<T>(raw: string, fallback: T, column: string, agentGroupId: string): T {
+  try {
+    return JSON.parse(raw) as T;
+  } catch (e) {
+    log.warn('eval/setup: unparseable JSON column, using fallback', {
+      column,
+      agentGroupId,
+      err: e instanceof Error ? e.message : String(e),
+    });
+    return fallback;
+  }
+}
 
 /**
  * Idempotent on `folder`. Returns the existing group (re-running
@@ -83,7 +104,12 @@ export function ensureEvalCalendarOverride(agentGroupId: string): void {
   const row = getContainerConfig(agentGroupId);
   if (!row) throw new Error(`No container config for group: ${agentGroupId}`);
 
-  const registry = JSON.parse(row.calendar_registry) as Array<{ name: string; calendarId: string }>;
+  const registry = safeJsonParse(
+    row.calendar_registry,
+    [] as Array<{ name: string; calendarId: string }>,
+    'calendar_registry',
+    agentGroupId,
+  );
   const filtered = registry.filter((e) => e.name !== 'uriel');
   filtered.push({ name: 'uriel', calendarId });
   updateContainerConfigJson(agentGroupId, 'calendar_registry', filtered);
@@ -122,7 +148,7 @@ export function ensureEvalPeopleMount(agentGroupId: string): void {
   if (!row) throw new Error(`No container config for group: ${agentGroupId}`);
 
   const mount: AdditionalMountConfig = { hostPath, containerPath, readonly: true };
-  const existing = JSON.parse(row.additional_mounts) as AdditionalMountConfig[];
+  const existing = safeJsonParse(row.additional_mounts, [] as AdditionalMountConfig[], 'additional_mounts', agentGroupId);
   if (!existing.some((m) => m.hostPath === hostPath && m.containerPath === containerPath)) {
     existing.push(mount);
     updateContainerConfigJson(agentGroupId, 'additional_mounts', existing);

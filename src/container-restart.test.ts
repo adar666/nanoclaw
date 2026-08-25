@@ -155,6 +155,25 @@ describe('restartAgentGroupContainers', () => {
     expect(mockWriteSessionMessage.mock.calls[1][1]).toBe('s2');
   });
 
+  it('skips a session with managed_by="eval" even when isContainerRunning would say yes', () => {
+    // Defensive guard (deferred-work.md finding) — eval sessions are spawned
+    // and torn down by the separate eval CLI process, never this host
+    // process, so isContainerRunning would already return false for one in
+    // practice; this filter is a belt-and-suspenders backstop that doesn't
+    // rely on that incidental process-boundary fact.
+    mockGetSessionsByAgentGroup.mockReturnValue([
+      { ...makeSession('s1', 'g1'), managed_by: 'eval' },
+      makeSession('s2', 'g1'),
+    ]);
+    mockIsContainerRunning.mockReturnValue(true);
+
+    const count = restartAgentGroupContainers('g1', 'test');
+
+    expect(count).toBe(1);
+    expect(mockKillContainer).toHaveBeenCalledTimes(1);
+    expect(mockKillContainer).toHaveBeenCalledWith('s2', 'test', undefined);
+  });
+
   it('wakes even without a wake message when in-flight messages are pending', () => {
     // A provider switch mid-conversation kills a container holding claimed
     // messages — without an immediate respawn those messages stay dark until

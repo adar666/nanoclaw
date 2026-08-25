@@ -18,7 +18,7 @@ import { log } from '../src/log.js';
 import { judgeDeterministic } from './judge/deterministic.js';
 import { judgeLlm } from './judge/llm.js';
 import { loadScenarios, SCENARIO_SETS, type Scenario } from './loader.js';
-import { withEvalLock } from './lock.js';
+import { releaseEvalLockIfOwned, withEvalLock } from './lock.js';
 import { makeRunId, writeReport, type Report, type ScenarioReportEntry } from './reporter.js';
 import { runScenarioTurn } from './runner.js';
 import { EVAL_THREAD_PREFIX } from './session.js';
@@ -28,6 +28,19 @@ import { runSweep, type SweepResult } from './sweep.js';
 interface ParsedArgs {
   scenarioSetName: string;
 }
+
+/**
+ * A full `pnpm eval run` invocation can span several scenarios, each up to
+ * `runScenarioTurn`'s own 5-minute default timeout — sometimes crossed twice
+ * over for one scenario (its own turn plus a cleanup turn, plus a separate
+ * judge turn for an `llmJudge` scenario). `lock.ts`'s own 30s default
+ * `staleMs` is sized for `documents.ts`'s sub-second critical sections, not
+ * this — a real multi-scenario run risks crossing it, which would let a
+ * second invocation reclaim this run's own still-live lock as abandoned.
+ * Sized generously rather than computed from the current scenario-set size,
+ * since this file has no visibility into how large a future set might grow.
+ */
+const RUN_LOCK_STALE_MS = 30 * 60 * 1000; // 30 minutes
 
 /**
  * Validates argv shape — exactly `["run", "<scenario-set-name>"]` — and that
@@ -119,7 +132,7 @@ export async function runOneScenario(scenario: Scenario, judgeAgentGroupId: stri
     }
   } else {
     try {
-      const judged = judgeDeterministic(turn.transcript, scenario.judging.check);
+      const judged = judgeDeterministic(turn.transcript, scenario.judging.check, scenario.id);
       entry = {
         id: scenario.id,
         status: 'completed',
@@ -251,7 +264,7 @@ export async function runCli(argv: string[]): Promise<Report> {
       const reportPath = writeReport(built);
       console.log(`Report written to ${reportPath}`);
       return built;
-    });
+    }, { staleMs: RUN_LOCK_STALE_MS });
   } finally {
     // Every eval container this invocation spawned (scenario + judge groups
     // alike) is torn down before the process exits, regardless of outcome —
@@ -266,7 +279,15 @@ export async function runCli(argv: string[]): Promise<Report> {
   }
 
   const allPassed = report.entries.length > 0 && report.entries.every((e) => e.passed);
-  process.exitCode = allPassed ? 0 : 1;
+  const anyCleanupFailed = report.entries.some((e) => e.cleanupError);
+  // A distinct exit code for "every verdict passed, but at least one
+  // scenario's cleanup didn't confirm success" (deferred-work.md finding) —
+  // an operator scripting on exit code alone previously had no way to tell
+  // this apart from a fully-clean run; `2` is deliberately never returned for
+  // an actual verdict failure (that's still `1`), so a caller checking
+  // `=== 0` for "fully clean" or `!== 0` for "something to look at" both
+  // still work unchanged.
+  process.exitCode = !allPassed ? 1 : anyCleanupFailed ? 2 : 0;
   return report;
 }
 
@@ -322,6 +343,12 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const handleInterrupt = (signal: 'SIGINT' | 'SIGTERM'): void => {
     console.error(`eval: received ${signal} — tearing down eval containers before exit`);
     killAllActiveContainers(`eval run interrupted (${signal})`, EVAL_CLI_ONESHOT_TOKEN);
+    // process.exit() below does not drain pending promises, so withEvalLock's
+    // own release logic (inside the in-flight runCli call, if any) never
+    // runs — release it here explicitly, synchronously, before exiting, so a
+    // later invocation isn't left waiting out RUN_LOCK_STALE_MS for a
+    // process that is already gone.
+    releaseEvalLockIfOwned();
     process.exit(signal === 'SIGINT' ? 130 : 143);
   };
   process.on('SIGINT', () => handleInterrupt('SIGINT'));
