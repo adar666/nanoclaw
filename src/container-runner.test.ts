@@ -220,8 +220,14 @@ describe('killAllActiveContainers', () => {
   it('kills every tracked container, not just the first', () => {
     const killA = vi.fn();
     const killB = vi.fn();
-    registerActiveContainerForTest('sess-a', { process: { kill: killA, once: vi.fn() } as never, containerName: 'container-a' });
-    registerActiveContainerForTest('sess-b', { process: { kill: killB, once: vi.fn() } as never, containerName: 'container-b' });
+    registerActiveContainerForTest('sess-a', {
+      process: { kill: killA, once: vi.fn() } as never,
+      containerName: 'container-a',
+    });
+    registerActiveContainerForTest('sess-b', {
+      process: { kill: killB, once: vi.fn() } as never,
+      containerName: 'container-b',
+    });
     expect(getActiveContainerCount()).toBe(2);
 
     killAllActiveContainers('multi-kill test', EVAL_CLI_ONESHOT_TOKEN);
