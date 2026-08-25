@@ -1428,15 +1428,22 @@ describe('save_document — refresh, rollback on partial failure inside the crit
     const originalPdfBytes = buildMinimalPdf('Original PDF text');
     await saveDocumentImpl({ path: writeInboxFile('report.pdf', originalPdfBytes) }, opts());
 
-    const conceptPath = path.join(baseDir, 'memory', 'documents', 'report.md');
-    const rawPath = path.join(baseDir, 'memory', 'documents', 'files', 'report.pdf');
+    const documentsDir = path.join(baseDir, 'memory', 'documents');
+    const conceptPath = path.join(documentsDir, 'report.md');
+    const rawPath = path.join(documentsDir, 'files', 'report.pdf');
+
     // Force the concept-file write specifically to fail, *after* the raw
-    // file has already been removed and replaced — read-only permissions on
-    // the concept file itself (not the directory) block only the write, not
-    // the reads resolveDocument needs to resolve this refresh in the first
-    // place, and doesn't trip the ambiguousExtensions guard the way
-    // planting a second raw-file path would.
-    fs.chmodSync(conceptPath, 0o444);
+    // file has already been replaced. The concept write is now temp-file-
+    // then-rename (spec-2 retro item 1) — a rename that replaces an
+    // existing path only needs write permission on its *directory*, not on
+    // the target file's own mode bits, so chmod'ing conceptPath itself (the
+    // old technique) would no longer block it. Making documentsDir itself
+    // read-only instead blocks *creating* the concept temp file there,
+    // while leaving files/ (a separate, still-writable subdirectory) —
+    // and the per-slug raw-file lock, which lives entirely outside
+    // documentsDir under baseDir/.document-raw-locks/ (spec-2 retro item 3)
+    // — untouched.
+    fs.chmodSync(documentsDir, 0o555);
 
     fs.mkdirSync(path.join(inboxDir, 'msg2'), { recursive: true });
     const editedPath = path.join(inboxDir, 'msg2', 'report-edited.pdf');
@@ -1444,16 +1451,20 @@ describe('save_document — refresh, rollback on partial failure inside the crit
 
     const result = await saveDocumentImpl({ path: editedPath, document: 'report' }, opts());
 
+    // Restore write perms immediately — every assertion/cleanup below must
+    // not itself be blocked by the same guard.
+    fs.chmodSync(documentsDir, 0o755);
+
     expect(result.isError).toBe(true);
     // The document is left no worse off than before the refresh started —
     // the raw file is restored at its original path with its original
     // bytes, not missing and not the (never-committed) edited content.
     expect(fs.existsSync(rawPath)).toBe(true);
     expect(fs.readFileSync(rawPath).equals(originalPdfBytes)).toBe(true);
-    // The concept file was never actually overwritten (still read-only, and
-    // still describes the original — the write that would have changed it
-    // is exactly what failed).
-    fs.chmodSync(conceptPath, 0o644); // restore write perms so this read isn't itself blocked oddly by an ACL quirk
+    // The concept file was never actually overwritten — its own
+    // temp-file-then-rename never got far enough to rename onto conceptPath
+    // (creating the temp file itself is what failed), so conceptPath still
+    // describes the original.
     const concept = fs.readFileSync(conceptPath, 'utf-8');
     expect(concept).toContain('Original PDF text');
     // The pre-refresh snapshot written before the failure is still safely
@@ -4744,5 +4755,98 @@ describe('list_document_versions — concurrent fills of the same document', () 
     const recordedPaths = history.map((e) => e.outputPath);
     expect(recordedPaths).toContain(p1);
     expect(recordedPaths).toContain(p2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// spec-2 retro (epic-2 cross-story hardening) — items 2/3/5
+// ---------------------------------------------------------------------------
+
+describe('list_document_versions — fill, then refresh, then fill again (spec-2 retro item 5)', () => {
+  it('reports all three entries in order, each labeled with the correct kind', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
+
+    const fill1 = await fillDocumentFieldImpl({ document: 'report', row: 1, value: 'first' }, opts());
+    expect(fill1.isError).toBeFalsy();
+    const fill1Path = extractOutPath(fill1.content[0].text);
+
+    fs.mkdirSync(path.join(inboxDir, 'msg2'), { recursive: true });
+    const editedPath = path.join(inboxDir, 'msg2', 'report-edited.docx');
+    fs.writeFileSync(editedPath, buildDocxWithTables([[['a1-new', 'b1-new']]]));
+    const refresh = await saveDocumentImpl({ path: editedPath, document: 'report' }, opts());
+    expect(refresh.isError).toBeFalsy();
+
+    const fill2 = await fillDocumentFieldImpl({ document: 'report', row: 1, value: 'second' }, opts());
+    expect(fill2.isError).toBeFalsy();
+    const fill2Path = extractOutPath(fill2.content[0].text);
+
+    const result = await listDocumentVersionsImpl({ document: 'report' }, opts());
+    expect(result.isError).toBeFalsy();
+    const text = result.content[0].text;
+
+    // Correct order: oldest to newest.
+    const idxFill1 = text.indexOf(fill1Path);
+    const idxSnapshot = text.indexOf('pre-refresh snapshot');
+    const idxFill2 = text.indexOf(fill2Path);
+    expect(idxFill1).toBeGreaterThan(-1);
+    expect(idxSnapshot).toBeGreaterThan(-1);
+    expect(idxFill2).toBeGreaterThan(-1);
+    expect(idxFill1).toBeLessThan(idxSnapshot);
+    expect(idxSnapshot).toBeLessThan(idxFill2);
+
+    // Each entry's line is labeled with the correct `kind` (spec-2 retro item 2).
+    const lines = text.split('\n');
+    const fill1Line = lines.find((l) => l.includes(fill1Path));
+    const snapshotLine = lines.find((l) => l.includes('pre-refresh snapshot'));
+    const fill2Line = lines.find((l) => l.includes(fill2Path));
+    expect(fill1Line).toContain('[fill]');
+    expect(snapshotLine).toContain('[pre-refresh snapshot]');
+    expect(fill2Line).toContain('[fill]');
+  });
+});
+
+describe('save_document — refresh racing a concurrent fill of the same document (spec-2 retro item 3/5)', () => {
+  it('neither call observes a torn/missing raw file; each result is internally self-consistent', async () => {
+    await saveDocumentImpl(
+      { path: writeInboxFile('report.docx', buildDocxWithTables([[['original-a', 'original-b']]])) },
+      opts(),
+    );
+
+    fs.mkdirSync(path.join(inboxDir, 'msg2'), { recursive: true });
+    const editedPath = path.join(inboxDir, 'msg2', 'report-edited.docx');
+    fs.writeFileSync(editedPath, buildDocxWithTables([[['refreshed-a', 'refreshed-b']]]));
+
+    // row 1 has a single row with two cells — fill_document_field with no
+    // "column" defaults to the row's *last* cell (b1), so the first cell
+    // (a1) is left untouched by the fill and still shows exactly which
+    // version (pre- or post-refresh) the fill's own snapshot read.
+    const [fillResult, refreshResult] = await Promise.all([
+      fillDocumentFieldImpl({ document: 'report', row: 1, value: 'FILLED' }, opts()),
+      saveDocumentImpl({ path: editedPath, document: 'report' }, opts()),
+    ]);
+
+    // Neither call ever observes a missing raw file (the per-slug lock from
+    // item 3 serializes the two operations; the atomic rename from item 1
+    // means the raw file is never absent mid-swap, only ever fully-old or
+    // fully-new) — no spurious "is missing" error from either side.
+    expect(refreshResult.isError).toBeFalsy();
+    expect(fillResult.isError).toBeFalsy();
+    expect(fillResult.content[0].text).not.toContain('is missing');
+
+    // The refresh always lands its own new content.
+    const concept = fs.readFileSync(path.join(baseDir, 'memory', 'documents', 'report.md'), 'utf-8');
+    expect(concept).toContain('refreshed-a');
+
+    // The fill's own output is internally self-consistent — its untouched
+    // first cell reflects either the pre-refresh or the post-refresh
+    // content, but never a mix of both (which would only be possible from a
+    // torn read mid-swap).
+    const outPath = extractOutPath(fillResult.content[0].text);
+    const filledXml = execFileSync('unzip', ['-p', outPath, 'word/document.xml']).toString('utf-8');
+    const filledText = docxXmlToText(filledXml);
+    const readOriginal = filledText.includes('original-a');
+    const readRefreshed = filledText.includes('refreshed-a');
+    expect(readOriginal || readRefreshed).toBe(true);
+    expect(readOriginal && readRefreshed).toBe(false);
   });
 });

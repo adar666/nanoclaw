@@ -275,6 +275,28 @@ function appendIndexLine(indexPath: string, line: string): void {
   fs.writeFileSync(indexPath, `${withTrailingNewline}${line}\n`);
 }
 
+/**
+ * Writes `data` to `finalPath` via a same-directory temp file + fs.renameSync
+ * — atomic at the filesystem level, so a process kill mid-write can only
+ * ever be observed as the fully-old or the fully-new content at
+ * `finalPath`, never a truncated/partial one. Mirrors recordFillHistory's
+ * own temp-then-rename pattern (spec 2-3) — save_document's refresh branch
+ * (spec 2-4) needed this exact same protection (spec-2 retro item 1): a
+ * process kill mid a direct `fs.writeFileSync` onto the live path (the
+ * previous approach, for both the new raw file and the concept file) would
+ * otherwise leave that file half-written, with no exception for any catch
+ * block to react to.
+ */
+function atomicWriteFileSync(finalPath: string, data: string | Buffer): void {
+  const dir = path.dirname(finalPath);
+  const tmpPath = path.join(
+    dir,
+    `.${path.basename(finalPath)}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+  );
+  fs.writeFileSync(tmpPath, data);
+  fs.renameSync(tmpPath, finalPath);
+}
+
 const DOCUMENTS_INDEX_TEMPLATE =
   '# Saved documents\n\n' +
   'Word/PDF documents saved via `save_document`. Each entry is an OKF\n' +
@@ -621,6 +643,18 @@ async function ocrPngText(pngPath: string, ocrOpts: { cacheDir: string }): Promi
     const moduleDir = path.dirname(fileURLToPath(import.meta.url));
     const workerPath = path.join(moduleDir, '..', '..', 'node_modules', 'tesseract.js', 'src', 'worker-script', 'node', 'index.js');
 
+    // Fail fast and specifically (spec-2 retro item 8) — without this check,
+    // an unexpected node_modules layout (this path is anchored relative to
+    // *this* file's own real location, per the comment block above) would
+    // otherwise only surface as a worker-thread failure after the full
+    // OCR_TIMEOUT_MS budget elapses, with a much less specific error.
+    if (!fs.existsSync(workerPath)) {
+      throw new Error(
+        `OCR worker script not found at ${workerPath} — tesseract.js's Node worker script is missing ` +
+          '(unexpected node_modules layout?).',
+      );
+    }
+
     fs.mkdirSync(ocrOpts.cacheDir, { recursive: true });
 
     const worker = await createWorker('eng+heb', undefined, { workerPath, cachePath: ocrOpts.cacheDir });
@@ -797,8 +831,11 @@ export async function saveDocumentImpl(
       if (resolution.kind === 'candidates') {
         log(`save_document: ${resolution.metas.length} candidates for document "${documentQuery}"`);
         return ok(
-          `Multiple saved documents match "${documentQuery}":\n${formatDocumentCandidates(resolution.metas)}\n\n` +
+          formatAmbiguousDocumentMatches(
+            documentQuery,
+            resolution.metas,
             'Call save_document again with document set to the exact slug (first column) to pick one.',
+          ),
         );
       }
       if (resolution.meta.ambiguousExtensions) {
@@ -933,7 +970,6 @@ export async function saveDocumentImpl(
     }
 
     ensureDocumentsScaffold(documentsDir, filesDir);
-    const lockPath = path.join(documentsDir, '.index.lock');
 
     // Discriminated result of the locked critical section below — the
     // refresh branch intentionally does NOT compose its final response text
@@ -946,8 +982,22 @@ export async function saveDocumentImpl(
       | { kind: 'refresh'; slug: string; snapshotPath: string }
       | { kind: 'fresh'; response: ReturnType<typeof ok> };
 
-    const lockResult = await withLock<SaveDocumentLockResult>(lockPath, () => {
-      if (refreshTarget) {
+    let lockResult: SaveDocumentLockResult;
+
+    if (refreshTarget) {
+      // Per-slug lock (spec-2 retro item 3) — deliberately NOT
+      // documentsDir/.index.lock. The raw-file-swap + concept-file-write
+      // below can be real, possibly-large I/O; holding the *shared* index
+      // lock for that whole duration used to stall every other document's
+      // concurrent fill/refresh in this group for no reason (that lock is
+      // only genuinely needed for index-wide concerns like the
+      // slug-uniqueness check the fresh-save branch below still does).
+      // fillOneDocument's own pre-fill snapshot-copy step locks this exact
+      // same per-slug path for the same slug, so a concurrent fill and
+      // refresh of THIS document still correctly serialize against each
+      // other — only *different* documents stop contending.
+      const rawLockPath = rawFileLockPath(opts.baseDir, refreshTarget.slug);
+      lockResult = await withLock<SaveDocumentLockResult>(rawLockPath, () => {
         // Re-check the refresh target immediately before mutating anything,
         // now that this call actually holds the lock (spec 2-4, item 7):
         // `refreshTarget` was resolved *before* the lock was acquired, so a
@@ -1014,13 +1064,42 @@ export async function saveDocumentImpl(
         // ("never lose the pre-refresh content irrecoverably") requires, and
         // it's already safely on disk before the lines below touch anything.
         try {
-          fs.rmSync(oldRawPath, { force: true });
-          fs.copyFileSync(resolvedPath, newRawPath);
+          // Crash-atomicity (spec-2 retro item 1): both the new raw file and
+          // the concept file are written via atomicWriteFileSync
+          // (temp-file-then-rename), not a direct fs.rmSync/copyFileSync/
+          // writeFileSync onto the live path. A process kill at any point
+          // during this block can therefore only ever be observed as the
+          // fully-old or the fully-new content at each of those two paths —
+          // never a missing raw file (the old rmSync-then-copyFileSync
+          // sequence had exactly that window) and never a truncated concept
+          // file. oldRawPath is only removed *after* newRawPath's rename has
+          // already landed the new content — so if the extension changed and
+          // this removal itself fails/crashes, the worst case is a harmless
+          // extra stale file (the existing, already-handled
+          // ambiguousExtensions case above), never an absent raw file.
+          atomicWriteFileSync(newRawPath, fs.readFileSync(resolvedPath));
+          if (newRawPath !== oldRawPath) {
+            try {
+              fs.rmSync(oldRawPath, { force: true });
+            } catch (rmError) {
+              log(
+                `refresh: could not remove stale raw file "${oldRawPath}" for "${slug}" after an extension ` +
+                  `change — it may now show up as an extra/ambiguous file until removed manually: ` +
+                  `${rmError instanceof Error ? rmError.message : String(rmError)}`,
+              );
+            }
+          }
 
           const { conceptBody } = buildConceptBody(displayName, slug, ext, bodyText, extractionNote);
-          // No 'wx' flag here (unlike the fresh-save branch below) — this call
-          // site legitimately overwrites an existing concept file in place.
-          fs.writeFileSync(conceptPath, conceptBody);
+          atomicWriteFileSync(conceptPath, conceptBody);
+          // Deliberately does NOT touch memory/index.md's existing entry for
+          // this document — spec-2-4's frozen Boundaries: "Never touch
+          // memory/index.md's existing entry shape or add a second entry for
+          // the same document," matching CAP-1's own non-goal that this line
+          // is a mechanical filename restatement, not a live-updated
+          // summary. Flagged as a possible bug by two different reviewers
+          // who lacked visibility into that frozen decision (spec-2 retro
+          // item 2) — it is intentional, not an oversight.
         } catch (e) {
           // Rollback (spec 2-4, item 1) — mirrors the fresh-save branch's own
           // rawWritten/conceptWritten rollback immediately below, adapted for
@@ -1033,7 +1112,7 @@ export async function saveDocumentImpl(
           // pre-refresh version stays recoverable via list_document_versions
           // even if this rollback itself partially fails.
           try {
-            fs.writeFileSync(oldRawPath, oldRawBytes);
+            atomicWriteFileSync(oldRawPath, oldRawBytes);
             if (newRawPath !== oldRawPath) {
               try {
                 fs.unlinkSync(newRawPath);
@@ -1052,55 +1131,63 @@ export async function saveDocumentImpl(
 
         log(`save_document: refreshed "${slug}" from "${originalFilename}"`);
         return { kind: 'refresh', slug, snapshotPath };
-      }
+      });
+    } else {
+      // Shared documentsDir/.index.lock stays reserved for genuine
+      // index-wide concerns (spec-2 retro item 3) — here, the
+      // slug-uniqueness check a fresh save still needs (uniqueSlug must be
+      // computed *inside* the lock; see the "concurrent saves that
+      // normalize to the SAME slug" regression test).
+      const lockPath = path.join(documentsDir, '.index.lock');
+      lockResult = await withLock<SaveDocumentLockResult>(lockPath, () => {
+        const slug = uniqueSlug(documentsDir, originalFilename);
+        const rawDestPath = path.join(filesDir, `${slug}.${ext}`);
+        const conceptPath = path.join(documentsDir, `${slug}.md`);
+        let rawWritten = false;
+        let conceptWritten = false;
 
-      const slug = uniqueSlug(documentsDir, originalFilename);
-      const rawDestPath = path.join(filesDir, `${slug}.${ext}`);
-      const conceptPath = path.join(documentsDir, `${slug}.md`);
-      let rawWritten = false;
-      let conceptWritten = false;
+        try {
+          fs.copyFileSync(resolvedPath, rawDestPath, fs.constants.COPYFILE_EXCL);
+          rawWritten = true;
 
-      try {
-        fs.copyFileSync(resolvedPath, rawDestPath, fs.constants.COPYFILE_EXCL);
-        rawWritten = true;
+          const { conceptBody, savedDate, description } = buildConceptBody(originalFilename, slug, ext, bodyText, extractionNote);
+          fs.writeFileSync(conceptPath, conceptBody, { flag: 'wx' });
+          conceptWritten = true;
 
-        const { conceptBody, savedDate, description } = buildConceptBody(originalFilename, slug, ext, bodyText, extractionNote);
-        fs.writeFileSync(conceptPath, conceptBody, { flag: 'wx' });
-        conceptWritten = true;
+          const indexPath = path.join(memoryDir, 'index.md');
+          appendIndexLine(
+            indexPath,
+            // stripControlChars first: a raw newline in `description` would
+            // otherwise turn this single appended entry into multiple
+            // physical lines in memory/index.md.
+            `- [${escapeMarkdown(stripControlChars(description))}](documents/${slug}.md) - saved document, ${savedDate}`,
+          );
 
-        const indexPath = path.join(memoryDir, 'index.md');
-        appendIndexLine(
-          indexPath,
-          // stripControlChars first: a raw newline in `description` would
-          // otherwise turn this single appended entry into multiple
-          // physical lines in memory/index.md.
-          `- [${escapeMarkdown(stripControlChars(description))}](documents/${slug}.md) - saved document, ${savedDate}`,
-        );
-
-        log(`save_document: saved "${originalFilename}" as "${slug}"`);
-        return { kind: 'fresh', response: ok(`Saved "${originalFilename}" to memory as "${slug}". Recorded in memory/documents/${slug}.md.`) };
-      } catch (e) {
-        // Partial failure — a raw copy or concept file already landed with
-        // no complete, consistent entry to show for it. Roll back whatever
-        // succeeded so a retry doesn't hit a permanent EEXIST on the same
-        // slug, and so memory never shows a half-written document.
-        if (conceptWritten) {
-          try {
-            fs.unlinkSync(conceptPath);
-          } catch {
-            // best effort
+          log(`save_document: saved "${originalFilename}" as "${slug}"`);
+          return { kind: 'fresh', response: ok(`Saved "${originalFilename}" to memory as "${slug}". Recorded in memory/documents/${slug}.md.`) };
+        } catch (e) {
+          // Partial failure — a raw copy or concept file already landed with
+          // no complete, consistent entry to show for it. Roll back whatever
+          // succeeded so a retry doesn't hit a permanent EEXIST on the same
+          // slug, and so memory never shows a half-written document.
+          if (conceptWritten) {
+            try {
+              fs.unlinkSync(conceptPath);
+            } catch {
+              // best effort
+            }
           }
-        }
-        if (rawWritten) {
-          try {
-            fs.unlinkSync(rawDestPath);
-          } catch {
-            // best effort
+          if (rawWritten) {
+            try {
+              fs.unlinkSync(rawDestPath);
+            } catch {
+              // best effort
+            }
           }
+          throw e;
         }
-        throw e;
-      }
-    });
+      });
+    }
 
     let response: ReturnType<typeof ok> | ReturnType<typeof err>;
     if (lockResult.kind === 'refresh') {
@@ -1117,6 +1204,7 @@ export async function saveDocumentImpl(
           timestamp: new Date().toISOString(),
           outputPath: lockResult.snapshotPath,
           target: 'pre-refresh snapshot',
+          kind: 'pre-refresh-snapshot',
         });
         historyRecorded = true;
       } catch (e) {
@@ -1490,6 +1578,22 @@ function formatDocumentCandidates(metas: DocumentMeta[]): string {
   return metas
     .map((m, i) => `${i + 1}. ${m.slug} — ${m.sourceFilename}${m.description ? ` (${m.description})` : ''}`)
     .join('\n');
+}
+
+/**
+ * Shared "Multiple saved documents match" ambiguous-resolution message
+ * (spec-2 retro item 6) — every tool that resolves a free-text `document`
+ * query to exactly one saved document via resolveDocument, and needs to
+ * relay a 2+-match candidate list back to the agent instead of erroring
+ * (AD-7), used to retype this exact template three times (save_document's
+ * refresh branch, fill_document_field, list_document_versions). One source
+ * of truth now; `retryInstruction` carries each call site's own exact
+ * retry phrasing — they differ slightly (e.g. save_document's `document`
+ * argument is optional everywhere else it's required, so its instruction
+ * spells that out).
+ */
+function formatAmbiguousDocumentMatches(query: string, metas: DocumentMeta[], retryInstruction: string): string {
+  return `Multiple saved documents match "${query}":\n${formatDocumentCandidates(metas)}\n\n${retryInstruction}`;
 }
 
 type DocumentResolution =
@@ -2009,6 +2113,19 @@ interface FillHistoryEntry {
   timestamp: string;
   outputPath: string;
   target: string;
+  /**
+   * Distinguishes a real fill_document_field(_batch) output from a
+   * save_document refresh's pre-refresh raw-file snapshot (spec-2 retro
+   * item 2) — both share this exact same per-slug index, but a consumer
+   * (list_document_versions) needs a structured way to tell them apart
+   * rather than relying on the free-text `target` field to imply it.
+   * fillOneDocument writes 'fill'; saveDocumentImpl's refresh branch writes
+   * 'pre-refresh-snapshot'. Entries written before this field existed have
+   * none at all — readFillHistory below normalizes those to 'fill' (every
+   * one of them genuinely was, since the refresh feature and this field
+   * shipped together).
+   */
+  kind: 'fill' | 'pre-refresh-snapshot';
 }
 
 function fillHistoryDir(baseDir: string): string {
@@ -2017,6 +2134,34 @@ function fillHistoryDir(baseDir: string): string {
 
 function fillHistoryPath(baseDir: string, slug: string): string {
   return path.join(fillHistoryDir(baseDir), `${slug}.json`);
+}
+
+/**
+ * Per-slug lock guarding a document's raw-file mutation (spec-2 retro item
+ * 3) — shared between save_document's refresh branch and fillOneDocument's
+ * own pre-fill snapshot copy, so a concurrent fill and refresh of the SAME
+ * document still correctly serialize against each other, while fills/
+ * refreshes of DIFFERENT documents in the same group no longer contend on
+ * the shared documentsDir/.index.lock at all.
+ *
+ * Deliberately its OWN scratch directory (`.document-raw-locks/`, a sibling
+ * of `.document-fills/`/`.document-renders/`/`.ocr-cache/`/`.fill-tmp/`
+ * directly under `baseDir`) rather than living inside
+ * `memory/documents/.fill-history/` alongside recordFillHistory's own
+ * per-slug lock — that directory is a different critical section (the JSON
+ * history index, not the raw file), and coupling the two would mean
+ * anything that blocks fill-history's directory (a stray file at that
+ * path, its own permission state) also blocks acquiring this lock and
+ * therefore the fill/refresh itself, not just history recording.
+ */
+function rawFileLockDir(baseDir: string): string {
+  return path.join(baseDir, '.document-raw-locks');
+}
+
+function rawFileLockPath(baseDir: string, slug: string): string {
+  const dir = rawFileLockDir(baseDir);
+  fs.mkdirSync(dir, { recursive: true });
+  return path.join(dir, `${slug}.lock`);
 }
 
 /**
@@ -2049,19 +2194,31 @@ function readFillHistory(baseDir: string, slug: string): FillHistoryEntry[] {
       log(`fill history for "${slug}" is not a JSON array — ignoring corrupted index, treating as empty`);
       return [];
     }
-    const valid = parsed.filter((e): e is FillHistoryEntry => {
+    // Validated but not yet kind-normalized — see the map() below (spec-2
+    // retro item 2: backward compat for entries written before `kind`
+    // existed).
+    const validRaw = parsed.filter((e): e is Record<string, unknown> => {
       if (e === null || typeof e !== 'object') return false;
       const candidate = e as Record<string, unknown>;
       return (
         typeof candidate.timestamp === 'string' &&
+        // spec-2 retro item 7: a syntactically-string timestamp that isn't
+        // actually a parseable date (same malformed-entry risk as a bad
+        // outputPath/target) must not sneak through as "valid".
+        !isNaN(Date.parse(candidate.timestamp)) &&
         typeof candidate.outputPath === 'string' &&
         typeof candidate.target === 'string'
       );
     });
-    if (valid.length < parsed.length) {
-      log(`fill history for "${slug}" had ${parsed.length - valid.length} malformed entr(y/ies) — dropped, keeping the rest`);
+    if (validRaw.length < parsed.length) {
+      log(`fill history for "${slug}" had ${parsed.length - validRaw.length} malformed entr(y/ies) — dropped, keeping the rest`);
     }
-    return valid;
+    return validRaw.map((candidate) => ({
+      timestamp: candidate.timestamp as string,
+      outputPath: candidate.outputPath as string,
+      target: candidate.target as string,
+      kind: candidate.kind === 'pre-refresh-snapshot' ? 'pre-refresh-snapshot' : 'fill',
+    }));
   } catch (e) {
     log(`fill history for "${slug}" is not valid JSON — ignoring corrupted index, treating as empty: ${e instanceof Error ? e.message : String(e)}`);
     return [];
@@ -2070,10 +2227,16 @@ function readFillHistory(baseDir: string, slug: string): FillHistoryEntry[] {
 
 /**
  * Appends one entry to a document's fill-history index, capped at
- * FILL_HISTORY_CAP (oldest dropped first). Called once per *completed*
- * fill only — see fillOneDocument's FILL_SUCCESS_MARKER-gated call site
- * below; a discovery/prompt response or a per-item batch failure never
- * reaches this function at all.
+ * FILL_HISTORY_CAP (oldest dropped first). Two independent call sites, each
+ * with its own contract — this function itself is agnostic to which one is
+ * calling (spec-2 retro item 2 — this docstring used to name only the
+ * first, written before the second one existed):
+ *   - fillOneDocument's FILL_SUCCESS_MARKER-gated call site (`kind: 'fill'`)
+ *     — called once per *completed* fill only; a discovery/prompt response
+ *     or a per-item batch failure never reaches this function at all.
+ *   - saveDocumentImpl's refresh branch (`kind: 'pre-refresh-snapshot'`,
+ *     spec 2-4) — called directly, once per completed refresh, entirely
+ *     bypassing fillOneDocument's gating (a refresh is not a fill).
  *
  * The actual write is temp-file-then-rename, not a direct
  * fs.writeFileSync onto the live path: a process kill/crash mid-write to
@@ -3344,28 +3507,40 @@ async function fillOneDocument(
   const rawPath = path.join(filesDir, `${meta.slug}.${meta.ext}`);
 
   // Concurrency (spec 2-4, item 4): save_document's refresh path mutates a
-  // document's raw file (rmSync, then copyFileSync — sometimes onto this
-  // exact same path) while holding this same documentsDir's `.index.lock`.
-  // Reading `rawPath` here without that same lock could observe a
-  // transient "just removed, not yet replaced" state, or in principle a
-  // torn file mid-copy. Snapshot the current bytes into a private temp
-  // copy while briefly holding that lock, then let fillDocx/fillDoc/fillPdf
-  // read from that immutable copy exactly as they'd read from `rawPath` —
-  // none of them care about the path's identity, only its bytes, so this
-  // needs no change to any of their own internals. The lock's *duration*
-  // only needs to cover this one copy, not the whole (potentially slow)
-  // fill/stamp pipeline below.
-  const documentsDir = path.join(opts.baseDir, 'memory', 'documents');
-  const lockPath = path.join(documentsDir, '.index.lock');
+  // document's raw file while holding a lock on this exact same path
+  // (spec-2 retro item 3: a per-slug lock, not the shared
+  // documentsDir/.index.lock — see rawFileLockPath). Reading `rawPath` here
+  // without that same lock could observe a transient inconsistent state, or
+  // in principle a torn file mid-copy. Snapshot the current bytes into a
+  // private temp copy while briefly holding that same per-slug lock, then
+  // let fillDocx/fillDoc/fillPdf read from that immutable copy exactly as
+  // they'd read from `rawPath` — none of them care about the path's
+  // identity, only its bytes, so this needs no change to any of their own
+  // internals. The lock's *duration* only needs to cover this one copy, not
+  // the whole (potentially slow) fill/stamp pipeline below — and, since
+  // it's now a per-slug lock, a concurrent fill/refresh of a *different*
+  // document never waits on it at all.
+  const lockPath = rawFileLockPath(opts.baseDir, meta.slug);
   let snapshotRawPath: string;
   try {
     snapshotRawPath = await withLock(lockPath, () => {
       if (!fs.existsSync(rawPath)) {
         throw new Error(`Saved raw file for "${meta.slug}" is missing.`);
       }
+      // Snapshot copy lives under this agent group's own baseDir
+      // (.fill-tmp/), not os.tmpdir() (spec-2 retro item 4) — this
+      // codebase's standing convention for a group's own scratch data
+      // (.document-fills/, .document-renders/, .ocr-cache/ do the same).
+      // Contrast fillDoc's own scratchDir just below, which deliberately
+      // stays on a true ephemeral os.tmpdir() location for a different,
+      // still-valid reason (a LibreOffice profile dir must never be
+      // orphaned permanently in durable group storage) — that one is out
+      // of scope here.
+      const fillTmpDir = path.join(opts.baseDir, '.fill-tmp');
+      fs.mkdirSync(fillTmpDir, { recursive: true });
       const tmp = path.join(
-        os.tmpdir(),
-        `nanoclaw-fill-read-${meta.slug}-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${meta.ext}`,
+        fillTmpDir,
+        `${meta.slug}-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${meta.ext}`,
       );
       fs.copyFileSync(rawPath, tmp);
       return tmp;
@@ -3398,6 +3573,7 @@ async function fillOneDocument(
             timestamp: new Date().toISOString(),
             outputPath,
             target: describeFillTarget(args),
+            kind: 'fill',
           });
         } catch (e) {
           // Best-effort: a fill-history write failure must never mask an
@@ -3421,7 +3597,7 @@ async function fillOneDocument(
     try {
       fs.unlinkSync(snapshotRawPath);
     } catch {
-      // Best effort — a leftover temp read-copy under os.tmpdir() is
+      // Best effort — a leftover temp read-copy under .fill-tmp/ is
       // harmless and never surfaced to the user.
     }
   }
@@ -3447,8 +3623,11 @@ export async function fillDocumentFieldImpl(
     if (resolution.kind === 'candidates') {
       log(`fill_document_field: ${resolution.metas.length} candidates for document "${documentQuery}"`);
       return ok(
-        `Multiple saved documents match "${documentQuery}":\n${formatDocumentCandidates(resolution.metas)}\n\n` +
+        formatAmbiguousDocumentMatches(
+          documentQuery,
+          resolution.metas,
           'Call fill_document_field again with the exact slug (first column) to pick one.',
+        ),
       );
     }
 
@@ -3869,12 +4048,14 @@ export const saveDocument: McpToolDefinition = {
 
 // ---------------------------------------------------------------------------
 // list_document_versions (spec 2-3) — reads the per-document fill-history
-// index fillOneDocument writes to, filters out any entry whose output file
-// no longer exists on disk, and reports the rest oldest to newest. This
-// tool never sends anything itself and never deletes/restores anything —
-// the agent relays a chosen entry's outputPath to the existing send_file
-// tool exactly as it already does after a fresh fill (no new "restore"
-// tool, no new delivery mechanism).
+// index, filters out any entry whose output file no longer exists on disk,
+// and reports the rest oldest to newest. Two independent writers share this
+// same index (spec-2 retro item 2): fillOneDocument (kind: 'fill') and
+// save_document's refresh branch (kind: 'pre-refresh-snapshot', spec 2-4).
+// This tool never sends anything itself and never deletes/restores
+// anything — the agent relays a chosen entry's outputPath to the existing
+// send_file tool exactly as it already does after a fresh fill (no new
+// "restore" tool, no new delivery mechanism).
 // ---------------------------------------------------------------------------
 
 interface ListDocumentVersionsOpts {
@@ -3903,8 +4084,11 @@ export async function listDocumentVersionsImpl(
     if (resolution.kind === 'candidates') {
       log(`list_document_versions: ${resolution.metas.length} candidates for document "${documentQuery}"`);
       return ok(
-        `Multiple saved documents match "${documentQuery}":\n${formatDocumentCandidates(resolution.metas)}\n\n` +
+        formatAmbiguousDocumentMatches(
+          documentQuery,
+          resolution.metas,
           'Call list_document_versions again with the exact slug (first column) to pick one.',
+        ),
       );
     }
 
@@ -3926,9 +4110,16 @@ export async function listDocumentVersionsImpl(
     // this) — only the display here renders in the install timezone, per
     // CLAUDE.md's Timestamps convention (formatLocalTime/TIMEZONE, same
     // helper calendar.ts already uses for its own agent-facing text).
-    const lines = history.map(
-      (entry, i) => `${i + 1}. ${formatLocalTime(entry.timestamp, TIMEZONE)} — ${entry.target} — ${entry.outputPath}`,
-    );
+    //
+    // Each line is now labeled with its `kind` (spec-2 retro item 2) — this
+    // index no longer holds only real fill_document_field(_batch) outputs;
+    // a save_document refresh's pre-refresh snapshot lands here too (same
+    // per-slug index), and a reader shouldn't have to infer which is which
+    // from the free-text `target` field alone.
+    const lines = history.map((entry, i) => {
+      const kindLabel = entry.kind === 'pre-refresh-snapshot' ? 'pre-refresh snapshot' : 'fill';
+      return `${i + 1}. [${kindLabel}] ${formatLocalTime(entry.timestamp, TIMEZONE)} — ${entry.target} — ${entry.outputPath}`;
+    });
     log(`list_document_versions: ${history.length} entries for "${slug}"`);
     return ok(
       `Fill history for "${slug}" (oldest to newest):\n${lines.join('\n')}\n\n` +
@@ -3943,15 +4134,17 @@ export const listDocumentVersions: McpToolDefinition = {
   tool: {
     name: 'list_document_versions',
     description:
-      'List the fill history of a document already saved via save_document — every completed ' +
-      'fill_document_field/fill_document_field_batch output that is still on disk, oldest to newest, each with a ' +
-      'timestamp, a short description of what was filled (e.g. "row 2", "fieldName: Date"), and its output path. ' +
-      'Use this to find and resend an earlier fill (an "undo") — pass the chosen output path directly to the ' +
-      'existing send_file tool; this tool never sends or deletes anything itself. Capped at the 20 most recent ' +
-      'fills per document; an entry whose output file was manually deleted is silently dropped from the list. A ' +
-      'document that was only ever saved/discovery-called (never actually filled) reports an empty history, not ' +
-      'an error. If "document" matches more than one saved document, returns a numbered candidate list instead ' +
-      '(same handshake as list_documents/fill_document_field).',
+      'List the version history of a document already saved via save_document, oldest to newest, each entry ' +
+      'labeled with its kind: a completed fill_document_field/fill_document_field_batch output ("fill"), or a ' +
+      'save_document refresh\'s snapshot of the document as it was right before that refresh overwrote it ' +
+      '("pre-refresh snapshot") — both share this same history index. Every entry still on disk gets a timestamp, ' +
+      'a short description (e.g. "row 2", "fieldName: Date" for a fill; "pre-refresh snapshot" for a refresh), and ' +
+      'its output path. Use this to find and resend an earlier version (an "undo") — pass the chosen output path ' +
+      'directly to the existing send_file tool; this tool never sends or deletes anything itself. Capped at the 20 ' +
+      'most recent entries per document; an entry whose output file was manually deleted is silently dropped from ' +
+      'the list. A document that was only ever saved/discovery-called (never filled or refreshed) reports an empty ' +
+      'history, not an error. If "document" matches more than one saved document, returns a numbered candidate ' +
+      'list instead (same handshake as list_documents/fill_document_field).',
     inputSchema: {
       type: 'object' as const,
       properties: {
