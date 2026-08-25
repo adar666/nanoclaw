@@ -35,7 +35,7 @@ project_key: NOKEY
 tracking_system: file-system
 story_location: _bmad-output/implementation-artifacts
 development_status:
-  epic-1: backlog
+  epic-1: done
   1-2-create-an-event-on-uriel-s-or-devorah-s-calendar: done
   1-3-read-your-own-calendar: done
   1-5-update-an-event-on-uriel-s-or-devorah-s-calendar: done
