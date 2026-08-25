@@ -46,11 +46,11 @@ development_status:
   1-8-stamp-a-saved-signature-into-a-saved-docx: done
   epic-1-retrospective: done
 
-  epic-2: in-progress
-  2-1-ocr-fallback-for-scanned-pdfs: review
-  2-2-multi-file-batch-fill-operations: review
-  2-3-version-history-undo-for-edited-documents: review
-  2-4-auto-refresh-stored-raw-extracted-text-after-an-edit: review
+  epic-2: done
+  2-1-ocr-fallback-for-scanned-pdfs: done
+  2-2-multi-file-batch-fill-operations: done
+  2-3-version-history-undo-for-edited-documents: done
+  2-4-auto-refresh-stored-raw-extracted-text-after-an-edit: done
   epic-2-retrospective: optional
 action_items:
   - id: "epic-1-retro-item-1-add-log-calls-to-list_documents-fill_doc"
