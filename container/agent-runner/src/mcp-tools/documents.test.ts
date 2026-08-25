@@ -1147,6 +1147,14 @@ function diffMiddle(original: string, modified: string): { before: string; after
   };
 }
 
+/** Extracts the output path from a `list_document_versions` entry line (`N. <timestamp> — <target> — <path>`). */
+function extractVersionPath(text: string, target: string): string {
+  const line = text.split('\n').find((l) => l.includes(` — ${target} — `));
+  if (!line) throw new Error(`No "${target}" entry found in list_document_versions text: ${text}`);
+  const idx = line.lastIndexOf(' — ');
+  return line.slice(idx + 3).trim();
+}
+
 function extractOutPath(text: string): string {
   const m = /New file at (.+?) — call send_file/.exec(text);
   if (!m) throw new Error(`No output path found in response: ${text}`);
@@ -1220,6 +1228,425 @@ function buildMultilineTextPdf(lines: string[]): Buffer {
 
   return Buffer.from(parts.join(''), 'latin1');
 }
+
+// ---------------------------------------------------------------------------
+// save_document — refresh (spec 2-4)
+// ---------------------------------------------------------------------------
+
+describe('save_document tool metadata — document argument (spec 2-4)', () => {
+  it('declares document as an optional property, not required', () => {
+    const schema = saveDocument.tool.inputSchema as { properties: Record<string, unknown>; required: string[] };
+    expect(schema.properties.document).toBeDefined();
+    expect(schema.required).toEqual(['path']);
+  });
+});
+
+describe('save_document — refresh, unambiguous match', () => {
+  it('overwrites the raw file + concept body in place, same slug, no new document created', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocx(['Original content'])) }, opts());
+
+    fs.mkdirSync(path.join(inboxDir, 'msg2'), { recursive: true });
+    const editedPath = path.join(inboxDir, 'msg2', 'report-edited.docx');
+    fs.writeFileSync(editedPath, buildDocx(['Edited content']));
+
+    const result = await saveDocumentImpl({ path: editedPath, document: 'report' }, opts());
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('report');
+
+    // Same slug — no new document/concept file created for this refresh.
+    expect(fs.existsSync(path.join(baseDir, 'memory', 'documents', 'report-2.md'))).toBe(false);
+
+    const concept = fs.readFileSync(path.join(baseDir, 'memory', 'documents', 'report.md'), 'utf-8');
+    expect(concept).toContain('Edited content');
+    expect(concept).not.toContain('Original content');
+
+    const rawFile = path.join(baseDir, 'memory', 'documents', 'files', 'report.docx');
+    expect(fs.readFileSync(rawFile).equals(fs.readFileSync(editedPath))).toBe(true);
+  });
+
+  it('leaves memory/index.md byte-identical — no new entry, no rewritten line', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocx(['Original content'])) }, opts());
+    const indexBefore = fs.readFileSync(path.join(baseDir, 'memory', 'index.md'), 'utf-8');
+
+    fs.mkdirSync(path.join(inboxDir, 'msg2'), { recursive: true });
+    const editedPath = path.join(inboxDir, 'msg2', 'report-edited.docx');
+    fs.writeFileSync(editedPath, buildDocx(['Edited content']));
+    await saveDocumentImpl({ path: editedPath, document: 'report' }, opts());
+
+    const indexAfter = fs.readFileSync(path.join(baseDir, 'memory', 'index.md'), 'utf-8');
+    expect(indexAfter).toBe(indexBefore);
+  });
+});
+
+describe('save_document — document omitted, unchanged today\'s behavior', () => {
+  it('still creates a new, separately-slugged document even when a same-named one already exists', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocx(['First'])) }, opts());
+    fs.mkdirSync(path.join(inboxDir, 'msg2'), { recursive: true });
+    const secondPath = path.join(inboxDir, 'msg2', 'report.docx');
+    fs.writeFileSync(secondPath, buildDocx(['Second']));
+
+    const result = await saveDocumentImpl({ path: secondPath }, opts());
+
+    expect(result.isError).toBeFalsy();
+    expect(fs.existsSync(path.join(baseDir, 'memory', 'documents', 'report.md'))).toBe(true);
+    expect(fs.existsSync(path.join(baseDir, 'memory', 'documents', 'report-2.md'))).toBe(true);
+    const first = fs.readFileSync(path.join(baseDir, 'memory', 'documents', 'report.md'), 'utf-8');
+    expect(first).toContain('First');
+  });
+});
+
+describe('save_document — refresh, document matches nothing', () => {
+  it('errors, writes nothing', async () => {
+    const filePath = writeInboxFile('report.docx', buildDocx(['New content']));
+
+    const result = await saveDocumentImpl({ path: filePath, document: 'nonexistent' }, opts());
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('nonexistent');
+    expect(fs.existsSync(path.join(baseDir, 'memory', 'documents'))).toBe(false);
+  });
+});
+
+describe('save_document — refresh, document matches more than one saved document', () => {
+  it('returns a numbered candidate list (not an error) and writes nothing', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('Report A.docx', buildDocx(['A'])) }, opts());
+    await saveDocumentImpl({ path: writeInboxFile('Report B.docx', buildDocx(['B'])) }, opts());
+
+    fs.mkdirSync(path.join(inboxDir, 'msg2'), { recursive: true });
+    const editedPath = path.join(inboxDir, 'msg2', 'edited.docx');
+    fs.writeFileSync(editedPath, buildDocx(['Edited']));
+
+    const result = await saveDocumentImpl({ path: editedPath, document: 'report' }, opts());
+
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('report-a');
+    expect(result.content[0].text).toContain('report-b');
+
+    // Nothing was overwritten or newly created.
+    const conceptA = fs.readFileSync(path.join(baseDir, 'memory', 'documents', 'report-a.md'), 'utf-8');
+    const conceptB = fs.readFileSync(path.join(baseDir, 'memory', 'documents', 'report-b.md'), 'utf-8');
+    expect(conceptA).toContain('A');
+    expect(conceptB).toContain('B');
+    expect(fs.existsSync(path.join(baseDir, 'memory', 'documents', 'edited.md'))).toBe(false);
+  });
+});
+
+describe('save_document — refresh, document must be a string', () => {
+  it('rejects a non-string document argument', async () => {
+    const filePath = writeInboxFile('report.docx', buildDocx(['content']));
+    const result = await saveDocumentImpl({ path: filePath, document: 42 }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('document must be a string');
+  });
+});
+
+describe('save_document — refresh, pre-refresh raw file is snapshotted into fill-history', () => {
+  it('is recoverable via list_document_versions, with the exact pre-refresh bytes', async () => {
+    const originalBytes = buildDocx(['Original content']);
+    await saveDocumentImpl({ path: writeInboxFile('report.docx', originalBytes) }, opts());
+
+    fs.mkdirSync(path.join(inboxDir, 'msg2'), { recursive: true });
+    const editedPath = path.join(inboxDir, 'msg2', 'report-edited.docx');
+    fs.writeFileSync(editedPath, buildDocx(['Edited content']));
+    await saveDocumentImpl({ path: editedPath, document: 'report' }, opts());
+
+    const versions = await listDocumentVersionsImpl({ document: 'report' }, opts());
+    expect(versions.isError).toBeFalsy();
+    expect(versions.content[0].text).toContain('pre-refresh snapshot');
+
+    const snapshotPath = extractVersionPath(versions.content[0].text, 'pre-refresh snapshot');
+    expect(fs.existsSync(snapshotPath)).toBe(true);
+    expect(fs.readFileSync(snapshotPath).equals(originalBytes)).toBe(true);
+  });
+});
+
+describe('save_document — refresh, a second fill afterward compounds on the refreshed content', () => {
+  it('fill_document_field operates on the refreshed document, not the pre-refresh original', async () => {
+    await saveDocumentImpl(
+      { path: writeInboxFile('report.docx', buildDocxWithTables([[['Name:', 'orig1'], ['Date:', 'orig2']]])) },
+      opts(),
+    );
+
+    const fill1 = await fillDocumentFieldImpl({ document: 'report', row: 1, value: 'FirstValue' }, opts());
+    expect(fill1.isError).toBeFalsy();
+    const fill1Path = extractOutPath(fill1.content[0].text);
+
+    const refresh = await saveDocumentImpl({ path: fill1Path, document: 'report' }, opts());
+    expect(refresh.isError).toBeFalsy();
+
+    const fill2 = await fillDocumentFieldImpl({ document: 'report', row: 2, value: 'SecondValue' }, opts());
+    expect(fill2.isError).toBeFalsy();
+    const fill2Path = extractOutPath(fill2.content[0].text);
+
+    const finalXml = await readDocxXml(fs.readFileSync(fill2Path));
+    // Both edits are present — row 1's edit survived because the second fill
+    // ran against the refreshed (already-edited) raw file, not the
+    // pre-refresh original (which never had "FirstValue" in it at all).
+    expect(finalXml).toContain('FirstValue');
+    expect(finalXml).toContain('SecondValue');
+  });
+});
+
+describe('save_document — refresh, source file type differs from the original', () => {
+  it('changes the raw file\'s extension, updates the raw-file frontmatter pointer, and snapshots the old-extension file', async () => {
+    const originalPdfBytes = buildMinimalPdf('Original PDF text');
+    await saveDocumentImpl({ path: writeInboxFile('report.pdf', originalPdfBytes) }, opts());
+    expect(fs.existsSync(path.join(baseDir, 'memory', 'documents', 'files', 'report.pdf'))).toBe(true);
+    const indexBefore = fs.readFileSync(path.join(baseDir, 'memory', 'index.md'), 'utf-8');
+
+    fs.mkdirSync(path.join(inboxDir, 'msg2'), { recursive: true });
+    const editedPath = path.join(inboxDir, 'msg2', 'report-edited.docx');
+    fs.writeFileSync(editedPath, buildDocx(['Edited docx content']));
+
+    const result = await saveDocumentImpl({ path: editedPath, document: 'report' }, opts());
+    expect(result.isError).toBeFalsy();
+
+    // memory/index.md is untouched by a cross-extension refresh too — same
+    // invariant already covered for the same-extension case above.
+    const indexAfter = fs.readFileSync(path.join(baseDir, 'memory', 'index.md'), 'utf-8');
+    expect(indexAfter).toBe(indexBefore);
+
+    // Old-extension raw file is gone; new-extension raw file holds the new content.
+    expect(fs.existsSync(path.join(baseDir, 'memory', 'documents', 'files', 'report.pdf'))).toBe(false);
+    const newRaw = path.join(baseDir, 'memory', 'documents', 'files', 'report.docx');
+    expect(fs.existsSync(newRaw)).toBe(true);
+    expect(fs.readFileSync(newRaw).equals(fs.readFileSync(editedPath))).toBe(true);
+
+    const concept = fs.readFileSync(path.join(baseDir, 'memory', 'documents', 'report.md'), 'utf-8');
+    expect(concept).toContain('raw-file: "files/report.docx"');
+    expect(concept).toContain('Edited docx content');
+
+    // The old .pdf is still recoverable through the snapshot, not just deleted outright.
+    const versions = await listDocumentVersionsImpl({ document: 'report' }, opts());
+    const snapshotPath = extractVersionPath(versions.content[0].text, 'pre-refresh snapshot');
+    expect(fs.readFileSync(snapshotPath).equals(originalPdfBytes)).toBe(true);
+  });
+});
+
+describe('save_document — refresh, rollback on partial failure inside the critical section', () => {
+  it('restores the pre-refresh raw file if the concept-file write throws after the raw file was already replaced', async () => {
+    const originalPdfBytes = buildMinimalPdf('Original PDF text');
+    await saveDocumentImpl({ path: writeInboxFile('report.pdf', originalPdfBytes) }, opts());
+
+    const conceptPath = path.join(baseDir, 'memory', 'documents', 'report.md');
+    const rawPath = path.join(baseDir, 'memory', 'documents', 'files', 'report.pdf');
+    // Force the concept-file write specifically to fail, *after* the raw
+    // file has already been removed and replaced — read-only permissions on
+    // the concept file itself (not the directory) block only the write, not
+    // the reads resolveDocument needs to resolve this refresh in the first
+    // place, and doesn't trip the ambiguousExtensions guard the way
+    // planting a second raw-file path would.
+    fs.chmodSync(conceptPath, 0o444);
+
+    fs.mkdirSync(path.join(inboxDir, 'msg2'), { recursive: true });
+    const editedPath = path.join(inboxDir, 'msg2', 'report-edited.pdf');
+    fs.writeFileSync(editedPath, buildMinimalPdf('Edited PDF text'));
+
+    const result = await saveDocumentImpl({ path: editedPath, document: 'report' }, opts());
+
+    expect(result.isError).toBe(true);
+    // The document is left no worse off than before the refresh started —
+    // the raw file is restored at its original path with its original
+    // bytes, not missing and not the (never-committed) edited content.
+    expect(fs.existsSync(rawPath)).toBe(true);
+    expect(fs.readFileSync(rawPath).equals(originalPdfBytes)).toBe(true);
+    // The concept file was never actually overwritten (still read-only, and
+    // still describes the original — the write that would have changed it
+    // is exactly what failed).
+    fs.chmodSync(conceptPath, 0o644); // restore write perms so this read isn't itself blocked oddly by an ACL quirk
+    const concept = fs.readFileSync(conceptPath, 'utf-8');
+    expect(concept).toContain('Original PDF text');
+    // The pre-refresh snapshot written before the failure is still safely
+    // on disk, even though this call overall failed and never got to index
+    // it via recordFillHistory (list_document_versions won't show it).
+    const fillsDir = path.join(baseDir, '.document-fills');
+    expect(fs.existsSync(fillsDir) ? fs.readdirSync(fillsDir).length : 0).toBeGreaterThan(0);
+  });
+});
+
+describe('save_document — refresh preserves the original document\'s source-filename/description/heading', () => {
+  it('does not overwrite them with the refresh source\'s own (often machine-generated) filename', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('Quarterly Report.docx', buildDocx(['Original content'])) }, opts());
+
+    fs.mkdirSync(path.join(inboxDir, 'msg2'), { recursive: true });
+    const editedPath = path.join(inboxDir, 'msg2', 'report-filled-1735012345-a3f9k2.docx');
+    fs.writeFileSync(editedPath, buildDocx(['Edited content']));
+
+    const result = await saveDocumentImpl({ path: editedPath, document: 'quarterly-report' }, opts());
+    expect(result.isError).toBeFalsy();
+
+    const concept = fs.readFileSync(path.join(baseDir, 'memory', 'documents', 'quarterly-report.md'), 'utf-8');
+    expect(concept).toContain('source-filename: "Quarterly Report.docx"');
+    expect(concept).toContain('description: "Saved document: Quarterly Report.docx"');
+    expect(concept).toContain('# Quarterly Report.docx');
+    expect(concept).not.toContain('report-filled-1735012345-a3f9k2.docx');
+    expect(concept).toContain('Edited content');
+  });
+});
+
+describe('save_document — refresh, document must not be empty', () => {
+  it('rejects a whitespace-only document argument instead of silently treating it as omitted', async () => {
+    const filePath = writeInboxFile('report.docx', buildDocx(['content']));
+    const result = await saveDocumentImpl({ path: filePath, document: '   ' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('document must not be empty');
+    // Did NOT silently fall through to a fresh save.
+    expect(fs.existsSync(path.join(baseDir, 'memory', 'documents'))).toBe(false);
+  });
+});
+
+describe('save_document — refresh, Ask-First halt message preserves refresh intent', () => {
+  it('tells the agent to include document again on the image follow-up call', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocx(['Original'])) }, opts());
+
+    fs.mkdirSync(path.join(inboxDir, 'msg2'), { recursive: true });
+    const imgPath = path.join(inboxDir, 'msg2', 'photo.png');
+    fs.writeFileSync(imgPath, buildSignaturePng({ width: 4, height: 4 }));
+
+    const result = await saveDocumentImpl({ path: imgPath, document: 'report' }, opts());
+
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('document: "report"');
+  });
+});
+
+describe('save_document — refresh, ambiguous slug (two raw files under one slug)', () => {
+  it('errors with a specific message instead of proceeding, and touches neither raw file', async () => {
+    const documentsDir = path.join(baseDir, 'memory', 'documents');
+    const filesDir = path.join(documentsDir, 'files');
+    fs.mkdirSync(filesDir, { recursive: true });
+    const docxBytes = buildDocxWithTables([[['a1', 'b1']]]);
+    const pdfBytes = buildMinimalPdf('Hello');
+    fs.writeFileSync(path.join(filesDir, 'dup.docx'), docxBytes);
+    fs.writeFileSync(path.join(filesDir, 'dup.pdf'), pdfBytes);
+    fs.writeFileSync(
+      path.join(documentsDir, 'dup.md'),
+      '---\ntype: saved-document\ndescription: "A duplicated slug"\nsource-filename: "dup"\nsaved-date: 2026-01-01T00:00:00.000Z\n---\n\nbody\n',
+    );
+
+    const editedPath = writeInboxFile('dup-edited.docx', buildDocx(['Edited']));
+    const result = await saveDocumentImpl({ path: editedPath, document: 'dup' }, opts());
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('dup');
+    expect(result.content[0].text).toContain('Multiple files');
+
+    // Neither raw file was touched.
+    expect(fs.readFileSync(path.join(filesDir, 'dup.docx')).equals(docxBytes)).toBe(true);
+    expect(fs.readFileSync(path.join(filesDir, 'dup.pdf')).equals(pdfBytes)).toBe(true);
+  });
+});
+
+describe('save_document — refresh, symlink refusal at the old (pre-refresh) raw file path', () => {
+  it('refuses to touch a symlink planted at the old raw file location', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocx(['Original'])) }, opts());
+
+    const oldRawPath = path.join(baseDir, 'memory', 'documents', 'files', 'report.docx');
+    const outsideTarget = path.join(tmpRoot, 'outside-old-raw.bin');
+    fs.writeFileSync(outsideTarget, 'do not touch me');
+    fs.unlinkSync(oldRawPath);
+    fs.symlinkSync(outsideTarget, oldRawPath);
+
+    fs.mkdirSync(path.join(inboxDir, 'msg2'), { recursive: true });
+    const editedPath = path.join(inboxDir, 'msg2', 'report-edited.docx');
+    fs.writeFileSync(editedPath, buildDocx(['Edited']));
+
+    const result = await saveDocumentImpl({ path: editedPath, document: 'report' }, opts());
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text.toLowerCase()).toContain('symlink');
+    expect(fs.readFileSync(outsideTarget, 'utf-8')).toBe('do not touch me');
+  });
+});
+
+describe('save_document — refresh, symlink refusal at the new (post-refresh) raw file path', () => {
+  it('refuses to touch a symlink planted at the new-extension raw file location', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('report.pdf', buildMinimalPdf('Original PDF')) }, opts());
+
+    const filesDir = path.join(baseDir, 'memory', 'documents', 'files');
+    // Dangling on purpose (target doesn't exist) — a *live* symlink here
+    // would make fs.existsSync see it as a second real raw file and trip
+    // the earlier ambiguousExtensions guard instead of ever reaching this
+    // specific check; refuseIfSymlink uses lstat (not existsSync), so a
+    // dangling link is exactly what isolates this one code path.
+    const newRawPath = path.join(filesDir, 'report.docx');
+    fs.symlinkSync(path.join(tmpRoot, 'does-not-exist.bin'), newRawPath);
+
+    fs.mkdirSync(path.join(inboxDir, 'msg2'), { recursive: true });
+    const editedPath = path.join(inboxDir, 'msg2', 'report-edited.docx');
+    fs.writeFileSync(editedPath, buildDocx(['Edited docx content']));
+
+    const result = await saveDocumentImpl({ path: editedPath, document: 'report' }, opts());
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text.toLowerCase()).toContain('symlink');
+    // The dangling symlink itself was never followed/replaced.
+    expect(fs.lstatSync(newRawPath).isSymbolicLink()).toBe(true);
+    // The refusal happens before anything (including the pre-refresh
+    // snapshot) is written — the old .pdf raw file is untouched too.
+    expect(fs.existsSync(path.join(filesDir, 'report.pdf'))).toBe(true);
+  });
+});
+
+describe('save_document — refresh, symlink refusal at the concept file path', () => {
+  it('refuses to touch a symlink planted at the concept .md file location', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocx(['Original'])) }, opts());
+
+    const conceptPath = path.join(baseDir, 'memory', 'documents', 'report.md');
+    const outsideTarget = path.join(tmpRoot, 'outside-concept.bin');
+    fs.writeFileSync(outsideTarget, 'do not touch me');
+    fs.unlinkSync(conceptPath);
+    fs.symlinkSync(outsideTarget, conceptPath);
+
+    fs.mkdirSync(path.join(inboxDir, 'msg2'), { recursive: true });
+    const editedPath = path.join(inboxDir, 'msg2', 'report-edited.docx');
+    fs.writeFileSync(editedPath, buildDocx(['Edited']));
+
+    const result = await saveDocumentImpl({ path: editedPath, document: 'report' }, opts());
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text.toLowerCase()).toContain('symlink');
+    expect(fs.readFileSync(outsideTarget, 'utf-8')).toBe('do not touch me');
+  });
+});
+
+describe('save_document — refresh, source path outside both inbox and .document-fills', () => {
+  it('refuses an arbitrary absolute path elsewhere, does not silently allow it through', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocx(['Original'])) }, opts());
+
+    const outsideDir = path.join(tmpRoot, 'elsewhere');
+    fs.mkdirSync(outsideDir, { recursive: true });
+    const outsidePath = path.join(outsideDir, 'sneaky.docx');
+    fs.writeFileSync(outsidePath, buildDocx(['Sneaky content']));
+
+    const result = await saveDocumentImpl({ path: outsidePath, document: 'report' }, opts());
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('outside the inbox');
+    const concept = fs.readFileSync(path.join(baseDir, 'memory', 'documents', 'report.md'), 'utf-8');
+    expect(concept).toContain('Original');
+    expect(concept).not.toContain('Sneaky content');
+  });
+});
+
+describe('save_document — a plain (non-refresh) save cannot source its path from .document-fills', () => {
+  it('refuses a .document-fills path when document is omitted (regression guard for the item-3 fix)', async () => {
+    // Produce a real .document-fills output the normal way (a fill).
+    await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
+    const fill = await fillDocumentFieldImpl({ document: 'report', row: 1, value: 'X' }, opts());
+    expect(fill.isError).toBeFalsy();
+    const fillOutputPath = extractOutPath(fill.content[0].text);
+    expect(fs.existsSync(fillOutputPath)).toBe(true);
+
+    // No `document` argument — this must stay inbox-only, exactly like
+    // before this story; sourcing from .document-fills is only allowed on
+    // an explicit refresh call.
+    const result = await saveDocumentImpl({ path: fillOutputPath }, opts());
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('outside the inbox');
+  });
+});
 
 // ---------------------------------------------------------------------------
 // list_documents

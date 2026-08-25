@@ -63,7 +63,18 @@
  * containment-checked against the session's `inbox/` root, mirroring the
  * `isPathInside`/`ensureContainedInboxDir` pattern `src/inbox-safety.ts`
  * and `src/session-manager.ts` already use on the host side for the same
- * class of risk (a path that resolves outside the sandbox).
+ * class of risk (a path that resolves outside the sandbox). This same
+ * containment check also accepts a path under `<baseDir>/.document-fills/`
+ * (a fill's own output), needed for the refresh feature below.
+ *
+ * `document` (spec 2-4, optional): when given and it resolves (via the same
+ * `resolveDocument` handshake every other tool here uses) to exactly one
+ * already-saved document, this call refreshes that document in place —
+ * overwrites its raw file and re-extracts its stored text from the new
+ * source — instead of creating a new, separately-slugged document. An
+ * explicit, opt-in "re-save," never an automatic side effect of a fill; the
+ * pre-refresh raw file is preserved via the fill-history mechanism below
+ * (`target: "pre-refresh snapshot"`) before anything is overwritten.
  */
 import { execFileSync } from 'child_process';
 import crypto from 'crypto';
@@ -109,6 +120,20 @@ const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png']);
 // realpath-containment approach on the host side; reimplemented here rather
 // than imported because container/agent-runner is a separate Bun package
 // tree with no dependency on host code.
+//
+// `extraAllowedRoot` (spec 2-4): the frozen Intent/I-O-matrix for
+// save_document's refresh feature demonstrates the primary case as
+// `save_document({ path: <fill output>, document: "report" })` — but a fill
+// output lives under `<baseDir>/.document-fills/`, never under
+// `<workspaceRoot>/inbox/`, so an unmodified inbox-only containment check
+// would reject that exact call. save_document alone passes
+// `.document-fills` here (save_signature's own call site is unchanged,
+// inbox-only) — safe to allow specifically because that directory only ever
+// holds files this same tool already wrote for the calling agent earlier in
+// the session (fillOneDocument's writeFillOutput / this file's own
+// pre-refresh snapshot), never arbitrary/untrusted content, so widening
+// containment to it doesn't expose anything the agent didn't already have a
+// path to.
 // ---------------------------------------------------------------------------
 
 /** True if `child` is `parent` itself or nested within it (no traversal/escape). */
@@ -117,7 +142,11 @@ function isPathInside(parent: string, child: string): boolean {
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }
 
-function resolveInboxPath(filePath: string, workspaceRoot: string): { path: string } | { error: string } {
+function resolveInboxPath(
+  filePath: string,
+  workspaceRoot: string,
+  extraAllowedRoot?: string,
+): { path: string } | { error: string } {
   const resolved = path.isAbsolute(filePath) ? filePath : path.resolve(workspaceRoot, filePath);
   if (!fs.existsSync(resolved)) return { error: `File not found: ${filePath}` };
 
@@ -129,17 +158,24 @@ function resolveInboxPath(filePath: string, workspaceRoot: string): { path: stri
   }
 
   const inboxRoot = path.join(workspaceRoot, 'inbox');
-  let realInboxRoot: string;
   try {
-    realInboxRoot = fs.realpathSync(inboxRoot);
+    const realInboxRoot = fs.realpathSync(inboxRoot);
+    if (isPathInside(realInboxRoot, realResolved)) return { path: realResolved };
   } catch {
-    return { error: `Refusing to read a file outside the inbox: ${filePath}` };
+    // Inbox root doesn't exist (yet) — fall through to the extra-root check
+    // (if any) before giving up.
   }
 
-  if (!isPathInside(realInboxRoot, realResolved)) {
-    return { error: `Refusing to read a file outside the inbox: ${filePath}` };
+  if (extraAllowedRoot) {
+    try {
+      const realExtraRoot = fs.realpathSync(extraAllowedRoot);
+      if (isPathInside(realExtraRoot, realResolved)) return { path: realResolved };
+    } catch {
+      // Extra root doesn't exist (yet) — nothing to allow through it.
+    }
   }
-  return { path: realResolved };
+
+  return { error: `Refusing to read a file outside the inbox: ${filePath}` };
 }
 
 // ---------------------------------------------------------------------------
@@ -622,6 +658,71 @@ function isNearEmptyOcrText(text: string): boolean {
 // save_document
 // ---------------------------------------------------------------------------
 
+/**
+ * Refuses to proceed if `destPath` is currently a symlink — mirrors
+ * `writeSignaturePng`'s `replace: true` defense (an explicit, identity-
+ * preserving overwrite of a known asset is not license to write through a
+ * symlink an attacker, or a stray prior operation, planted at that exact
+ * path, which would silently affect whatever it points to instead). lstat
+ * (not stat) inspects the directory entry itself without following it;
+ * ENOENT just means nothing is there yet, not a collision at all.
+ */
+function refuseIfSymlink(destPath: string, label: string): void {
+  let isSymlink = false;
+  try {
+    isSymlink = fs.lstatSync(destPath).isSymbolicLink();
+  } catch (e) {
+    if (errnoCode(e) !== 'ENOENT') throw e;
+  }
+  if (isSymlink) {
+    throw new Error(`Refusing to overwrite "${label}" — it is a symlink, not a regular file.`);
+  }
+}
+
+/**
+ * Builds a document's concept-file body (frontmatter + heading + extracted
+ * text) — the one template both a fresh save and a refresh (spec 2-4) write
+ * out, so the two paths can never drift apart in shape. `ext` is the raw
+ * file's own extension (not necessarily the pre-refresh document's — a
+ * refresh can change it, e.g. `.doc` -> `.docx`), so `raw-file` always points
+ * at what's actually on disk after this call completes.
+ *
+ * `displayName` drives `description`/`source-filename`/the H1 heading — a
+ * fresh save passes the new file's own basename (`originalFilename`, as
+ * always), but a refresh must NOT: a refresh's `path` is typically a fill
+ * output or other machine-generated filename (e.g.
+ * `report-filled-1735012345-a3f9k2.docx`), not something user-meaningful, so
+ * the refresh call site passes the EXISTING document's already-stored
+ * `sourceFilename` instead, leaving this identity untouched by the refresh.
+ */
+function buildConceptBody(
+  displayName: string,
+  slug: string,
+  ext: string,
+  bodyText: string,
+  extractionNote: string,
+): { conceptBody: string; savedDate: string; description: string } {
+  const savedDate = new Date().toISOString();
+  const description = `Saved document: ${displayName}`;
+  const conceptBody = [
+    '---',
+    'type: saved-document',
+    `description: ${yamlEscape(description)}`,
+    `source-filename: ${yamlEscape(displayName)}`,
+    `saved-date: ${savedDate}`,
+    // Relative path back to the canonical raw copy, per AD-6 — recorded explicitly
+    // rather than left only derivable from <slug>.<ext> by convention.
+    `raw-file: ${yamlEscape(`files/${slug}.${ext}`)}`,
+    '---',
+    '',
+    `# ${escapeMarkdown(stripControlChars(displayName))}`,
+    '',
+    bodyText || '_(no text extracted)_',
+    extractionNote,
+  ].join('\n');
+  return { conceptBody, savedDate, description };
+}
+
 interface SaveDocumentOpts {
   /** `/workspace/agent` in production; a temp dir in tests. */
   baseDir: string;
@@ -642,8 +743,27 @@ export async function saveDocumentImpl(
     }
     const extractedText = typeof args.extractedText === 'string' ? args.extractedText : undefined;
 
+    if (args.document !== undefined && typeof args.document !== 'string') {
+      return err('document must be a string');
+    }
+    // A whitespace-only `document` must not silently fall through to the
+    // omitted/fresh-save path — that would look like the caller's explicit
+    // refresh intent was just ignored with no signal at all.
+    let documentQuery: string | undefined;
+    if (typeof args.document === 'string') {
+      const trimmed = args.document.trim();
+      if (!trimmed) return err('document must not be empty');
+      documentQuery = trimmed;
+    }
+
     const workspaceRoot = opts.workspaceRoot ?? '/workspace';
-    const resolution = resolveInboxPath(filePath, workspaceRoot);
+    // `.document-fills` is only an allowed source root on a refresh call
+    // (document given) — a plain new-document save stays inbox-only, exactly
+    // as before this story. Widening it unconditionally would let a fresh
+    // save source its content from a fill output too, which was never
+    // intended or documented.
+    const extraAllowedRoot = documentQuery ? path.join(opts.baseDir, '.document-fills') : undefined;
+    const resolution = resolveInboxPath(filePath, workspaceRoot, extraAllowedRoot);
     if ('error' in resolution) return err(resolution.error);
     const resolvedPath = resolution.path;
 
@@ -659,6 +779,46 @@ export async function saveDocumentImpl(
     const memoryDir = path.join(opts.baseDir, 'memory');
     const documentsDir = path.join(memoryDir, 'documents');
     const filesDir = path.join(documentsDir, 'files');
+
+    // Refresh resolution (spec 2-4) — resolved up front, before the (possibly
+    // OCR-heavy) extraction pipeline runs below, so a doomed call (no match,
+    // or an ambiguous one) fails fast rather than after paying for extraction
+    // it's about to throw away. `document` omitted entirely (the default) is
+    // today's unchanged always-create-new path — refreshTarget stays
+    // undefined and nothing below this block behaves any differently than it
+    // did before this story.
+    let refreshTarget: DocumentMeta | undefined;
+    if (documentQuery) {
+      const resolution = resolveDocument(documentsDir, filesDir, documentQuery);
+      if (resolution.kind === 'not-found') {
+        log(`save_document: no match for document "${documentQuery}"`);
+        return err(`No saved document matches "${documentQuery}".`);
+      }
+      if (resolution.kind === 'candidates') {
+        log(`save_document: ${resolution.metas.length} candidates for document "${documentQuery}"`);
+        return ok(
+          `Multiple saved documents match "${documentQuery}":\n${formatDocumentCandidates(resolution.metas)}\n\n` +
+            'Call save_document again with document set to the exact slug (first column) to pick one.',
+        );
+      }
+      if (resolution.meta.ambiguousExtensions) {
+        return err(
+          `Multiple files found for document "${resolution.meta.slug}" (${resolution.meta.ambiguousExtensions.join(', ')}) — ` +
+            'this shouldn\'t normally happen. Check memory/documents/files/ for this slug manually before retrying.',
+        );
+      }
+      refreshTarget = resolution.meta;
+    }
+
+    // Appended to both Ask-First halt messages below (scanned-PDF-OCR and
+    // plain-image) when this call is a refresh — without it, an agent's
+    // retry that only repeats `path`/`extractedText` (the normal, non-refresh
+    // instruction) would silently drop `document` and downgrade an intended
+    // refresh into a fresh, separately-slugged save.
+    const refreshRetryNote = refreshTarget
+      ? ` Also include document: "${refreshTarget.slug}" again on that follow-up call — leaving it out would ` +
+        'silently turn this refresh into a new, separately-slugged document instead of completing it.'
+      : '';
 
     let bodyText: string;
     let extractionNote = '';
@@ -723,7 +883,8 @@ export async function saveDocumentImpl(
                 'proceed: either read that rendered image yourself and call save_document again with the same path ' +
                 `("${filePath}") and an "extractedText" argument containing what you read, or call ` +
                 'save_document again with the same path and extractedText: "" to save it with a placeholder ' +
-                'note instead of blank/guessed text.',
+                'note instead of blank/guessed text.' +
+                refreshRetryNote,
             );
           }
 
@@ -750,7 +911,8 @@ export async function saveDocumentImpl(
         return ok(
           `This is an image (${ext}) — I can't extract its content myself. Read it yourself at "${filePath}", ` +
             'then call save_document again with the same path and an "extractedText" argument containing what ' +
-            'you read (a description, any readable text, numbers, etc.), to finish saving it to memory.',
+            'you read (a description, any readable text, numbers, etc.), to finish saving it to memory.' +
+            refreshRetryNote,
         );
       }
       bodyText = extractedText;
@@ -773,7 +935,125 @@ export async function saveDocumentImpl(
     ensureDocumentsScaffold(documentsDir, filesDir);
     const lockPath = path.join(documentsDir, '.index.lock');
 
-    const result = await withLock(lockPath, () => {
+    // Discriminated result of the locked critical section below — the
+    // refresh branch intentionally does NOT compose its final response text
+    // here (spec 2-4, item 8): whether the pre-refresh snapshot actually got
+    // indexed into fill history is only known after recordFillHistory runs,
+    // just below, *after* this lock is released, so claiming "recoverable
+    // via list_document_versions" from inside the lock would be a promise
+    // this code can't yet back up.
+    type SaveDocumentLockResult =
+      | { kind: 'refresh'; slug: string; snapshotPath: string }
+      | { kind: 'fresh'; response: ReturnType<typeof ok> };
+
+    const lockResult = await withLock<SaveDocumentLockResult>(lockPath, () => {
+      if (refreshTarget) {
+        // Re-check the refresh target immediately before mutating anything,
+        // now that this call actually holds the lock (spec 2-4, item 7):
+        // `refreshTarget` was resolved *before* the lock was acquired, so a
+        // same-slug double-refresh race (two concurrent save_document calls
+        // both naming the same document) could otherwise act on
+        // already-stale ext/existence info from the first resolution. This
+        // re-check is what turns that race into a clear, accurate error
+        // instead of a possibly-confusing one further down (e.g. a
+        // rollback-triggering ENOENT from a sibling refresh that already
+        // completed).
+        const recheck = resolveDocument(documentsDir, filesDir, refreshTarget.slug);
+        if (recheck.kind !== 'resolved' || recheck.meta.slug !== refreshTarget.slug) {
+          throw new Error(
+            `"${refreshTarget.slug}" changed since this refresh was resolved (likely a concurrent refresh of ` +
+              'the same document) — retry.',
+          );
+        }
+        if (recheck.meta.ambiguousExtensions) {
+          throw new Error(
+            `Multiple files found for document "${recheck.meta.slug}" (${recheck.meta.ambiguousExtensions.join(', ')}) — ` +
+              'this shouldn\'t normally happen. Check memory/documents/files/ for this slug manually before retrying.',
+          );
+        }
+        const meta = recheck.meta;
+
+        // Refresh path (spec 2-4) — same slug, existing concept file
+        // overwritten in place; never a new, separately-slugged document.
+        // The pre-refresh raw file is copied into .document-fills/ (via the
+        // same writeFillOutput helper a real fill's output already uses)
+        // *before* anything about the stored copy changes below, so it's
+        // never lost even if a later step in this same critical section
+        // throws. The actual fill-history *index* entry pointing at that
+        // copy is recorded just after this lock is released (recordFillHistory
+        // manages its own separate per-slug lock) — the exact same
+        // write-then-index ordering fillOneDocument's own completed-fill path
+        // already uses (see its recordFillHistory call site), not a new risk
+        // shape invented for this story.
+        const slug = meta.slug;
+        const oldExt = meta.ext;
+        // The EXISTING document's own display name — never the new source
+        // path's basename (`originalFilename`), which is typically a
+        // machine-generated fill-output filename with no user-meaningful
+        // content. A refresh must leave description/source-filename/the H1
+        // heading identity untouched (spec 2-4, item 2) — only saved-date,
+        // the raw file's extension/content, and the extracted body text
+        // actually change.
+        const displayName = meta.sourceFilename;
+        const oldRawPath = path.join(filesDir, `${slug}.${oldExt}`);
+        const newRawPath = path.join(filesDir, `${slug}.${ext}`);
+        const conceptPath = path.join(documentsDir, `${slug}.md`);
+
+        refuseIfSymlink(oldRawPath, `${slug}.${oldExt}`);
+        if (newRawPath !== oldRawPath) refuseIfSymlink(newRawPath, `${slug}.${ext}`);
+        refuseIfSymlink(conceptPath, `${slug}.md`);
+
+        if (!fs.existsSync(oldRawPath)) {
+          throw new Error(`Saved raw file for "${slug}" is missing — cannot refresh.`);
+        }
+        const oldRawBytes = fs.readFileSync(oldRawPath);
+        const snapshotPath = writeFillOutput(opts.baseDir, slug, oldExt, oldRawBytes);
+
+        // Nothing about the stored copy has changed yet — the snapshot above
+        // is the recoverability guarantee this story's Never bullet
+        // ("never lose the pre-refresh content irrecoverably") requires, and
+        // it's already safely on disk before the lines below touch anything.
+        try {
+          fs.rmSync(oldRawPath, { force: true });
+          fs.copyFileSync(resolvedPath, newRawPath);
+
+          const { conceptBody } = buildConceptBody(displayName, slug, ext, bodyText, extractionNote);
+          // No 'wx' flag here (unlike the fresh-save branch below) — this call
+          // site legitimately overwrites an existing concept file in place.
+          fs.writeFileSync(conceptPath, conceptBody);
+        } catch (e) {
+          // Rollback (spec 2-4, item 1) — mirrors the fresh-save branch's own
+          // rawWritten/conceptWritten rollback immediately below, adapted for
+          // a refresh: a partial failure here must never leave the document
+          // worse off than before this refresh started. Restore the
+          // pre-refresh raw file from the bytes already captured above,
+          // clean up any new-extension file that may have landed before the
+          // failure, then rethrow. The snapshot already written to disk
+          // above is untouched by this rollback either way, so the
+          // pre-refresh version stays recoverable via list_document_versions
+          // even if this rollback itself partially fails.
+          try {
+            fs.writeFileSync(oldRawPath, oldRawBytes);
+            if (newRawPath !== oldRawPath) {
+              try {
+                fs.unlinkSync(newRawPath);
+              } catch {
+                // best effort — may not have been written yet
+              }
+            }
+          } catch (restoreError) {
+            log(
+              `refresh rollback failed for "${slug}" — raw file may be left inconsistent: ` +
+                `${restoreError instanceof Error ? restoreError.message : String(restoreError)}`,
+            );
+          }
+          throw e;
+        }
+
+        log(`save_document: refreshed "${slug}" from "${originalFilename}"`);
+        return { kind: 'refresh', slug, snapshotPath };
+      }
+
       const slug = uniqueSlug(documentsDir, originalFilename);
       const rawDestPath = path.join(filesDir, `${slug}.${ext}`);
       const conceptPath = path.join(documentsDir, `${slug}.md`);
@@ -784,24 +1064,7 @@ export async function saveDocumentImpl(
         fs.copyFileSync(resolvedPath, rawDestPath, fs.constants.COPYFILE_EXCL);
         rawWritten = true;
 
-        const savedDate = new Date().toISOString();
-        const description = `Saved document: ${originalFilename}`;
-        const conceptBody = [
-          '---',
-          'type: saved-document',
-          `description: ${yamlEscape(description)}`,
-          `source-filename: ${yamlEscape(originalFilename)}`,
-          `saved-date: ${savedDate}`,
-          // Relative path back to the canonical raw copy, per AD-6 — recorded explicitly
-          // rather than left only derivable from <slug>.<ext> by convention.
-          `raw-file: ${yamlEscape(`files/${slug}.${ext}`)}`,
-          '---',
-          '',
-          `# ${escapeMarkdown(stripControlChars(originalFilename))}`,
-          '',
-          bodyText || '_(no text extracted)_',
-          extractionNote,
-        ].join('\n');
+        const { conceptBody, savedDate, description } = buildConceptBody(originalFilename, slug, ext, bodyText, extractionNote);
         fs.writeFileSync(conceptPath, conceptBody, { flag: 'wx' });
         conceptWritten = true;
 
@@ -815,7 +1078,7 @@ export async function saveDocumentImpl(
         );
 
         log(`save_document: saved "${originalFilename}" as "${slug}"`);
-        return ok(`Saved "${originalFilename}" to memory as "${slug}". Recorded in memory/documents/${slug}.md.`);
+        return { kind: 'fresh', response: ok(`Saved "${originalFilename}" to memory as "${slug}". Recorded in memory/documents/${slug}.md.`) };
       } catch (e) {
         // Partial failure — a raw copy or concept file already landed with
         // no complete, consistent entry to show for it. Roll back whatever
@@ -839,6 +1102,40 @@ export async function saveDocumentImpl(
       }
     });
 
+    let response: ReturnType<typeof ok> | ReturnType<typeof err>;
+    if (lockResult.kind === 'refresh') {
+      // Item 8: only claim recoverability once recordFillHistory has
+      // actually confirmed it — this write is still best-effort (mirroring
+      // fillOneDocument's own completed-fill recording pattern: a
+      // history-index write failure must never mask an already-successful
+      // refresh, since the snapshot file itself is already safely on disk
+      // either way), but the response text now reflects which outcome
+      // actually happened instead of unconditionally promising the good one.
+      let historyRecorded = false;
+      try {
+        await recordFillHistory(opts.baseDir, lockResult.slug, {
+          timestamp: new Date().toISOString(),
+          outputPath: lockResult.snapshotPath,
+          target: 'pre-refresh snapshot',
+        });
+        historyRecorded = true;
+      } catch (e) {
+        log(
+          `pre-refresh snapshot history recording failed for ${lockResult.slug}: ` +
+            `${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+      response = ok(
+        `Refreshed "${lockResult.slug}" in memory from "${originalFilename}". Recorded in memory/documents/${lockResult.slug}.md.` +
+          (historyRecorded
+            ? ' A snapshot of the pre-refresh version was saved and is recoverable via list_document_versions.'
+            : ' Its pre-refresh version was saved to disk, but could not be indexed into fill history — it may ' +
+              'not show up via list_document_versions.'),
+      );
+    } else {
+      response = lockResult.response;
+    }
+
     if (renderPathToCleanup) {
       try {
         fs.unlinkSync(renderPathToCleanup);
@@ -848,7 +1145,7 @@ export async function saveDocumentImpl(
       }
     }
 
-    return result;
+    return response;
   } catch (e) {
     return err(`save_document failed: ${e instanceof Error ? e.message : String(e)}`);
   }
@@ -1700,6 +1997,12 @@ function writeFillOutput(baseDir: string, slug: string, ext: string, data: Buffe
 // newer fill pushes it out, even though list_document_versions filters it
 // out of what it actually shows. Don't assume this cap tracks "visible"
 // history.
+//
+// A save_document refresh's pre-refresh snapshot (spec 2-4, `target:
+// "pre-refresh snapshot"`) shares this exact same cap and index — it's not a
+// separate, larger allowance. Repeated refreshes of one document can push
+// genuine past fill-output entries out of the visible 20 sooner than a user
+// might expect, exactly as a burst of real fills would.
 const FILL_HISTORY_CAP = 20;
 
 interface FillHistoryEntry {
@@ -3039,50 +3342,89 @@ async function fillOneDocument(
   }
 
   const rawPath = path.join(filesDir, `${meta.slug}.${meta.ext}`);
-  if (!fs.existsSync(rawPath)) return err(`Saved raw file for "${meta.slug}" is missing.`);
 
-  const result =
-    meta.ext === 'docx'
-      ? await fillDocx(rawPath, meta, args, opts)
-      : meta.ext === 'doc'
-        ? await fillDoc(rawPath, meta, args, opts)
-        : await fillPdf(rawPath, meta, args, opts);
-
-  // History recording (spec 2-3) — the single choke point covering both
-  // fill_document_field and fill_document_field_batch, since both callers
-  // funnel through fillOneDocument. Gated on the exact same
-  // FILL_SUCCESS_MARKER signal the batch tool already uses to distinguish
-  // a completed fill from a discovery/prompt response — a discovery call
-  // or a per-item batch failure never reaches this point.
-  const resultText = typeof result.content[0]?.text === 'string' ? result.content[0].text : '';
-  const isCompletedFill = !('isError' in result && result.isError) && resultText.includes(FILL_SUCCESS_MARKER);
-  if (isCompletedFill) {
-    const outputPath = extractFillOutputPath(resultText);
-    if (outputPath) {
-      try {
-        await recordFillHistory(opts.baseDir, meta.slug, {
-          timestamp: new Date().toISOString(),
-          outputPath,
-          target: describeFillTarget(args),
-        });
-      } catch (e) {
-        // Best-effort: a fill-history write failure must never mask an
-        // already-successful fill — the real output file is already
-        // written and the response already confirms it. Log and move on.
-        log(`fill history recording failed for ${meta.slug}: ${e instanceof Error ? e.message : String(e)}`);
+  // Concurrency (spec 2-4, item 4): save_document's refresh path mutates a
+  // document's raw file (rmSync, then copyFileSync — sometimes onto this
+  // exact same path) while holding this same documentsDir's `.index.lock`.
+  // Reading `rawPath` here without that same lock could observe a
+  // transient "just removed, not yet replaced" state, or in principle a
+  // torn file mid-copy. Snapshot the current bytes into a private temp
+  // copy while briefly holding that lock, then let fillDocx/fillDoc/fillPdf
+  // read from that immutable copy exactly as they'd read from `rawPath` —
+  // none of them care about the path's identity, only its bytes, so this
+  // needs no change to any of their own internals. The lock's *duration*
+  // only needs to cover this one copy, not the whole (potentially slow)
+  // fill/stamp pipeline below.
+  const documentsDir = path.join(opts.baseDir, 'memory', 'documents');
+  const lockPath = path.join(documentsDir, '.index.lock');
+  let snapshotRawPath: string;
+  try {
+    snapshotRawPath = await withLock(lockPath, () => {
+      if (!fs.existsSync(rawPath)) {
+        throw new Error(`Saved raw file for "${meta.slug}" is missing.`);
       }
-    } else {
-      // Should be unreachable in practice — every FILL_SUCCESS_MARKER site
-      // writes the exact "New file at <path> — call send_file" shape
-      // extractFillOutputPath parses — but a future copy change to that
-      // text could silently break extraction. Log it rather than letting a
-      // completed fill silently get no history entry with zero trace.
-      log(`fill history: completed fill for ${meta.slug} matched FILL_SUCCESS_MARKER but no output path could be extracted from the result text`);
-    }
+      const tmp = path.join(
+        os.tmpdir(),
+        `nanoclaw-fill-read-${meta.slug}-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${meta.ext}`,
+      );
+      fs.copyFileSync(rawPath, tmp);
+      return tmp;
+    });
+  } catch (e) {
+    return err(e instanceof Error ? e.message : String(e));
   }
 
-  log(`${callerLabel}: ${meta.slug} (${meta.ext}) -> ${'isError' in result && result.isError ? 'error' : 'ok'}`);
-  return result;
+  try {
+    const result =
+      meta.ext === 'docx'
+        ? await fillDocx(snapshotRawPath, meta, args, opts)
+        : meta.ext === 'doc'
+          ? await fillDoc(snapshotRawPath, meta, args, opts)
+          : await fillPdf(snapshotRawPath, meta, args, opts);
+
+    // History recording (spec 2-3) — the single choke point covering both
+    // fill_document_field and fill_document_field_batch, since both callers
+    // funnel through fillOneDocument. Gated on the exact same
+    // FILL_SUCCESS_MARKER signal the batch tool already uses to distinguish
+    // a completed fill from a discovery/prompt response — a discovery call
+    // or a per-item batch failure never reaches this point.
+    const resultText = typeof result.content[0]?.text === 'string' ? result.content[0].text : '';
+    const isCompletedFill = !('isError' in result && result.isError) && resultText.includes(FILL_SUCCESS_MARKER);
+    if (isCompletedFill) {
+      const outputPath = extractFillOutputPath(resultText);
+      if (outputPath) {
+        try {
+          await recordFillHistory(opts.baseDir, meta.slug, {
+            timestamp: new Date().toISOString(),
+            outputPath,
+            target: describeFillTarget(args),
+          });
+        } catch (e) {
+          // Best-effort: a fill-history write failure must never mask an
+          // already-successful fill — the real output file is already
+          // written and the response already confirms it. Log and move on.
+          log(`fill history recording failed for ${meta.slug}: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      } else {
+        // Should be unreachable in practice — every FILL_SUCCESS_MARKER site
+        // writes the exact "New file at <path> — call send_file" shape
+        // extractFillOutputPath parses — but a future copy change to that
+        // text could silently break extraction. Log it rather than letting a
+        // completed fill silently get no history entry with zero trace.
+        log(`fill history: completed fill for ${meta.slug} matched FILL_SUCCESS_MARKER but no output path could be extracted from the result text`);
+      }
+    }
+
+    log(`${callerLabel}: ${meta.slug} (${meta.ext}) -> ${'isError' in result && result.isError ? 'error' : 'ok'}`);
+    return result;
+  } finally {
+    try {
+      fs.unlinkSync(snapshotRawPath);
+    } catch {
+      // Best effort — a leftover temp read-copy under os.tmpdir() is
+      // harmless and never surfaced to the user.
+    }
+  }
 }
 
 export async function fillDocumentFieldImpl(
@@ -3482,7 +3824,8 @@ export const saveDocument: McpToolDefinition = {
       '(English and Hebrew) in the same call; a plain image asks you to read it yourself and call back with ' +
       'extractedText — and so does a scanned PDF in the rare case OCR finds little to no readable text), and ' +
       'records an entry in memory/index.md so it can be recalled later without resending it. Declines cleanly ' +
-      'for any other file type.',
+      'for any other file type. Give "document" to refresh an already-saved document in place instead of saving ' +
+      'a new one — see that argument\'s own description before using it.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -3500,6 +3843,22 @@ export const saveDocument: McpToolDefinition = {
             'scanned PDF whose page-1 OCR came back with little to no readable text, either the text you read ' +
             'yourself from the still-present render, or "" to accept a placeholder note instead — after a prior ' +
             'save_document call on the same path asked you to read/decide and call back.',
+        },
+        document: {
+          type: 'string',
+          description:
+            'Only set this when the user explicitly asked to replace/update/re-save an already-saved document ' +
+            "with this new file's content — never as a default after a fill, and never just because the file " +
+            'looks related. Free-text match (same as every other tool here) against an already-saved document\'s ' +
+            "slug/filename/description. When it resolves, that document's raw file and stored text are " +
+            "overwritten in place with this call's content (same slug, extension changes if the new file is a " +
+            'different type) — the pre-refresh version is snapshotted for recovery via list_document_versions, ' +
+            'but this is still a real, deliberate overwrite, not a preview. Nothing checks that the file you pass ' +
+            "actually corresponds to the document named in `document` — pointing it at the wrong document's " +
+            'content is on you, not verified automatically. Omit entirely (the default) to save a new, ' +
+            "separately-slugged document as always. If it matches more than one saved document, returns a " +
+            'numbered candidate list instead of refreshing anything; if it matches none, errors instead of ' +
+            'silently falling back to creating a new document.',
         },
       },
       required: ['path'],

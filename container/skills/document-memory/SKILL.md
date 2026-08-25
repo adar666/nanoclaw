@@ -1,6 +1,6 @@
 ---
 name: document-memory
-description: Save a Word (.docx or legacy .doc), PDF, or image (.jpg/.jpeg/.png) file the user sends into this agent group's persistent memory, so its content can be recalled in a later, unrelated conversation without resending the file. Also fill a value into a table row, form field, or line of a document already saved this way and send back a new file, or recall/answer questions about what a previously saved document says. Also list a document's fill history and resend an earlier fill (an "undo"). Also save a PNG image of a handwritten signature as a reusable, background-removed asset, and stamp a saved signature into a saved PDF, .docx, or .doc. Use when the user sends a Word/PDF/image attachment and asks to save/remember/keep it, asks to fill in / complete a blank on a document already saved, asks what a saved document says/contains, asks to summarize/recall a document already saved, wants to undo a bad edit or get an earlier version of a filled document back, sends a signature image and asks to save/remember it for reuse, or asks to sign/stamp a saved document with a saved signature.
+description: Save a Word (.docx or legacy .doc), PDF, or image (.jpg/.jpeg/.png) file the user sends into this agent group's persistent memory, so its content can be recalled in a later, unrelated conversation without resending the file. Also fill a value into a table row, form field, or line of a document already saved this way and send back a new file, or recall/answer questions about what a previously saved document says. Also list a document's fill history and resend an earlier fill (an "undo"). Also refresh (re-save) an already-saved document in place with an edited version, when the user explicitly asks to replace/update the stored copy. Also save a PNG image of a handwritten signature as a reusable, background-removed asset, and stamp a saved signature into a saved PDF, .docx, or .doc. Use when the user sends a Word/PDF/image attachment and asks to save/remember/keep it, asks to fill in / complete a blank on a document already saved, asks what a saved document says/contains, asks to summarize/recall a document already saved, wants to undo a bad edit or get an earlier version of a filled document back, explicitly asks to replace/update/re-save the stored version of a document with an edit, sends a signature image and asks to save/remember it for reuse, or asks to sign/stamp a saved document with a saved signature.
 ---
 
 # Saving a document to memory
@@ -366,24 +366,104 @@ target in the batch failed.
   just shows up as a per-item failure for that document instead of
   succeeding.
 
+# Refreshing (re-saving) an already-saved document after an edit
+
+## When to use this
+
+The user explicitly asks to replace/update/re-save an already-saved
+document with an edited version — "save that as the new version", "update
+the stored report with this edit", "make this the new saved copy" —
+typically right after a `fill_document_field`/`fill_document_field_batch`
+call just handed back an edited file. This is `save_document` again, with
+a `document` argument added — not a separate tool.
+
+**Only pass `document` when the user explicitly asked for a replace/update.**
+A plain "save this" about a brand-new file, or silence on whether to
+replace anything, is a normal new save (omit `document`, exactly like
+today) — never add `document` as a default just because a similarly-named
+document is already saved, and never add it just because you happen to be
+holding a fresh fill output. Guessing wrong here silently overwrites
+something the user didn't ask to touch.
+
+## Workflow
+
+1. **Call `save_document` again**, exactly like a fresh save, plus
+   `document` set to the target document's name/slug/topic (same free-text
+   matching every other tool in this skill uses). The `path` here is often
+   the output path a preceding `fill_document_field` call just returned,
+   not a fresh inbox attachment:
+   ```
+   mcp__nanoclaw__save_document({ path: "<fill output path>", document: "report" })
+   ```
+2. **Same resolution handshake as everywhere else.** No match is an error
+   (say so plainly, nothing is written); more than one match returns a
+   numbered candidate list to relay, same as `fill_document_field`; ask the
+   user to pick before re-calling with the exact slug.
+3. **What actually happens on a match:** the raw file and stored extracted
+   text under that same slug are overwritten with this call's content — the
+   raw file's extension can change too (e.g. refreshing a saved `.doc` with
+   a `.docx` fill output leaves it stored as `.docx` going forward). It's
+   the *same document* (same slug, same concept file), not a new one —
+   `memory/index.md`'s existing one-line entry for it is left as-is. **The
+   document's own name/description/heading stay exactly what they already
+   were** — the new file's own filename (often something machine-generated
+   like `report-filled-1735012345-a3f9k2.docx`, not something user-facing)
+   never replaces them; only the saved-date, the raw file itself, and the
+   extracted text actually change.
+4. **The pre-refresh version is never lost.** Before anything is
+   overwritten, the old raw file is snapshotted into that document's fill
+   history — recoverable via `list_document_versions` exactly like a past
+   fill output (see "Undoing a bad edit" below), listed with
+   `pre-refresh snapshot` in place of a field description.
+5. **A later fill builds on the refreshed content, not the original.**
+   Once refreshed, `fill_document_field`/`fill_document_field_batch` read
+   and edit the *refreshed* raw file — this is how a second edit compounds
+   on top of a first one instead of silently discarding it.
+6. **If the refresh source itself needs the two-call OCR/image round trip**
+   (e.g. the edited file you're refreshing with happens to be a scanned PDF
+   with no text layer, or a plain image), the tool's halt response says so
+   explicitly: include `document` again on the follow-up call, alongside
+   `extractedText`. Dropping `document` on that follow-up silently turns the
+   refresh into a fresh, separately-slugged save instead of completing it —
+   the halt message calls this out so you don't have to remember it.
+
+## What NOT to do
+
+- Don't pass `document` after every fill by default — it's an explicit,
+  opt-in overwrite, only when the user actually asked to replace/update the
+  stored version.
+- Nothing checks that the file you're passing actually corresponds to the
+  document named in `document` — pointing it at content meant for a
+  different document silently overwrites the wrong one. Double-check the
+  correspondence yourself before calling; the tool trusts you the same way
+  it trusts every other free-text-matched argument in this skill.
+- Don't guess which saved document `document` should match, or guess that a
+  refresh is wanted at all — if either is unclear, ask rather than picking.
+- Don't assume the raw file's extension stays whatever it was before — a
+  `.doc` refreshed from a `.docx` fill output is now stored (and will be
+  filled/recalled) as `.docx`.
+
 # Undoing a bad edit / recalling an earlier fill
 
 ## When to use this
 
-The user wants an earlier version of a filled document back — "undo that",
-"give me the version before I changed the date", "what did I have before
-the last edit" — for a document you've filled one or more times via
-`fill_document_field`/`fill_document_field_batch`. There is no separate
-"restore"/"undo" tool: `list_document_versions` returns the still-on-disk
-output path of each past fill, and you resend the one the user wants with
-the existing `send_file` tool, exactly like after a fresh fill.
+The user wants an earlier version of a document back — "undo that", "give
+me the version before I changed the date", "what did I have before the
+last edit" — for a document you've filled one or more times via
+`fill_document_field`/`fill_document_field_batch`, or refreshed via
+`save_document`'s `document` argument (see "Refreshing" above). There is no
+separate "restore"/"undo" tool: `list_document_versions` returns the
+still-on-disk output path of each past fill *and* each pre-refresh
+snapshot, and you resend the one the user wants with the existing
+`send_file` tool, exactly like after a fresh fill.
 
-**Important:** this only recalls a past *fill output* — it never reverts
-the stored document itself. Filling a document has never touched the
-stored raw file or its extracted text, so there is nothing there to
-"undo"; the user's actual ask ("give me a version from before") is
-answered by resending an earlier already-produced file, not by mutating
-anything in memory.
+**Important:** this only recalls a past *fill output* (or, after a
+refresh, the pre-refresh raw file) — it never reverts the currently-stored
+document itself. Filling a document never touches the stored raw file or
+its extracted text — only an explicit `save_document` refresh does that,
+and even then the version it replaces is preserved here first. The user's
+actual ask ("give me a version from before") is answered by resending an
+already-produced file, not by mutating anything back in memory.
 
 ## Workflow
 
@@ -392,9 +472,11 @@ anything in memory.
    (slug/filename/description). If the reference is ambiguous, it returns
    the same numbered candidate list every other tool in this skill uses —
    relay it and re-call with the exact slug once the user picks.
-2. **Read the report.** One line per past fill, oldest to newest, each
-   with a timestamp, a short description of what was filled (e.g. "row
-   2", "fieldName: Date"), and its output path. A document that was only
+2. **Read the report.** One line per past fill (or pre-refresh snapshot),
+   oldest to newest, each with a timestamp, a short description — normally
+   what was filled (e.g. "row 2", "fieldName: Date"), or literally
+   `pre-refresh snapshot` for an entry that's the version right before a
+   `save_document` refresh — and its output path. A document that was only
    ever saved (never actually filled) reports an empty history — say so
    plainly rather than implying there's something to undo.
    - An entry whose output file was deleted from disk some other way is
@@ -402,7 +484,10 @@ anything in memory.
      that can't actually be resent.
    - Only the 20 most recent fills per document are kept — if the user
      wants something older than that, say the history doesn't go back
-     that far rather than guessing.
+     that far rather than guessing. A pre-refresh snapshot shares this same
+     cap with real fill outputs (it's not a separate, larger allowance) —
+     repeated refreshes of one document can push genuine past fills out of
+     the visible 20 sooner than the user might expect.
 3. **Pick the entry the user means** — usually "the one before the last
    edit" is the second-to-last line in the list (the most recent entry is
    what's currently in effect; the one before it is the pre-last-edit
@@ -422,9 +507,10 @@ mcp__nanoclaw__list_document_versions({ document: "intake-form" })
 - Don't invent a "restore" or "revert" step — there isn't one. The stored
   document is never touched by this; you're only resending a file that
   was already produced and is still sitting on disk.
-- Don't call this for a document that was never filled — check
+- Don't call this for a document that was never filled or refreshed — check
   `list_documents`/the concept file first if you're not sure whether it's
-  ever actually been through `fill_document_field`.
+  ever actually been through `fill_document_field` or a `save_document`
+  refresh.
 - Don't forget `send_file` — `list_document_versions` only reports paths,
   it never delivers anything.
 - Don't offer an entry the tool didn't list — a deleted output is already
