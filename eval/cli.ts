@@ -1,14 +1,17 @@
 /**
- * CLI entry point: `pnpm eval run <scenario-set-name>` or `pnpm eval sweep`.
+ * CLI entry point: `pnpm eval run <scenario-set-name>`, `pnpm eval sweep`,
+ * `pnpm eval prune`, or `pnpm eval teardown`.
  *
- * `dispatchEvalCli` (bottom of this file) routes between the two: `run`
+ * `dispatchEvalCli` (bottom of this file) routes between the four: `run`
  * drives the whole pipeline this epic built — `loader → runner →
  * judge/deterministic (or judge/llm, depending on the scenario's judging
  * type) → reporter` — under one `withEvalLock` call (AD-8), matching
  * `lock.ts`'s own docstring expectation that this file is its first real
  * caller; `sweep` (Story 3.1) delegates to `./sweep.js`'s `runSweep()`, its
- * own standalone, differently-shaped operation. Exactly two subcommands are
- * supported: an unknown subcommand, no subcommand, or an unregistered
+ * own standalone, differently-shaped operation; `prune`/`teardown`
+ * (deferred-work.md's "no teardown/pruning story" finding) delegate to
+ * `./teardown.js`'s `pruneEvalSessions()`/`decommissionEvalHarness()`. An
+ * unknown subcommand, no subcommand, or (for `run`) an unregistered
  * scenario-set name is a clear error to stderr with `process.exitCode = 1`
  * and, per the I/O matrix, is thrown before `withEvalLock` ever acquires —
  * a bad invocation touches no session, no container, no lock file.
@@ -24,6 +27,12 @@ import { runScenarioTurn } from './runner.js';
 import { EVAL_THREAD_PREFIX } from './session.js';
 import { bootstrapDb, ensureEvalJudgeGroup, ensureEvalScenarioGroup } from './setup.js';
 import { runSweep, type SweepResult } from './sweep.js';
+import {
+  decommissionEvalHarness,
+  pruneEvalSessions,
+  type DecommissionResult,
+  type PruneResult,
+} from './teardown.js';
 
 interface ParsedArgs {
   scenarioSetName: string;
@@ -292,15 +301,53 @@ export async function runCli(argv: string[]): Promise<Report> {
 }
 
 /**
- * Top-level subcommand dispatcher (Story 3.1). Recognizes exactly two
+ * `pnpm eval prune` — deletes every eval-managed session (DB row + on-disk
+ * dir) for the eval/eval-judge groups, keeping the groups themselves
+ * provisioned. See `teardown.ts`'s own docstring for the full reasoning.
+ * Always exits 0 — this isn't a pass/fail verdict the way `run` is, only a
+ * summary of what got cleaned up (and what was skipped, if anything).
+ */
+async function runPrune(): Promise<PruneResult> {
+  const result = await pruneEvalSessions();
+  console.log(
+    `Pruned ${result.removedSessions} eval session(s).` +
+      (result.skippedRunning.length > 0 ? ` Skipped ${result.skippedRunning.length} still-running session(s).` : ''),
+  );
+  process.exitCode = 0;
+  return result;
+}
+
+/**
+ * `pnpm eval teardown` — `runPrune`'s own work, plus deletes the
+ * eval/eval-judge agent groups themselves (workspace + DB rows). See
+ * `teardown.ts`'s own docstring for why this is safe/recoverable, not a
+ * one-way door. Always exits 0, same reasoning as `runPrune`.
+ */
+async function runTeardown(): Promise<DecommissionResult> {
+  const result = await decommissionEvalHarness();
+  console.log(
+    `Decommissioned ${result.removedGroups.length} eval group(s) (${result.removedGroups.join(', ') || 'none'}), ` +
+      `removed ${result.removedSessions} session(s).` +
+      (result.skippedRunning.length > 0 ? ` Skipped ${result.skippedRunning.length} still-running session(s).` : ''),
+  );
+  process.exitCode = 0;
+  return result;
+}
+
+/**
+ * Top-level subcommand dispatcher (Story 3.1, extended for `prune`/
+ * `teardown` — deferred-work.md's own "adding a subcommand is a scope
+ * decision for a future story, not a review-cycle patch" note, made now
+ * deliberately rather than under review-time pressure). Recognizes four
  * subcommands: `run` (delegates the full, unmodified `argv` to `runCli`,
- * which does its own scenario-set-name parsing/validation) and `sweep`
- * (delegates to `runSweep()`, which takes no arguments — a trailing extra
- * argument is a usage error, same strictness `run`'s own `parseArgs`
- * already applies). Anything else — an unknown subcommand, or no
- * subcommand at all — is one clear, combined usage error naming both,
- * thrown before either handler runs so a bad invocation never touches a
- * lock, a session, or a container.
+ * which does its own scenario-set-name parsing/validation), `sweep`
+ * (delegates to `runSweep()`), `prune` and `teardown` (delegate to
+ * `runPrune()`/`runTeardown()` above) — the latter three all take no
+ * arguments, a trailing extra argument is a usage error, same strictness
+ * `run`'s own `parseArgs` already applies. Anything else — an unknown
+ * subcommand, or no subcommand at all — is one clear, combined usage error
+ * naming all four, thrown before any handler runs so a bad invocation never
+ * touches a lock, a session, or a container.
  *
  * Declared `async` deliberately (review finding, converged across all 3
  * review layers): a plain function's own `throw` below is a *synchronous*
@@ -316,14 +363,24 @@ export async function runCli(argv: string[]): Promise<Report> {
  * Exported for `cli.test.ts`'s own direct coverage of the dispatch routing,
  * same reasoning as `runOneScenario` above.
  */
-export async function dispatchEvalCli(argv: string[]): Promise<Report | SweepResult> {
+export async function dispatchEvalCli(argv: string[]): Promise<Report | SweepResult | PruneResult | DecommissionResult> {
   const [subcommand, ...rest] = argv;
   if (subcommand === 'run') return runCli(argv);
   if (subcommand === 'sweep') {
     if (rest.length > 0) throw new Error(`Usage: pnpm eval sweep. Got: ${JSON.stringify(argv)}`);
     return runSweep();
   }
-  throw new Error(`Usage: pnpm eval run <scenario-set-name> | pnpm eval sweep. Got: ${JSON.stringify(argv)}`);
+  if (subcommand === 'prune') {
+    if (rest.length > 0) throw new Error(`Usage: pnpm eval prune. Got: ${JSON.stringify(argv)}`);
+    return runPrune();
+  }
+  if (subcommand === 'teardown') {
+    if (rest.length > 0) throw new Error(`Usage: pnpm eval teardown. Got: ${JSON.stringify(argv)}`);
+    return runTeardown();
+  }
+  throw new Error(
+    `Usage: pnpm eval run <scenario-set-name> | pnpm eval sweep | pnpm eval prune | pnpm eval teardown. Got: ${JSON.stringify(argv)}`,
+  );
 }
 
 // CLI entry point — only runs when this file is executed directly (`tsx

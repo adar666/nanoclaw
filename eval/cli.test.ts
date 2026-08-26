@@ -49,6 +49,11 @@ vi.mock('../src/container-runner.js', () => ({
   // the mock must export it too or the real code sees `undefined` in its
   // place.
   EVAL_CLI_ONESHOT_TOKEN: 'eval-cli-oneshot',
+  // teardown.ts (imported by cli.ts for the prune/teardown subcommands)
+  // calls this too — real dedicated coverage for its actual behavior lives
+  // in teardown.test.ts; here it just needs to exist so a prune/teardown
+  // dispatch test doesn't crash on an undefined import.
+  isContainerRunning: vi.fn(() => false),
 }));
 
 vi.mock('./judge/deterministic.js', () => ({
@@ -59,9 +64,11 @@ vi.mock('./judge/llm.js', () => ({
   judgeLlm: vi.fn(),
 }));
 
+import { getAgentGroupByFolder } from '../src/db/agent-groups.js';
 import { killAllActiveContainers } from '../src/container-runner.js';
 import { closeDb } from '../src/db/index.js';
 import type { OutboundMessage } from '../src/db/session-db.js';
+import { getSessionsByAgentGroup } from '../src/db/sessions.js';
 import { readEnvFile } from '../src/env.js';
 import { dispatchEvalCli, runCli, runOneScenario } from './cli.js';
 import { judgeDeterministic } from './judge/deterministic.js';
@@ -70,8 +77,8 @@ import type { Scenario } from './loader.js';
 import { EVAL_LOCK_PATH } from './lock.js';
 import { REPORTS_DIR } from './reporter.js';
 import { runScenarioTurn } from './runner.js';
-import { EVAL_THREAD_PREFIX } from './session.js';
-import { ensureEvalJudgeGroup, ensureEvalScenarioGroup } from './setup.js';
+import { EVAL_THREAD_PREFIX, resolveEvalSession } from './session.js';
+import { bootstrapDb, ensureEvalJudgeGroup, ensureEvalScenarioGroup } from './setup.js';
 
 const mockedReadEnvFile = vi.mocked(readEnvFile);
 const mockedRunScenarioTurn = vi.mocked(runScenarioTurn);
@@ -557,8 +564,46 @@ describe('dispatchEvalCli (Story 3.1)', () => {
     expect(process.exitCode).toBe(0);
   });
 
-  it('rejects with one usage error naming both "run" and "sweep" for an unknown subcommand, touching nothing (no lock file either)', async () => {
-    await expect(dispatchEvalCli(['bogus'])).rejects.toThrow(/run.*sweep|sweep.*run/is);
+  it('routes "prune" to pruneEvalSessions() — removes a real eval session, group stays provisioned', async () => {
+    // ensureEvalScenarioGroup/resolveEvalSession are real (only runner.js's
+    // runScenarioTurn is mocked in this file) — provisions the group and a
+    // real session exactly like a real run would, without needing the
+    // mocked turn pipeline to (it can't: it never touches the DB).
+    // bootstrapDb() first — normally runCli's own job, not called yet since
+    // this test never goes through runCli/dispatchEvalCli(['run', ...]).
+    bootstrapDb();
+    const group = ensureEvalScenarioGroup();
+    const { session } = resolveEvalSession(group.id, `${EVAL_THREAD_PREFIX}:some-scenario`);
+    expect(getSessionsByAgentGroup(group.id)).toEqual([session]);
+
+    const result = await dispatchEvalCli(['prune']);
+
+    expect(result).toMatchObject({ removedSessions: 1, skippedRunning: [] });
+    expect(getSessionsByAgentGroup(group.id)).toEqual([]);
+    expect(getAgentGroupByFolder('eval')).toBeDefined(); // group itself untouched
+  });
+
+  it('routes "teardown" to decommissionEvalHarness() — removes a provisioned group entirely', async () => {
+    bootstrapDb();
+    ensureEvalScenarioGroup();
+    ensureEvalJudgeGroup();
+    expect(getAgentGroupByFolder('eval')).toBeDefined();
+    expect(getAgentGroupByFolder('eval-judge')).toBeDefined();
+
+    const result = await dispatchEvalCli(['teardown']);
+
+    expect((result as { removedGroups: string[] }).removedGroups.sort()).toEqual(['eval', 'eval-judge']);
+    expect(getAgentGroupByFolder('eval')).toBeUndefined();
+    expect(getAgentGroupByFolder('eval-judge')).toBeUndefined();
+  });
+
+  it('rejects "prune"/"teardown" with a trailing extra argument, matching sweep\'s own strictness about extra args', async () => {
+    await expect(dispatchEvalCli(['prune', 'extra'])).rejects.toThrow(/usage/i);
+    await expect(dispatchEvalCli(['teardown', 'extra'])).rejects.toThrow(/usage/i);
+  });
+
+  it('rejects with one usage error naming all four subcommands for an unknown subcommand, touching nothing (no lock file either)', async () => {
+    await expect(dispatchEvalCli(['bogus'])).rejects.toThrow(/run.*sweep.*prune.*teardown/is);
     expect(mockedRunScenarioTurn).not.toHaveBeenCalled();
     expect(fs.existsSync(EVAL_LOCK_PATH)).toBe(false);
   });
