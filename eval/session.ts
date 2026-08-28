@@ -10,7 +10,7 @@
  */
 import { randomUUID } from 'crypto';
 
-import { findSystemSession, createSession, updateSession } from '../src/db/sessions.js';
+import { findSystemSession, createSession, deleteSession, updateSession } from '../src/db/sessions.js';
 import { log } from '../src/log.js';
 import { initSessionFolder } from '../src/session-manager.js';
 import type { Session } from '../src/types.js';
@@ -72,7 +72,18 @@ export function resolveEvalSession(agentGroupId: string, threadId: string): { se
   };
 
   createSession(session);
-  initSessionFolder(agentGroupId, id);
+  try {
+    initSessionFolder(agentGroupId, id);
+  } catch (err) {
+    // Rollback (deferred-work.md finding, spec-eval-1-1): the DB insert above
+    // already committed — if the follow-up filesystem step throws, delete the
+    // row rather than leave an orphaned `sessions` row with no matching
+    // session folder/DBs for a later resolveEvalSession(agentGroupId,
+    // threadId) call's `findSystemSession` to find and silently treat as
+    // already-provisioned.
+    deleteSession(id);
+    throw err;
+  }
   log.info('Eval session created', { id, agentGroupId, threadId });
 
   return { session, created: true };

@@ -13,7 +13,7 @@ import path from 'path';
 
 import { DATA_DIR, GROUPS_DIR } from '../src/config.js';
 import { CALENDAR_ID_RE, type AdditionalMountConfig } from '../src/container-config.js';
-import { createAgentGroup, getAgentGroupByFolder } from '../src/db/agent-groups.js';
+import { createAgentGroup, deleteAgentGroup, getAgentGroupByFolder } from '../src/db/agent-groups.js';
 import { initDb } from '../src/db/connection.js';
 import { getContainerConfig, updateContainerConfigJson } from '../src/db/container-configs.js';
 import { runMigrations } from '../src/db/migrations/index.js';
@@ -56,7 +56,18 @@ export function ensureAgentGroup(folder: string, name: string): AgentGroup {
   const id = `ag-${randomUUID()}`;
   const group: AgentGroup = { id, name, folder, agent_provider: null, created_at: new Date().toISOString() };
   createAgentGroup(group);
-  initGroupFilesystem(group);
+  try {
+    initGroupFilesystem(group);
+  } catch (err) {
+    // Rollback (deferred-work.md finding, spec-eval-1-1): the DB insert above
+    // already committed — if the follow-up filesystem step throws, delete the
+    // row rather than leave an orphaned `agent_groups` row with no matching
+    // workspace for a later `getAgentGroupByFolder(folder)` call to trip over
+    // (it would return a group whose `initGroupFilesystem` never actually
+    // finished, silently skipping the repair-on-existing branch above).
+    deleteAgentGroup(id);
+    throw err;
+  }
   return group;
 }
 

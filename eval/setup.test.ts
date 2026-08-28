@@ -27,8 +27,18 @@ vi.mock('../src/env.js', () => ({
   readEnvFile: vi.fn(() => ({})),
 }));
 
+// Calls through to the real implementation by default (every existing test
+// below relies on the real filesystem side effects) — only the rollback test
+// overrides it, via mockImplementationOnce, to simulate the follow-up
+// filesystem step throwing after the DB insert already committed.
+vi.mock('../src/group-init.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/group-init.js')>();
+  return { ...actual, initGroupFilesystem: vi.fn(actual.initGroupFilesystem) };
+});
+
 import { closeDb, initTestDb, runMigrations } from '../src/db/index.js';
 import { getAgentGroupByFolder, getAllAgentGroups } from '../src/db/agent-groups.js';
+import { initGroupFilesystem } from '../src/group-init.js';
 import { getContainerConfig } from '../src/db/container-configs.js';
 import { getDestinations } from '../src/modules/agent-to-agent/db/agent-destinations.js';
 import { readEnvFile } from '../src/env.js';
@@ -309,5 +319,30 @@ describe('ensureAgentGroup', () => {
 
     expect(again.id).toBe(group.id);
     expect(fs.existsSync(`${TEST_ROOT}/groups/eval-repair`)).toBe(true);
+  });
+
+  it('rolls back (deletes) the agent_groups row when the filesystem step throws after the DB insert commits (deferred-work.md, spec-eval-1-1)', () => {
+    vi.mocked(initGroupFilesystem).mockImplementationOnce(() => {
+      throw new Error('disk full');
+    });
+
+    expect(() => ensureAgentGroup('eval-rollback', 'Rollback Test')).toThrow(/disk full/);
+
+    // No orphaned row left behind for a later ensureAgentGroup(folder, ...)
+    // call to find and treat as already-provisioned (silently skipping the
+    // repair-on-existing branch, since initGroupFilesystem never finished).
+    expect(getAgentGroupByFolder('eval-rollback')).toBeUndefined();
+  });
+
+  it('a later ensureAgentGroup call for the same folder after a rollback creates a fresh group rather than silently no-oping', () => {
+    vi.mocked(initGroupFilesystem).mockImplementationOnce(() => {
+      throw new Error('disk full');
+    });
+    expect(() => ensureAgentGroup('eval-rollback-retry', 'Rollback Retry Test')).toThrow();
+
+    const group = ensureAgentGroup('eval-rollback-retry', 'Rollback Retry Test');
+
+    expect(group.folder).toBe('eval-rollback-retry');
+    expect(fs.existsSync(`${TEST_ROOT}/groups/eval-rollback-retry`)).toBe(true);
   });
 });
