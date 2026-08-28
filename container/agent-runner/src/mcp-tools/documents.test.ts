@@ -27,6 +27,7 @@ import {
   listDocumentVersions,
   describePdfReadError,
   withLock,
+  ocrPngText,
 } from './documents.js';
 
 // ---------------------------------------------------------------------------
@@ -53,9 +54,33 @@ import {
 let mockOcrResult: { text: string } | { error: string } = { text: '' };
 let lastCreateWorkerCall: { langs: unknown; oem: unknown; options: { workerPath?: string; cachePath?: string } } | undefined;
 
+// Concurrency instrumentation for the withOcrCacheDirLock regression test
+// below (deferred-work.md, ocr-fallback item) — `createWorkerDelayMs` lets a
+// test hold createWorker "in flight" long enough for a second concurrent
+// call to genuinely overlap if the lock didn't exist;
+// `maxConcurrentCreateWorkerCalls` records the real high-water mark. Both
+// reset to their neutral defaults in beforeEach below so they never leak
+// into an unrelated test.
+let createWorkerDelayMs = 0;
+let activeCreateWorkerCalls = 0;
+let maxConcurrentCreateWorkerCalls = 0;
+// Makes createWorker() itself throw (rather than the later recognize()
+// call) — used only to test that withOcrCacheDirLock's chain doesn't get
+// permanently wedged by a failing call.
+let createWorkerShouldThrow: string | undefined;
+
 mock.module('tesseract.js', () => ({
   createWorker: async (langs: unknown, oem: unknown, options: { workerPath?: string; cachePath?: string }) => {
     lastCreateWorkerCall = { langs, oem, options };
+    activeCreateWorkerCalls++;
+    maxConcurrentCreateWorkerCalls = Math.max(maxConcurrentCreateWorkerCalls, activeCreateWorkerCalls);
+    if (createWorkerDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, createWorkerDelayMs));
+    }
+    activeCreateWorkerCalls--;
+    if (createWorkerShouldThrow !== undefined) {
+      throw new Error(createWorkerShouldThrow);
+    }
     return {
       recognize: async () => {
         if ('error' in mockOcrResult) throw new Error(mockOcrResult.error);
@@ -339,6 +364,10 @@ beforeEach(() => {
   fs.mkdirSync(inboxDir, { recursive: true });
   mockOcrResult = { text: '' };
   lastCreateWorkerCall = undefined;
+  createWorkerDelayMs = 0;
+  activeCreateWorkerCalls = 0;
+  maxConcurrentCreateWorkerCalls = 0;
+  createWorkerShouldThrow = undefined;
 });
 
 afterEach(() => {
@@ -5210,5 +5239,64 @@ describe('withLock — off-by-one and fencing regressions', () => {
     } finally {
       fs.rmSync(work, { recursive: true, force: true });
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ocrPngText — per-cacheDir download-race lock (deferred-work.md,
+// ocr-fallback item)
+//
+// Two concurrent first-ever OCR calls against the same fresh (not-yet-
+// populated) `.ocr-cache/` dir could otherwise both trigger createWorker's
+// own internal eng.traineddata/heb.traineddata download at once. Verified
+// here without a real network call: the mocked createWorker (module-level
+// mock above) holds "in flight" for `createWorkerDelayMs` and records the
+// real concurrent high-water mark via `maxConcurrentCreateWorkerCalls` — if
+// the lock weren't there, two calls started together would both be in
+// flight at once and that mark would read 2.
+// ---------------------------------------------------------------------------
+
+describe('ocrPngText — concurrent calls against the same cacheDir', () => {
+  it('never runs two createWorker calls concurrently against the same cacheDir', async () => {
+    const cacheDir = path.join(baseDir, '.ocr-cache');
+    createWorkerDelayMs = 20;
+    mockOcrResult = { text: 'ocr text' };
+
+    const [a, b] = await Promise.all([
+      ocrPngText('/fake/page-a.png', { cacheDir }),
+      ocrPngText('/fake/page-b.png', { cacheDir }),
+    ]);
+
+    expect(maxConcurrentCreateWorkerCalls).toBe(1);
+    expect(a).toBe('ocr text');
+    expect(b).toBe('ocr text');
+  });
+
+  it('does not serialize createWorker calls against two different cacheDirs', async () => {
+    createWorkerDelayMs = 20;
+    mockOcrResult = { text: 'ocr text' };
+
+    const [a, b] = await Promise.all([
+      ocrPngText('/fake/page-a.png', { cacheDir: path.join(baseDir, 'group-a', '.ocr-cache') }),
+      ocrPngText('/fake/page-b.png', { cacheDir: path.join(baseDir, 'group-b', '.ocr-cache') }),
+    ]);
+
+    // Different agent groups' cache dirs are independent locks — no reason
+    // for one group's OCR call to wait on an unrelated group's.
+    expect(maxConcurrentCreateWorkerCalls).toBe(2);
+    expect(a).toBe('ocr text');
+    expect(b).toBe('ocr text');
+  });
+
+  it("one call's createWorker failure never wedges a later call against the same cacheDir", async () => {
+    const cacheDir = path.join(baseDir, '.ocr-cache');
+    createWorkerShouldThrow = 'simulated createWorker failure (e.g. a failed language-data download)';
+
+    await expect(ocrPngText('/fake/page-a.png', { cacheDir })).rejects.toThrow(createWorkerShouldThrow);
+
+    createWorkerShouldThrow = undefined;
+    mockOcrResult = { text: 'recovered' };
+    const result = await ocrPngText('/fake/page-b.png', { cacheDir });
+    expect(result).toBe('recovered');
   });
 });

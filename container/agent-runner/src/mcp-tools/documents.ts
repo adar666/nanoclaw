@@ -805,7 +805,34 @@ function renderFileNameFor(resolvedPath: string, originalFilename: string): stri
 const OCR_TIMEOUT_MS = 60_000;
 // ---------------------------------------------------------------------------
 
-async function ocrPngText(pngPath: string, ocrOpts: { cacheDir: string }): Promise<string> {
+/**
+ * Per-cacheDir in-memory mutex (deferred-work.md finding, ocr-fallback item):
+ * this file never controls tesseract.js's own internal "check cache,
+ * download if missing" sequence for eng.traineddata/heb.traineddata
+ * directly — that happens inside createWorker() itself — so two concurrent
+ * first-ever `save_document` OCR calls against the same fresh (not-yet-
+ * populated) agent-group `.ocr-cache/` dir could otherwise both trigger a
+ * download of the same language file at once. A single-process in-memory
+ * lock keyed by cacheDir path is enough (no eval/lock.ts-style staleness-
+ * reclaim machinery needed): this all runs in one Bun process per
+ * container, so there's no cross-process holder to ever go stale. Chains
+ * each call after whatever's already queued for that same cacheDir, and
+ * always resolves (never rejects) so one call's failure can't permanently
+ * wedge later callers against the same directory.
+ */
+const ocrCacheDirLocks = new Map<string, Promise<unknown>>();
+
+function withOcrCacheDirLock<T>(cacheDir: string, fn: () => Promise<T>): Promise<T> {
+  const prior = ocrCacheDirLocks.get(cacheDir) ?? Promise.resolve();
+  const result = prior.then(fn, fn);
+  ocrCacheDirLocks.set(
+    cacheDir,
+    result.catch(() => undefined),
+  );
+  return result;
+}
+
+export async function ocrPngText(pngPath: string, ocrOpts: { cacheDir: string }): Promise<string> {
   const work = (async () => {
     const tesseractModule = await import('tesseract.js');
     const createWorker = tesseractModule.createWorker ?? tesseractModule.default?.createWorker;
@@ -830,7 +857,16 @@ async function ocrPngText(pngPath: string, ocrOpts: { cacheDir: string }): Promi
 
     fs.mkdirSync(ocrOpts.cacheDir, { recursive: true });
 
-    const worker = await createWorker('eng+heb', undefined, { workerPath, cachePath: ocrOpts.cacheDir });
+    // Locked around worker creation only (not the recognize() call below) —
+    // that's precisely where tesseract.js's own "check cache, download if
+    // missing" sequence runs. Once createWorker resolves for the first
+    // caller against a given cacheDir, the language data is fully present,
+    // so a second, already-queued caller's own createWorker call proceeds
+    // needing no download at all — concurrent recognize() calls against an
+    // already-populated cache are never serialized by this lock.
+    const worker = await withOcrCacheDirLock(ocrOpts.cacheDir, () =>
+      createWorker('eng+heb', undefined, { workerPath, cachePath: ocrOpts.cacheDir }),
+    );
     try {
       const { data } = await worker.recognize(pngPath);
       return (data.text ?? '').trim();
