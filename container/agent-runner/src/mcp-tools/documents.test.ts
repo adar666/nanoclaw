@@ -207,6 +207,29 @@ function buildMinimalPdf(text: string | null): Buffer {
 }
 
 /**
+ * A PDF with one page per entry in `pages`: a string draws real text (a
+ * genuine text layer, via pdf-lib's own drawText/embedFont — the same
+ * pattern `buildTextPdfWithAcroForm` below already uses and already proven
+ * to extract cleanly via pdfjs-dist); `null` leaves the page completely
+ * blank — no content-stream text at all, so pdfjs-dist's getTextContent()
+ * legitimately returns nothing for it, the same "needs OCR" signal a real
+ * scanned page gives, without needing an actual embedded raster image for
+ * these tests to exercise save_document's render+OCR fallback per page
+ * (`buildMultiPageAcroFormPdf` further below already relies on this same
+ * blank-page-means-no-text-layer property for its own page 1).
+ */
+async function buildMultiPagePdf(pages: Array<string | null>): Promise<Buffer> {
+  const { PDFDocument, StandardFonts } = await import('pdf-lib');
+  const pdfDoc = await PDFDocument.create();
+  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  for (const text of pages) {
+    const page = pdfDoc.addPage([200, 200]);
+    if (text) page.drawText(text, { x: 20, y: 150, size: 14, font });
+  }
+  return Buffer.from(await pdfDoc.save());
+}
+
+/**
  * A white canvas with an optional solid-color ink rectangle — pngjs is
  * already this story's real dependency (production decode/encode both go
  * through it), so building the fixture with it is a real PNG, not a second
@@ -587,7 +610,12 @@ describe('save_document — scanned PDF, OCR finds no readable text (Ask-First h
     expect(result.content[0].text).toContain('found little to no readable text');
     expect(result.content[0].text).toContain('save_document again');
     expect(result.content[0].text).toContain('extractedText: ""');
-    // Transparency: the response must disclose that only page 1 was captured.
+    // Transparency: a follow-up extractedText must be scoped to the one
+    // page being asked about (not "the whole document," now that
+    // save_document reads every page independently) — this single-page PDF
+    // happens to phrase that as "for page 1 only" too, but the meaning has
+    // changed from the old page-1-only-ever-captured caveat to "this reply
+    // answers page 1 specifically."
     expect(result.content[0].text).toContain('page 1 only');
     // The render path in the message must be derived from the injected
     // baseDir, not a hardcoded "/workspace/agent/" prefix (which would be
@@ -681,6 +709,154 @@ describe('save_document — scanned PDF, OCR finds no readable text (Ask-First h
     // follow-up flow that needs it — it must not be left orphaned.
     const renderDir = path.join(baseDir, '.document-renders');
     expect(fs.existsSync(renderDir) ? fs.readdirSync(renderDir).length : 0).toBe(0);
+  });
+});
+
+describe('save_document — multi-page PDF, mixed text/image-page handling', () => {
+  it('all-text-layer multi-page PDF: extracts every page directly via pdfjs-dist, in order, no rendering at all', async () => {
+    const filePath = writeInboxFile(
+      'report.pdf',
+      await buildMultiPagePdf(['Page one content.', 'Page two content.', 'Page three content.']),
+    );
+
+    const result = await saveDocumentImpl({ path: filePath }, opts());
+
+    expect(result.isError).toBeFalsy();
+    const concept = fs.readFileSync(path.join(baseDir, 'memory', 'documents', 'report.md'), 'utf-8');
+    const idx1 = concept.indexOf('Page one content.');
+    const idx2 = concept.indexOf('Page two content.');
+    const idx3 = concept.indexOf('Page three content.');
+    expect(idx1).toBeGreaterThan(-1);
+    expect(idx2).toBeGreaterThan(idx1);
+    expect(idx3).toBeGreaterThan(idx2);
+    // No page marker at all — every page came straight from its own text
+    // layer, none needed OCR/transcription.
+    expect(concept).not.toContain('— OCR');
+    expect(concept).not.toContain('— transcribed');
+    expect(fs.existsSync(path.join(baseDir, '.document-renders'))).toBe(false);
+  });
+
+  it('all-scanned multi-page PDF: renders and OCRs every page, concatenated in order with per-page markers', async () => {
+    mockOcrResult = { text: 'OCR text for this page.' };
+    const filePath = writeInboxFile('scan.pdf', await buildMultiPagePdf([null, null, null]));
+
+    const result = await saveDocumentImpl({ path: filePath }, opts());
+
+    expect(result.isError).toBeFalsy();
+    const concept = fs.readFileSync(path.join(baseDir, 'memory', 'documents', 'scan.md'), 'utf-8');
+    expect(concept).toContain('[Page 1 — OCR]');
+    expect(concept).toContain('[Page 2 — OCR]');
+    expect(concept).toContain('[Page 3 — OCR]');
+    // Every page's own render is cleaned up once the whole save succeeds.
+    const renderDir = path.join(baseDir, '.document-renders');
+    expect(fs.existsSync(renderDir) ? fs.readdirSync(renderDir).length : 0).toBe(0);
+  });
+
+  it('mixed PDF: routes each page independently — text pages get no marker, the scanned page does', async () => {
+    mockOcrResult = { text: 'OCR text for the scanned page.' };
+    const filePath = writeInboxFile(
+      'mixed.pdf',
+      await buildMultiPagePdf(['Real text on page one.', null, 'Real text on page three.']),
+    );
+
+    const result = await saveDocumentImpl({ path: filePath }, opts());
+
+    expect(result.isError).toBeFalsy();
+    const concept = fs.readFileSync(path.join(baseDir, 'memory', 'documents', 'mixed.md'), 'utf-8');
+    expect(concept).toContain('Real text on page one.');
+    expect(concept).toContain('[Page 2 — OCR]');
+    expect(concept).toContain('OCR text for the scanned page.');
+    expect(concept).toContain('Real text on page three.');
+    // Only page 2 needed a marker — pages 1 and 3 came straight from their
+    // own text layer and never touched render/OCR.
+    expect((concept.match(/— OCR\]/g) ?? []).length).toBe(1);
+    const renderDir = path.join(baseDir, '.document-renders');
+    expect(fs.existsSync(renderDir) ? fs.readdirSync(renderDir).length : 0).toBe(0);
+  });
+
+  it('a bad page halts the whole save even though other pages already have good content, and resumes on that exact page', async () => {
+    mockOcrResult = { text: '' };
+    const filePath = writeInboxFile(
+      'mixed-bad.pdf',
+      await buildMultiPagePdf(['Real text on page one.', null, 'Real text on page three.']),
+    );
+
+    const halt = await saveDocumentImpl({ path: filePath }, opts());
+    expect(halt.isError).toBeFalsy();
+    expect(halt.content[0].text).toContain('Page 2');
+    expect(halt.content[0].text).toContain('found little to no readable text');
+    expect(halt.content[0].text).toContain('page 2');
+    expect(fs.existsSync(path.join(baseDir, 'memory', 'documents', 'mixed-bad.md'))).toBe(false);
+    const renderDir = path.join(baseDir, '.document-renders');
+    expect(fs.readdirSync(renderDir).length).toBe(1); // only page 2's render survives the halt
+
+    const result = await saveDocumentImpl({ path: filePath, extractedText: 'What I read on page 2.' }, opts());
+
+    expect(result.isError).toBeFalsy();
+    const concept = fs.readFileSync(path.join(baseDir, 'memory', 'documents', 'mixed-bad.md'), 'utf-8');
+    expect(concept).toContain('Real text on page one.');
+    expect(concept).toContain('[Page 2 — transcribed]');
+    expect(concept).toContain('What I read on page 2.');
+    expect(concept).toContain('Real text on page three.');
+    expect(fs.readdirSync(renderDir).length).toBe(0);
+  });
+
+  it('extractedText: "" on a multi-page halt marks just that one page unreadable and keeps the rest of the document', async () => {
+    mockOcrResult = { text: '' };
+    const filePath = writeInboxFile('mixed-blank.pdf', await buildMultiPagePdf(['Real text on page one.', null]));
+
+    await saveDocumentImpl({ path: filePath }, opts());
+    const result = await saveDocumentImpl({ path: filePath, extractedText: '' }, opts());
+
+    expect(result.isError).toBeFalsy();
+    const concept = fs.readFileSync(path.join(baseDir, 'memory', 'documents', 'mixed-blank.md'), 'utf-8');
+    expect(concept).toContain('Real text on page one.');
+    expect(concept).toContain('[Page 2 — no readable text]');
+    // Deliberately NOT the whole-document '_(no text extracted)_' fallback
+    // — that's reserved for a genuinely single-page document (see the
+    // regression tests above); this document still has real content overall.
+    expect(concept).not.toContain('_(no text extracted)_');
+  });
+
+  it('two separate bad pages need two separate Ask-First round trips, one page resolved per call', async () => {
+    mockOcrResult = { text: '' };
+    const filePath = writeInboxFile('two-bad.pdf', await buildMultiPagePdf([null, 'Real text on page two.', null]));
+
+    const halt1 = await saveDocumentImpl({ path: filePath }, opts());
+    expect(halt1.isError).toBeFalsy();
+    expect(halt1.content[0].text).toContain('Page 1');
+    expect(fs.existsSync(path.join(baseDir, 'memory', 'documents', 'two-bad.md'))).toBe(false);
+
+    const halt2 = await saveDocumentImpl({ path: filePath, extractedText: 'What I read on page 1.' }, opts());
+    expect(halt2.isError).toBeFalsy();
+    // Page 2 (real text) was resolved silently in between — the second halt
+    // is on page 3, not page 2.
+    expect(halt2.content[0].text).toContain('Page 3');
+    expect(fs.existsSync(path.join(baseDir, 'memory', 'documents', 'two-bad.md'))).toBe(false);
+
+    const result = await saveDocumentImpl({ path: filePath, extractedText: 'What I read on page 3.' }, opts());
+
+    expect(result.isError).toBeFalsy();
+    const concept = fs.readFileSync(path.join(baseDir, 'memory', 'documents', 'two-bad.md'), 'utf-8');
+    expect(concept).toContain('[Page 1 — transcribed]');
+    expect(concept).toContain('What I read on page 1.');
+    expect(concept).toContain('Real text on page two.');
+    expect(concept).toContain('[Page 3 — transcribed]');
+    expect(concept).toContain('What I read on page 3.');
+    const renderDir = path.join(baseDir, '.document-renders');
+    expect(fs.readdirSync(renderDir).length).toBe(0);
+  });
+
+  it('rejects a PDF over the page-count cap with a clear error before doing any rendering/OCR work', async () => {
+    const manyPages: Array<string | null> = Array.from({ length: 301 }, () => null);
+    const filePath = writeInboxFile('huge.pdf', await buildMultiPagePdf(manyPages));
+
+    const result = await saveDocumentImpl({ path: filePath }, opts());
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('Could not read PDF');
+    expect(result.content[0].text).toContain('300-page limit');
+    expect(fs.existsSync(path.join(baseDir, '.document-renders'))).toBe(false);
   });
 });
 
@@ -3664,8 +3840,14 @@ describe('fill_document_field — PDF, AcroForm signature stamp against a non-te
   it('declines cleanly for a text field with more than one widget', async () => {
     const pdfBytes = await buildAcroFormPdfWithTwoWidgets('Signature');
     const filePath = writeInboxFile('form.pdf', pdfBytes);
+    // Both pages carry only a form-field widget, no drawn text — each needs
+    // OCR under save_document's per-page routing. A non-empty mock OCR
+    // result lets both resolve without an Ask-First halt, so a single call
+    // (unlike the old page-1-only flow's fixed two-call pattern) completes
+    // the save; this test is about fill_document_field's own widget-count
+    // check downstream, not save_document's extraction path.
+    mockOcrResult = { text: 'A form with a two-widget field.' };
     await saveDocumentImpl({ path: filePath }, opts());
-    await saveDocumentImpl({ path: filePath, extractedText: 'A form with a two-widget field.' }, opts());
     writeSavedSignature('uriel', buildSignaturePng({ width: 40, height: 20, ink: { x: 5, y: 5, w: 20, h: 10 } }));
 
     const result = await fillDocumentFieldImpl(
@@ -3683,8 +3865,14 @@ describe('fill_document_field — PDF, AcroForm signature stamp, multi-page widg
   it('stamps on the page the widget is actually on (page 2), via the /P fast path', async () => {
     const pdfBytes = await buildMultiPageAcroFormPdf('Signature');
     const filePath = writeInboxFile('form.pdf', pdfBytes);
+    // Neither page has drawn text (page 1 is deliberately blank; page 2's
+    // form-field widget draws nothing to the content stream either) — both
+    // need OCR under save_document's per-page routing. A non-empty mock OCR
+    // result resolves both without an Ask-First halt, so one call completes
+    // the save; this test is about fill_document_field's own widget->page
+    // resolution downstream, not save_document's extraction path.
+    mockOcrResult = { text: 'A two-page form, field on page 2.' };
     await saveDocumentImpl({ path: filePath }, opts());
-    await saveDocumentImpl({ path: filePath, extractedText: 'A two-page form, field on page 2.' }, opts());
     writeSavedSignature('uriel', buildSignaturePng({ width: 100, height: 50, ink: { x: 10, y: 10, w: 80, h: 30 } }));
 
     const result = await fillDocumentFieldImpl(
@@ -3710,8 +3898,11 @@ describe('fill_document_field — PDF, AcroForm signature stamp, multi-page widg
   it('stamps on the correct page via the /Annots-scan fallback when /P is stripped', async () => {
     const pdfBytes = await buildMultiPageAcroFormPdf('Signature', { stripP: true });
     const filePath = writeInboxFile('form.pdf', pdfBytes);
+    // See the sibling /P-fast-path test above — neither page has drawn
+    // text, so both need OCR; a non-empty mock result resolves both in one
+    // save_document call.
+    mockOcrResult = { text: 'A two-page form, field on page 2, /P stripped.' };
     await saveDocumentImpl({ path: filePath }, opts());
-    await saveDocumentImpl({ path: filePath, extractedText: 'A two-page form, field on page 2, /P stripped.' }, opts());
     writeSavedSignature('uriel', buildSignaturePng({ width: 100, height: 50, ink: { x: 10, y: 10, w: 80, h: 30 } }));
 
     const result = await fillDocumentFieldImpl(
@@ -3760,8 +3951,10 @@ describe('fill_document_field — PDF, AcroForm signature stamp, malformed /Anno
 
     const pdfBytes = Buffer.from(await pdfDoc.save());
     const filePath = writeInboxFile('form.pdf', pdfBytes);
+    // Neither page has drawn text — both need OCR under save_document's
+    // per-page routing; a non-empty mock result resolves both in one call.
+    mockOcrResult = { text: 'A two-page form with a malformed Annots entry.' };
     await saveDocumentImpl({ path: filePath }, opts());
-    await saveDocumentImpl({ path: filePath, extractedText: 'A two-page form with a malformed Annots entry.' }, opts());
     writeSavedSignature('uriel', buildSignaturePng({ width: 100, height: 50, ink: { x: 10, y: 10, w: 80, h: 30 } }));
 
     const result = await fillDocumentFieldImpl(

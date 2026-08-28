@@ -7,20 +7,28 @@
  * All work runs synchronously in-container, in the same MCP tool call
  * (no host round-trip — this needs no external API/credential):
  *
- *   - `.pdf` with a text layer: `pdfjs-dist` extracts the text directly.
- *   - `.pdf` with no text layer (scanned/image-only): `@hyzyla/pdfium`
- *     renders page 1 (page 1 only — later pages are not captured) to a PNG,
- *     and `tesseract.js` OCRs that PNG in-process (English and Hebrew) — a
- *     single deterministic call, not a round trip through the agent's own
+ *   - `.pdf`: every page is read on its own — `pdfjs-dist` first tries that
+ *     page's own text layer; a page with no usable text (scanned/
+ *     image-only) falls back to `@hyzyla/pdfium` rendering just that page
+ *     to a PNG, OCR'd in-process by `tesseract.js` (English and Hebrew) —
+ *     mixed documents (some pages real text, some scanned) are handled
+ *     transparently in one pass, with an inline `[Page N — OCR]` marker
+ *     ahead of any OCR'd page's text so a later reader can tell which pages
+ *     were transcribed vs. directly extracted. This is a single
+ *     deterministic call per page, not a round trip through the agent's own
  *     multimodal turn (spec 2-1, which deliberately reverses this file's
  *     earlier "never a tool-embedded OCR call" stance — see SPEC.md's
- *     amended constraint and spec-2-1's Spec Change Log). If OCR comes back
- *     empty/near-empty (a genuinely blank or unreadable page, or a page in
- *     neither supported language), the tool halts instead of writing a
- *     blank concept file: it asks the agent to either read the
- *     still-present render itself and call back with `extractedText` (the
- *     old vision-fallback path, now only reached on this one edge case), or
- *     call back with `extractedText: ""` to accept today's placeholder.
+ *     amended constraint and spec-2-1's Spec Change Log). If a page's OCR
+ *     comes back empty/near-empty (a genuinely blank or unreadable page, or
+ *     a page in neither supported language), the tool halts on THAT page
+ *     instead of writing a blank/guessed placeholder for it: it asks the
+ *     agent to either read the still-present render itself and call back
+ *     with `extractedText` (scoped to that one page — the old vision-
+ *     fallback path, now only reached on this one edge case), or call back
+ *     with `extractedText: ""` to accept a placeholder for that page only.
+ *     Earlier pages already resolved (real text or successful OCR) are never
+ *     re-asked about — see the design note above `extractPdfPageTexts` for
+ *     how a halt-and-resume cycle finds its way back to the same page.
  *   - `.docx`: text is pulled out of `word/document.xml` (body paragraphs
  *     only — headers, footers, footnotes, and text boxes are not read) by
  *     shelling out to the `unzip` CLI (already in the base image for other
@@ -507,6 +515,22 @@ async function extractDocText(filePath: string): Promise<string> {
 // the background until it settles on its own; best achievable without one.
 const PDF_TIMEOUT_MS = 30_000;
 
+// Sanity bound for save_document's per-page pipeline (deferred-work.md's
+// "is a page-count cap needed" question) — PDF_TIMEOUT_MS (render) and
+// OCR_TIMEOUT_MS (OCR) already bound each individual page's own worst case,
+// but nothing bounds the TOTAL wall-clock time as page count grows: a
+// pathological adversarial input (e.g. a 10,000-page scanned PDF) could
+// still make save_document run for a genuinely unreasonable duration even
+// though each single page is individually well-behaved. A real household
+// document — a contract, a tax return, an insurance policy, even a scanned
+// book chapter — essentially never exceeds a few hundred pages, so this cap
+// is generous headroom for every real case while still turning the
+// pathological one into a fast, clear error instead of a many-hour hang.
+// Applied uniformly (not just to scanned pages) for simplicity — the rare
+// legitimate case of an all-text PDF longer than this can still be split by
+// the user; that tradeoff is deliberate, not an oversight.
+const MAX_PDF_PAGES_FOR_SAVE = 300;
+
 async function extractPdfText(filePath: string): Promise<string> {
   const { getDocument } = await import('pdfjs-dist/legacy/build/pdf.mjs');
   const data = new Uint8Array(fs.readFileSync(filePath));
@@ -523,6 +547,75 @@ async function extractPdfText(filePath: string): Promise<string> {
       page.cleanup();
     }
     return pageTexts.join('\n\n').trim();
+  } finally {
+    await loadingTask.destroy();
+  }
+}
+
+/**
+ * Per-page counterpart to `extractPdfText` above — same pdfjs-dist
+ * per-page loop (`pdfExtractLinesAllPages`'s iteration pattern), but returns
+ * each page's own text separately instead of concatenating the whole
+ * document into one string. `save_document`'s multi-page flow needs this:
+ * `extractPdfText`'s whole-document view can't tell "page 3 has no text"
+ * apart from "the whole document has no text," which is exactly the
+ * distinction mixed text/image-page handling depends on. `fillPdf`'s own
+ * text-layer-or-not branch point is a document-wide decision and keeps
+ * using `extractPdfText` unchanged — this is a separate function rather
+ * than a shared refactor so that call site's behavior is untouched.
+ *
+ * Multi-page Ask-First design note (read this before touching the halt
+ * logic in `saveDocumentImpl`'s PDF branch): a halted call and its
+ * follow-up are two separate, otherwise-stateless MCP tool calls — nothing
+ * persists "which page were we asking about" between them except the
+ * deterministic inputs (the same `path`, hence the same raw PDF bytes) and
+ * the deterministic per-page render filename (see `renderFileNameFor`).
+ * `saveDocumentImpl` exploits that: on every call it re-derives page
+ * routing from scratch, in page order, and applies a caller-supplied
+ * `extractedText` to the FIRST page it finds that needs OCR and comes back
+ * near-empty. Because routing is fully deterministic (same bytes, same OCR
+ * engine, same order), that first near-empty page is always the same page
+ * that halted last time — no explicit page-number argument needed. If a
+ * LATER page also turns out near-empty in the same call, save_document
+ * halts again on that one; a document with several genuinely bad pages
+ * therefore needs several round trips, one page at a time, never a single
+ * call answering more than one page. This trades a few extra round trips
+ * (rare in practice — most scanned documents are either all fine or have
+ * at most one truly blank/unreadable page) for a message contract that
+ * never needs to grow beyond a single string, and for zero new persisted
+ * state anywhere in this stateless-between-calls tool.
+ *
+ * A real cost of "re-derive from scratch every call": on a follow-up call,
+ * every page BEFORE the one being answered is re-processed too — a text
+ * layer page is re-extracted (cheap), but a page that succeeded via OCR on
+ * an earlier call is OCR'd again here (not cheap). Deliberately not cached
+ * — this file has no cross-call state store to put such a cache in, and
+ * for realistic household-scale documents (a handful of pages, rarely more
+ * than one bad page) the extra OCR passes are a small, bounded cost, not a
+ * correctness risk.
+ */
+async function extractPdfPageTexts(filePath: string): Promise<string[]> {
+  const { getDocument } = await import('pdfjs-dist/legacy/build/pdf.mjs');
+  const data = new Uint8Array(fs.readFileSync(filePath));
+  const loadingTask = getDocument({ data, verbosity: 0 });
+  try {
+    const doc = await loadingTask.promise;
+    if (doc.numPages > MAX_PDF_PAGES_FOR_SAVE) {
+      throw new Error(
+        `PDF has ${doc.numPages} pages, over the ${MAX_PDF_PAGES_FOR_SAVE}-page limit save_document supports in ` +
+          'one call — split it into smaller files and save those separately.',
+      );
+    }
+    const pageTexts: string[] = [];
+    for (let i = 1; i <= doc.numPages; i++) {
+      const page = await doc.getPage(i);
+      const content = await page.getTextContent();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const pageText = content.items.map((item: any) => ('str' in item ? item.str : '')).join(' ');
+      pageTexts.push(pageText.trim());
+      page.cleanup();
+    }
+    return pageTexts;
   } finally {
     await loadingTask.destroy();
   }
@@ -662,15 +755,49 @@ function sweepOldFiles(dir: string, maxAgeMs: number): void {
   }
 }
 
-async function renderFirstPageToPng(filePath: string, outPath: string): Promise<{ width: number; height: number }> {
+/**
+ * Pulls the `n`-th (0-based) item out of a `Generator` and stops iterating
+ * — `document.pages()` below yields one native page handle at a time (each
+ * a real @hyzyla/pdfium resource), so this avoids realizing every page up
+ * to `n` into an array (`[...gen]`) just to discard all but one; genuinely
+ * matters for a multi-page save_document call, which calls this once per
+ * image-only page and would otherwise redo O(numPages) work per page,
+ * O(numPages^2) over the whole document.
+ */
+function nthFromGenerator<T>(gen: Generator<T>, n: number): T | undefined {
+  let i = 0;
+  for (const item of gen) {
+    if (i === n) return item;
+    i++;
+  }
+  return undefined;
+}
+
+/**
+ * Renders one page (`pageIndex`, 0-based — defaults to page 1, the only
+ * page `pdfRenderForOverlay`'s single-page overlay flow ever needs) to a
+ * PNG via @hyzyla/pdfium. `document.pages()` returns a `Generator`, not an
+ * array (confirmed against `@hyzyla/pdfium`'s own `.d.ts` — indexing it
+ * directly, e.g. `document.pages()[pageIndex]`, silently returns `undefined`
+ * for every index since a Generator has no numeric properties); `pages()`
+ * still nominally hands the caller every page in the document, but
+ * `save_document`'s multi-page flow only ever wants one of them per call —
+ * see `nthFromGenerator` above. Every existing call site that doesn't pass
+ * `pageIndex` keeps rendering page 1, unchanged.
+ */
+async function renderFirstPageToPng(
+  filePath: string,
+  outPath: string,
+  pageIndex = 0,
+): Promise<{ width: number; height: number }> {
   const { PDFiumLibrary } = await import('@hyzyla/pdfium');
   const buf = fs.readFileSync(filePath);
   const library = await PDFiumLibrary.init();
   try {
     const document = await library.loadDocument(buf);
     try {
-      const [page] = document.pages();
-      if (!page) throw new Error('PDF has no pages');
+      const page = nthFromGenerator(document.pages(), pageIndex);
+      if (!page) throw new Error(`PDF has no page at index ${pageIndex}`);
       let dims = { width: 0, height: 0 };
       const image = await page.render({
         scale: RENDER_SCALE,
@@ -691,16 +818,88 @@ async function renderFirstPageToPng(filePath: string, outPath: string): Promise<
 }
 
 /**
- * Deterministic render filename for a given source file — so a follow-up
- * `save_document` call (same `path`, now with `extractedText`) can compute
- * the identical path and delete it on success, instead of leaving it behind
- * (a random/timestamped name would make that lookup impossible).
+ * Deterministic render filename for a given source file and 1-based page
+ * number — so a follow-up `save_document` call (same `path`, now with
+ * `extractedText`) can compute the identical path and delete it on success,
+ * instead of leaving it behind (a random/timestamped name would make that
+ * lookup impossible). `pageNumber` defaults to 1 — every pre-multi-page call
+ * site (and every single-page document) gets the exact same `-p1.png`
+ * suffix as before this function grew a page number at all.
  */
-function renderFileNameFor(resolvedPath: string, originalFilename: string): string {
+function renderFileNameFor(resolvedPath: string, originalFilename: string, pageNumber = 1): string {
   const hash = crc32(Buffer.from(resolvedPath, 'utf-8'))
     .toString(16)
     .padStart(8, '0');
-  return `${slugify(originalFilename)}-${hash}-p1.png`;
+  return `${slugify(originalFilename)}-${hash}-p${pageNumber}.png`;
+}
+
+/**
+ * Cross-call memory for a multi-page save_document's Ask-First answers —
+ * ONLY needed once a document has had more than one page halt-and-resume in
+ * its lifetime (see the multi-page Ask-First design note above
+ * extractPdfPageTexts). Every call re-derives page routing from scratch, so
+ * a page resolved via `extractedText` on an EARLIER halted call would
+ * otherwise be indistinguishable, on a LATER call, from a page that has
+ * simply never been asked about yet — both look identical (no text layer,
+ * OCR still comes back near-empty, since nothing about the source PDF or
+ * the OCR mock/engine changed between calls). Without this file, a second
+ * bad page's follow-up call would silently re-consume `extractedText` for
+ * the FIRST bad page all over again instead of the new one being answered.
+ * This sidecar closes that gap: every page resolved via `extractedText` is
+ * persisted here immediately, so a later call can skip straight to using
+ * the stored answer for that page — no render, no OCR, no risk of
+ * re-asking about (or silently overwriting the answer to) a page that's
+ * already been answered. Lives in the same `.document-renders/` directory
+ * as the per-page render PNGs, deliberately: `sweepOldFiles`'s existing
+ * mtime-based sweep already reclaims anything in that directory regardless
+ * of filename, so an abandoned sidecar (no follow-up ever arrived) needs no
+ * extra cleanup path of its own. Deleted alongside the render PNGs once the
+ * whole save actually succeeds (see the final cleanup block in
+ * `saveDocumentImpl`) — a completed save has nothing left to resume.
+ */
+function pdfResolvedPagesSidecarPath(renderDir: string, resolvedPath: string, originalFilename: string): string {
+  const hash = crc32(Buffer.from(resolvedPath, 'utf-8'))
+    .toString(16)
+    .padStart(8, '0');
+  return path.join(renderDir, `${slugify(originalFilename)}-${hash}-resolved.json`);
+}
+
+/** Best-effort load — a missing, unreadable, or corrupt sidecar is treated as "nothing resolved yet," never a hard failure (this is a resumability aid, not durable storage). */
+function loadResolvedPages(sidecarPath: string): Map<number, string> {
+  const result = new Map<number, string>();
+  let raw: string;
+  try {
+    raw = fs.readFileSync(sidecarPath, 'utf-8');
+  } catch {
+    return result;
+  }
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object') {
+      for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+        const pageNum = Number(key);
+        if (Number.isInteger(pageNum) && typeof value === 'string') result.set(pageNum, value);
+      }
+    }
+  } catch {
+    // Corrupt sidecar — treat as empty rather than failing the whole save;
+    // the page(s) it would have covered will simply be asked about again.
+  }
+  return result;
+}
+
+/** Read-modify-write: merges one newly-resolved page into whatever the sidecar already holds. Best-effort — a write failure here degrades to "this page may be asked about again on a later call," never a save_document failure. */
+function persistResolvedPage(sidecarPath: string, pageNum: number, text: string): void {
+  try {
+    const existing = loadResolvedPages(sidecarPath);
+    existing.set(pageNum, text);
+    const obj: Record<string, string> = {};
+    for (const [k, v] of existing) obj[String(k)] = v;
+    fs.mkdirSync(path.dirname(sidecarPath), { recursive: true });
+    fs.writeFileSync(sidecarPath, JSON.stringify(obj));
+  } catch (e) {
+    log(`save_document: could not persist resolved-page sidecar at ${sidecarPath} (non-fatal): ${e instanceof Error ? e.message : String(e)}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -985,84 +1184,206 @@ export async function saveDocumentImpl(
 
     let bodyText: string;
     let extractionNote = '';
-    let renderPathToCleanup: string | undefined;
+    // Populated only on the success path — mirrors the pre-multi-page
+    // single `renderPathToCleanup`, generalized to one entry per page that
+    // actually got rendered+OCR'd (or resolved via a follow-up
+    // extractedText) this call. Deliberately NOT deleted if this function
+    // returns early (an Ask-First halt, or an error below) — same
+    // retry-safety guarantee as before: a halted/failed call leaves its
+    // render(s) in place for a follow-up or a retry to find at the same
+    // deterministic path, only cleaned up once the whole save actually
+    // succeeds (see the single cleanup block near the end of this function).
+    const renderPathsToCleanup: string[] = [];
 
     if (ext === 'pdf') {
-      let pdfText: string;
+      let pageTexts: string[];
       try {
-        pdfText = await withTimeout(extractPdfText(resolvedPath), PDF_TIMEOUT_MS, 'PDF text extraction');
+        pageTexts = await withTimeout(extractPdfPageTexts(resolvedPath), PDF_TIMEOUT_MS, 'PDF text extraction');
       } catch (e) {
         return err(`Could not read PDF: ${describePdfReadError(e)}`);
       }
-
-      if (hasTextLayer(pdfText)) {
-        bodyText = pdfText;
-      } else {
-        const renderDir = path.join(opts.baseDir, '.document-renders');
-        sweepOldFiles(renderDir, ABANDONED_RENDER_MAX_AGE_MS);
-        const renderPath = path.join(renderDir, renderFileNameFor(resolvedPath, originalFilename));
-
-        if (extractedText === undefined) {
-          // First call for this path (or a retry after an earlier halt below
-          // — renderFileNameFor is deterministic, so this re-renders the
-          // same file in place rather than accumulating a new PNG per
-          // retry). Render page 1, then OCR it directly: this collapses
-          // what used to be a two-call agent-vision round trip into a
-          // single deterministic call for the common case (spec-2-1).
-          let dims: { width: number; height: number };
-          try {
-            dims = await withTimeout(renderFirstPageToPng(resolvedPath, renderPath), PDF_TIMEOUT_MS, 'PDF page render');
-          } catch (e) {
-            return err(`Could not render scanned PDF page: ${e instanceof Error ? e.message : String(e)}`);
-          }
-
-          let ocrText: string;
-          try {
-            const ocrCacheDir = path.join(opts.baseDir, '.ocr-cache');
-            ocrText = await ocrPngText(renderPath, { cacheDir: ocrCacheDir });
-          } catch (e) {
-            // Unlike the near-empty halt below, there's no follow-up flow
-            // that needs this render — a genuine OCR engine failure (as
-            // opposed to a successful-but-empty OCR) has nothing for a
-            // vision-fallback follow-up to read differently, so clean up
-            // now rather than leaving it orphaned in .document-renders.
-            try {
-              fs.unlinkSync(renderPath);
-            } catch {
-              // best effort
-            }
-            return err(`Could not OCR scanned PDF page: ${e instanceof Error ? e.message : String(e)}`);
-          }
-
-          if (isNearEmptyOcrText(ocrText)) {
-            // Ask-First (spec-2-1): a genuinely blank/unreadable page, or an
-            // OCR result too short to be real content (a stray character
-            // from noise is not "readable text") — do NOT delete the
-            // render, since the vision-fallback choice below needs it
-            // still on disk to read.
-            return ok(
-              'This PDF has no extractable text layer (scanned/image-only), and OCR on page 1 (page 1 only — ' +
-                `later pages are not captured), ${dims.width}x${dims.height}px, at ${renderPath} found little ` +
-                'to no readable text — the page may be genuinely blank or unreadable. Ask the user how to ' +
-                'proceed: either read that rendered image yourself and call save_document again with the same path ' +
-                `("${filePath}") and an "extractedText" argument containing what you read, or call ` +
-                'save_document again with the same path and extractedText: "" to save it with a placeholder ' +
-                'note instead of blank/guessed text.' +
-                refreshRetryNote,
-            );
-          }
-
-          bodyText = ocrText;
-          renderPathToCleanup = renderPath;
-        } else {
-          // Follow-up call after the Ask-First halt above: the agent either
-          // read the still-present render itself (real text) or is
-          // confirming the placeholder (extractedText === ""). Either way,
-          // the render has served its purpose and is cleaned up below.
-          bodyText = extractedText;
-          renderPathToCleanup = renderPath;
-        }
+      if (pageTexts.length === 0) {
+        return err('Could not read PDF: PDF has no pages.');
       }
+
+      // Per-page routing (mixed text/image-page handling): a page with a
+      // real text layer never touches render/OCR at all; a page without one
+      // does, entirely independently of how every other page in the same
+      // document was routed. `isMultiPage` gates the `[Page N — ...]`
+      // markers below — a genuinely single-page PDF (this tool's original,
+      // still overwhelmingly common case) keeps producing bare body text
+      // with no marker at all, byte-identical to this tool's behavior
+      // before multi-page support existed; a "page 1 of 1" marker would be
+      // pure noise there. A document with more than one page gets markers
+      // on every OCR'd/transcribed/placeholder page, so a human or agent
+      // reading the saved concept file later can tell which pages came from
+      // the PDF's own text layer and which were reconstructed.
+      const isMultiPage = pageTexts.length > 1;
+
+      const renderDir = path.join(opts.baseDir, '.document-renders');
+      const sidecarPath = pdfResolvedPagesSidecarPath(renderDir, resolvedPath, originalFilename);
+      const pageBodies: string[] = [];
+      let sweptRenderDir = false;
+      // extractedText, if given, answers only the FIRST near-empty-OCR page
+      // reached on this call that ISN'T already resolved via the sidecar
+      // below — see the design note above extractPdfPageTexts for why
+      // that's always the same page a previous halt asked about, with no
+      // explicit page-number argument needed.
+      let extractedTextConsumed = false;
+      // Loaded lazily (only if this document turns out to actually have a
+      // page needing OCR at all) and only once per call — see
+      // pdfResolvedPagesSidecarPath's own doc comment for why this exists.
+      let resolvedPages: Map<number, string> | undefined;
+
+      for (let i = 0; i < pageTexts.length; i++) {
+        const pageNum = i + 1;
+        const pageText = pageTexts[i];
+
+        if (hasTextLayer(pageText)) {
+          pageBodies.push(pageText);
+          continue;
+        }
+
+        // No text layer on this page — render + OCR it, independently of
+        // every other page's own routing.
+        if (!sweptRenderDir) {
+          sweepOldFiles(renderDir, ABANDONED_RENDER_MAX_AGE_MS);
+          sweptRenderDir = true;
+        }
+        const renderPath = path.join(renderDir, renderFileNameFor(resolvedPath, originalFilename, pageNum));
+        if (!resolvedPages) resolvedPages = loadResolvedPages(sidecarPath);
+
+        const alreadyResolved = resolvedPages.get(pageNum);
+        if (alreadyResolved !== undefined) {
+          // Answered on an EARLIER halted call, not this one (see
+          // pdfResolvedPagesSidecarPath's doc comment) — use that answer
+          // outright, no render/OCR attempt at all. A leftover render for
+          // this exact page (from the call that originally halted on it)
+          // may still be sitting on disk; clean it up defensively now that
+          // it's genuinely no longer needed for anything.
+          pageBodies.push(alreadyResolved);
+          try {
+            fs.unlinkSync(renderPath);
+          } catch {
+            // best effort — may never have existed, or was already cleaned up
+          }
+          continue;
+        }
+
+        if (extractedText !== undefined && !extractedTextConsumed) {
+          // Resumes a previous Ask-First halt on this exact page (see the
+          // design note above extractPdfPageTexts) — trusts the given
+          // text/placeholder outright rather than re-attempting OCR,
+          // mirroring the pre-multi-page follow-up's own trust model.
+          // Persisted to the sidecar immediately (not deferred) — cheap,
+          // and it's the only way a LATER halt in this same call (or an
+          // unrelated render/OCR error on a later page) doesn't lose this
+          // answer for the next call to pick up. The render this page's
+          // earlier halt kept around is no longer needed for anything once
+          // this text is captured, whether or not the rest of this call
+          // eventually succeeds — deleted immediately, not deferred.
+          extractedTextConsumed = true;
+          const trimmed = extractedText.trim();
+          const formatted = !isMultiPage
+            ? extractedText
+            : trimmed
+              ? `[Page ${pageNum} — transcribed]\n${extractedText}`
+              : `[Page ${pageNum} — no readable text]`;
+          pageBodies.push(formatted);
+          if (isMultiPage) persistResolvedPage(sidecarPath, pageNum, formatted);
+          try {
+            fs.unlinkSync(renderPath);
+          } catch {
+            // best effort
+          }
+          continue;
+        }
+
+        // First encounter with this page (or a retry after an earlier halt
+        // on a LATER page — renderFileNameFor is deterministic per page, so
+        // this re-renders the same file in place rather than accumulating a
+        // new PNG per retry). Render, then OCR it directly: this collapses
+        // what used to be a two-call agent-vision round trip into a single
+        // deterministic call for the common case (spec-2-1), now per page.
+        let dims: { width: number; height: number };
+        try {
+          dims = await withTimeout(renderFirstPageToPng(resolvedPath, renderPath, i), PDF_TIMEOUT_MS, 'PDF page render');
+        } catch (e) {
+          return err(`Could not render scanned PDF page ${pageNum}: ${e instanceof Error ? e.message : String(e)}`);
+        }
+
+        let ocrText: string;
+        try {
+          const ocrCacheDir = path.join(opts.baseDir, '.ocr-cache');
+          ocrText = await ocrPngText(renderPath, { cacheDir: ocrCacheDir });
+        } catch (e) {
+          // Unlike the near-empty halt below, there's no follow-up flow
+          // that needs this render — a genuine OCR engine failure (as
+          // opposed to a successful-but-empty OCR) has nothing for a
+          // vision-fallback follow-up to read differently, so clean up
+          // now rather than leaving it orphaned in .document-renders.
+          try {
+            fs.unlinkSync(renderPath);
+          } catch {
+            // best effort
+          }
+          return err(`Could not OCR scanned PDF page ${pageNum}: ${e instanceof Error ? e.message : String(e)}`);
+        }
+
+        if (isNearEmptyOcrText(ocrText)) {
+          // Ask-First (spec-2-1, extended per page): a genuinely blank/
+          // unreadable page, or an OCR result too short to be real content
+          // (a stray character from noise is not "readable text") — halt
+          // HERE and do not process any further pages this call. Do NOT
+          // delete the render, since the vision-fallback choice below needs
+          // it still on disk to read.
+          //
+          // Deliberate choice (deferred-work.md's "mixed text/image-page
+          // handling" framing left this open): one bad page ALWAYS halts —
+          // even in a document where every other page already has good
+          // content — rather than silently marking that one page
+          // "unreadable" and proceeding with the rest. Two reasons: (1) "no
+          // readable text" isn't necessarily "genuinely blank" — it can be
+          // OCR failing on a real but awkwardly-scanned page (skewed, low
+          // contrast) that a human/vision read could still recover, so
+          // silently giving up here would lose real, recoverable content;
+          // (2) a uniform rule ("every failing page gets a chance at a real
+          // answer, no exceptions") is a simpler, more predictable contract
+          // for the agent than a conditional one keyed on how many other
+          // pages already succeeded. The cost is more Ask-First round trips
+          // for a document with several bad pages, one page resolved per
+          // call (see the design note above extractPdfPageTexts) — accepted
+          // as rare in practice: most scanned documents are either all fine
+          // or have at most one truly blank/unreadable page.
+          const pageCountNote = isMultiPage
+            ? ` This PDF has ${pageTexts.length} pages; page ${pageNum} is the one that needs a reply — any ` +
+              'other pages have already been read successfully and do not need to be resent. If a later page ' +
+              'also turns out unreadable, save_document will ask again for that one page once this one is resolved.'
+            : '';
+          return ok(
+            `This PDF has ${pageTexts.length} page(s). Page ${pageNum} has no extractable text layer ` +
+              `(scanned/image-only), and OCR on it, ${dims.width}x${dims.height}px, at ${renderPath} found ` +
+              'little to no readable text — the page may be genuinely blank or unreadable. Ask the user how to ' +
+              'proceed: either read that rendered image yourself and call save_document again with the same path ' +
+              `("${filePath}") and an "extractedText" argument containing what you read for page ${pageNum} ` +
+              'only, or call save_document again with the same path and extractedText: "" to save that page ' +
+              `with a placeholder note instead of blank/guessed text.${pageCountNote}` +
+              refreshRetryNote,
+          );
+        }
+
+        pageBodies.push(isMultiPage ? `[Page ${pageNum} — OCR]\n${ocrText}` : ocrText);
+        renderPathsToCleanup.push(renderPath);
+      }
+
+      // A completed save has nothing left to resume — the sidecar (if this
+      // document ever needed one at all) is reclaimed the same way as the
+      // per-page renders, on the same successful-save-only cleanup path
+      // below. Pushing it unconditionally is safe: cleaning up a sidecar
+      // that was never created is just a harmless no-op unlink failure.
+      if (isMultiPage) renderPathsToCleanup.push(sidecarPath);
+
+      bodyText = pageBodies.join('\n\n');
     } else if (IMAGE_EXTENSIONS.has(ext)) {
       // No rendering step — the uploaded file already IS the image to look
       // at. Always a two-call vision-read pattern (unlike a scanned PDF,
@@ -1351,12 +1672,13 @@ export async function saveDocumentImpl(
       response = lockResult.response;
     }
 
-    if (renderPathToCleanup) {
+    for (const renderPath of renderPathsToCleanup) {
       try {
-        fs.unlinkSync(renderPathToCleanup);
+        fs.unlinkSync(renderPath);
       } catch {
-        // Best effort — an abandoned first-call render (no follow-up ever
-        // arrived) is not cleaned up here; see deferred-work.md.
+        // Best effort — an abandoned render (no follow-up ever arrived for
+        // that page) is not cleaned up here; sweepOldFiles reclaims it
+        // opportunistically on a later scanned-PDF render instead.
       }
     }
 

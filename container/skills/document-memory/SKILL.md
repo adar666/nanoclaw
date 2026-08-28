@@ -25,27 +25,36 @@ it.
    no waiting, no follow-up message to expect later.
 
 2. **Three possible outcomes:**
-   - **Saved.** The tool copied the file into memory, extracted its text
-     (for a scanned PDF, page 1 was rendered and OCR'd automatically —
-     English and Hebrew — in this same call — you don't need to read
-     anything yourself), and recorded it — you're done. Tell the user it's
-     saved and can be asked about later without resending it. **For a
-     scanned PDF, only page 1 is ever rendered/OCR'd** — for a multi-page
-     scanned PDF, later pages are not captured; if the document is more
-     than one page, say so rather than implying you saved the whole thing.
-   - **Scanned PDF, OCR found little to no readable text.** Rare — a
-     genuinely blank/unreadable page 1, or a page in a language other than
-     English/Hebrew. The tool renders page 1 to a PNG, tries OCR, and when
-     that comes back empty or near-empty tells you so instead of saving
-     anything yet — no memory entry exists at this point. Ask the user how
-     to proceed:
+   - **Saved.** The tool copied the file into memory, extracted its text,
+     and recorded it — you're done. Tell the user it's saved and can be
+     asked about later without resending it. **A multi-page PDF is fully
+     supported** — every page is read on its own: a page with a real text
+     layer is extracted directly, and a page with no text layer (scanned/
+     image-only) is rendered and OCR'd automatically (English and Hebrew) —
+     all in this same call, all pages included, you don't need to read
+     anything yourself. A mixed document (some pages real text, some
+     scanned) is handled transparently in one pass; the saved concept file
+     marks any OCR'd/transcribed page inline (`[Page N — OCR]` or
+     `[Page N — transcribed]`) so it's clear later which pages came from
+     the PDF's own text and which were reconstructed — you don't need to
+     mention that distinction yourself unless asked.
+   - **Scanned PDF, one page's OCR found little to no readable text.**
+     Rare — a genuinely blank/unreadable page, or a page in a language
+     other than English/Hebrew. The tool halts on that ONE page instead of
+     saving anything yet — no memory entry exists at this point, even if
+     every other page already read fine. Ask the user how to proceed:
      either **read the rendered image yourself** with your own Read tool
-     (you're multimodal — this is a fallback for this one case, not the
+     (you're multimodal — this is a fallback for this one page, not the
      normal path) and call `save_document` again with the *same* `path`
-     argument plus an `extractedText` argument containing what you read, or
-     call `save_document` again with the same `path` and
-     `extractedText: ""` to save it with a placeholder note instead. Either
-     follow-up call completes the save.
+     argument plus an `extractedText` argument containing what you read
+     **for that one page only** (never re-describe the whole document —
+     other pages have already been captured and don't need to be resent),
+     or call `save_document` again with the same `path` and
+     `extractedText: ""` to save just that page with a placeholder note
+     instead. Either follow-up call completes the save — unless a LATER
+     page in the same document also turns out unreadable, in which case
+     the tool halts again on that page and needs one more round trip; keep
+     replying the same way, one page at a time, until it reports saved.
    - **Plain image, needs your own reading.** For a `.jpg`/`.jpeg`/`.png`
      upload, the tool always tells you it needs you to read it yourself
      instead of saving anything yet — no memory entry exists at this point.
@@ -212,8 +221,10 @@ Three mechanisms, auto-detected — you never pick a mode explicitly:
      draws the value right after that line's existing content, on the same
      baseline. This never edits or reflows existing text, only adds new
      content in blank space.
-3. **Scanned/image-only PDF** (no text layer at all): two calls, mirroring
-   `save_document`'s scanned-PDF pattern.
+3. **Scanned/image-only PDF** (no text layer at all): two calls. Unlike
+   `save_document`'s own scanned-PDF handling (which reads every page),
+   this fill flow is page-1-only — it targets one specific spot on one
+   page, not the whole document's content.
    - First call: `fill_document_field({ document })` — renders page 1 (page
      1 only) and returns its path + pixel dimensions.
    - **Read that image yourself** and estimate the pixel position (x,y from
