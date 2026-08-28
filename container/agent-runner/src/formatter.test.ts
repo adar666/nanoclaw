@@ -206,24 +206,58 @@ describe('XML escaping', () => {
 });
 
 describe('eval-run routing and formatting', () => {
-  it('extractRouting derives evalRun true when every message is kind eval', () => {
+  // extractRouting's `evalRun` is now derived from `isEvalThread()`
+  // (db/session-routing.ts's session_routing.thread_id) — the same canonical
+  // signal index.ts uses for SessionMode — not from each message's own
+  // `kind` field. See extractRouting's own doc comment (formatter.ts) for why.
+  function seedEvalSessionRouting(): void {
+    const db = getInboundDb();
+    db.exec(`CREATE TABLE IF NOT EXISTS session_routing (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      channel_type TEXT, platform_id TEXT, thread_id TEXT
+    )`);
+    db.prepare(
+      'INSERT OR REPLACE INTO session_routing (id, channel_type, platform_id, thread_id) VALUES (1, NULL, NULL, ?)',
+    ).run('system:eval');
+  }
+
+  it('extractRouting derives evalRun true for a genuinely eval-harness session', () => {
+    seedEvalSessionRouting();
     insertMessage('e1', 'eval', { sender: 'Judge', text: 'is there an event tomorrow?' });
     const routing = extractRouting(getPendingMessages());
     expect(routing.evalRun).toBe(true);
     expect(routing.taskRun).toBe(false);
   });
 
-  it('extractRouting derives evalRun false for a mixed or non-eval batch', () => {
+  it('extractRouting derives evalRun false for a non-eval session, regardless of message kind', () => {
     insertMessage('m1', 'chat', { sender: 'Alice', text: 'hi' });
     expect(extractRouting(getPendingMessages()).evalRun).toBe(false);
 
     insertMessage('e1', 'eval', { sender: 'Judge', text: 'hi' });
-    // Batch now has both a chat row and an eval row — not a pure eval batch.
+    // An eval-kind row present in a non-eval session's batch still doesn't
+    // make it an eval run — the session's own thread id is the sole signal
+    // now, not any individual message's kind tag (see extractRouting's doc).
     expect(extractRouting(getPendingMessages()).evalRun).toBe(false);
   });
 
-  it('extractRouting derives evalRun false for an empty batch', () => {
+  it('extractRouting derives evalRun false for an empty batch, without even consulting isEvalThread()', () => {
+    // No session_routing seeded at all — if extractRouting called
+    // isEvalThread() unconditionally, initTestSessionDb()'s fresh DB (no
+    // session_routing table) would still correctly fall back to false, but
+    // the `messages.length > 0 &&` short-circuit means it isn't reached here.
     expect(extractRouting([]).evalRun).toBe(false);
+  });
+
+  it('extractRouting derives evalRun true for an eval session even with a stray non-eval-kind row in the batch', () => {
+    // Regression guard for the consolidation itself: under the old, now-
+    // replaced kind-based "every message is kind eval" derivation, this would
+    // have been false (deferred-work.md finding, spec-eval-session-output-capture.md)
+    // — a real eval session's own batch silently NOT treated as an eval run
+    // just because one row's kind field didn't match. Now it correctly
+    // follows the session's own identity instead.
+    seedEvalSessionRouting();
+    insertMessage('m1', 'chat', { sender: 'Alice', text: 'stray non-eval-kind row' });
+    expect(extractRouting(getPendingMessages()).evalRun).toBe(true);
   });
 
   it('formats an eval-kind message the same as a chat message', () => {
