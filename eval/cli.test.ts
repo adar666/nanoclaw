@@ -60,7 +60,12 @@ vi.mock('./judge/deterministic.js', () => ({
   judgeDeterministic: vi.fn(),
 }));
 
-vi.mock('./judge/llm.js', () => ({
+// Real JudgeLlmError export preserved (importOriginal) — runOneScenario's
+// llmJudge catch block does `instanceof JudgeLlmError`, so a test needs the
+// real class, not a mocked stand-in, for that check to behave as it does in
+// production.
+vi.mock('./judge/llm.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./judge/llm.js')>()),
   judgeLlm: vi.fn(),
 }));
 
@@ -79,7 +84,7 @@ import { getSessionsByAgentGroup } from '../src/db/sessions.js';
 import { readEnvFile } from '../src/env.js';
 import { dispatchEvalCli, runCli, runOneScenario } from './cli.js';
 import { judgeDeterministic } from './judge/deterministic.js';
-import { judgeLlm } from './judge/llm.js';
+import { JudgeLlmError, judgeLlm } from './judge/llm.js';
 import type { Scenario } from './loader.js';
 import { EVAL_LOCK_PATH } from './lock.js';
 import { REPORTS_DIR } from './reporter.js';
@@ -311,7 +316,7 @@ describe('runCli', () => {
       COMPLETED_CLEANUP,
     );
     mockedJudgeDeterministic.mockReturnValue({ passed: true, evidence: 'adardevora@gmail.com' });
-    const boom = new Error("judgeLlm: could not parse the judge's reply");
+    const boom = new JudgeLlmError("judgeLlm: could not parse the judge's reply");
     mockedJudgeLlm.mockRejectedValueOnce(boom);
 
     const report = await runCli(['run', 'guest-resolution']);
@@ -478,7 +483,7 @@ describe('runOneScenario (llmJudge branch)', () => {
       transcript: [outboundMsg('some reply')],
       sessionId: 's1',
     });
-    const boom = new Error('judgeLlm: judge turn did not complete — expected status "completed", got "timeout"');
+    const boom = new JudgeLlmError('judgeLlm: judge turn did not complete — expected status "completed", got "timeout"');
     mockedJudgeLlm.mockRejectedValueOnce(boom);
 
     const entry = await runOneScenario(llmJudgeScenario, JUDGE_AGENT_GROUP_ID);
@@ -497,7 +502,7 @@ describe('runOneScenario (llmJudge branch)', () => {
     mockedRunScenarioTurn
       .mockResolvedValueOnce({ status: 'completed', transcript: [outboundMsg('some reply')], sessionId: 's1' })
       .mockResolvedValueOnce(COMPLETED_CLEANUP);
-    mockedJudgeLlm.mockRejectedValueOnce(new Error('judgeLlm: could not parse the judge reply'));
+    mockedJudgeLlm.mockRejectedValueOnce(new JudgeLlmError('judgeLlm: could not parse the judge reply'));
 
     const entry = await runOneScenario(llmJudgeWithCleanup, JUDGE_AGENT_GROUP_ID);
 
@@ -505,6 +510,24 @@ describe('runOneScenario (llmJudge branch)', () => {
     expect(entry.cleanupError).toBeUndefined(); // cleanup ran and confirmed
     expect(mockedRunScenarioTurn).toHaveBeenCalledTimes(2); // main turn + cleanup follow-up
   });
+
+  it(
+    'propagates a plain (non-JudgeLlmError) throw out of judgeLlm instead of absorbing it into a judge-error — ' +
+      "a genuine AD-4-style structural failure leaked out of judgeLlm's own internal runScenarioTurn call " +
+      '(a destination violation, a spawn failure) must abort the run loud, exactly like the scenario\'s own ' +
+      'uncaught runScenarioTurn call, not become a per-scenario outcome (deferred-work.md, spec-eval-2-3)',
+    async () => {
+      mockedRunScenarioTurn.mockResolvedValueOnce({
+        status: 'completed',
+        transcript: [outboundMsg('some reply')],
+        sessionId: 's1',
+      });
+      const structuralFailure = new Error('runScenarioTurn: wakeContainer failed to spawn a container');
+      mockedJudgeLlm.mockRejectedValueOnce(structuralFailure);
+
+      await expect(runOneScenario(llmJudgeScenario, JUDGE_AGENT_GROUP_ID)).rejects.toBe(structuralFailure);
+    },
+  );
 
   it('still runs cleanup for an llmJudge scenario when judging passes', async () => {
     const llmJudgeWithCleanup: Scenario = {
