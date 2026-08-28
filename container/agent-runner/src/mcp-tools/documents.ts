@@ -3581,53 +3581,66 @@ function presentArgNames(args: Record<string, unknown>, keys: readonly string[])
   return keys.filter((k) => args[k] !== undefined);
 }
 
+// ---------------------------------------------------------------------------
+// fillOneDocument (spec-2 retro item — deferred-work.md) is split into three
+// steps composed by a thin orchestrator, matching the retro's own suggested
+// shape: resolveAndSnapshot (validation, arg gating, lock + snapshot-copy),
+// dispatchFill (pure dispatch to fillDocx/fillDoc/fillPdf + result-text
+// parsing), and recordCompletedFill (fill-history recording, logging,
+// temp-file cleanup). Pure structural split — no behavior change; every
+// error message, lock/snapshot/cleanup ordering, and history-recording
+// condition below is copied verbatim from the pre-split function.
+// ---------------------------------------------------------------------------
+
+type ResolveAndSnapshotResult =
+  | { ok: true; snapshotRawPath: string }
+  | { ok: false; result: ReturnType<typeof err> };
+
 /**
- * Per-document fill body, shared by fill_document_field (single call, Story
- * 1.2 onward) and fill_document_field_batch (spec 2-2) — takes an
- * already-resolved DocumentMeta and `filesDir`, applies the exact same
- * file-type auto-detection, DOCX_ONLY_ARGS/PDF_ONLY_ARGS validation, and
- * fillDocx/fillDoc/fillPdf dispatch fill_document_field has always used.
- * Document *resolution* (turning a free-text query into a DocumentMeta,
- * including the ambiguous/not-found handshake) is deliberately the caller's
- * job, not this helper's — fill_document_field and the batch tool resolve
- * differently (resolveDocument's single-match-only contract vs. the batch
- * tool's per-entry/matchQuery resolution), so folding resolution in here
- * would force one shape onto both.
+ * Validation, per-file-type arg gating, per-slug lock acquisition, and
+ * snapshot-copy creation — the part of fillOneDocument that must happen
+ * before any dispatch. Returns the snapshot path dispatchFill should read
+ * from, or an already-final response (a validation/lock/snapshot failure)
+ * for the orchestrator to return unchanged.
  */
-async function fillOneDocument(
+async function resolveAndSnapshot(
   meta: DocumentMeta,
   filesDir: string,
   args: Record<string, unknown>,
   opts: FillOpts,
-  // Only affects the log line's prefix (so a batch-triggered fill is
-  // distinguishable from a single-call fill in nanoclaw.log) — never
-  // affects behavior. Defaults to the single-call tool's own name since
-  // that's this function's original, still-primary caller.
-  callerLabel: string = 'fill_document_field',
-): Promise<ReturnType<typeof ok> | ReturnType<typeof err>> {
+): Promise<ResolveAndSnapshotResult> {
   if (meta.ambiguousExtensions) {
-    return err(
-      `Multiple files found for document "${meta.slug}" (${meta.ambiguousExtensions.join(', ')}) — this ` +
-        'shouldn\'t normally happen. Check memory/documents/files/ for this slug manually before retrying.',
-    );
+    return {
+      ok: false,
+      result: err(
+        `Multiple files found for document "${meta.slug}" (${meta.ambiguousExtensions.join(', ')}) — this ` +
+          'shouldn\'t normally happen. Check memory/documents/files/ for this slug manually before retrying.',
+      ),
+    };
   }
 
   if (IMAGE_EXTENSIONS.has(meta.ext)) {
-    return err(
-      `"${meta.slug}" is a saved image (.${meta.ext}) — fill_document_field only fills/stamps a .docx, .doc, ` +
-        'or .pdf document. There is no field/target to fill on a plain image.',
-    );
+    return {
+      ok: false,
+      result: err(
+        `"${meta.slug}" is a saved image (.${meta.ext}) — fill_document_field only fills/stamps a .docx, .doc, ` +
+          'or .pdf document. There is no field/target to fill on a plain image.',
+      ),
+    };
   }
 
   if (meta.ext === 'pdf') {
     const wrongArgs = presentArgNames(args, DOCX_ONLY_ARGS);
     if (wrongArgs.length > 0) {
-      return err(`These arguments don't apply to a .pdf document: ${wrongArgs.join(', ')}.`);
+      return { ok: false, result: err(`These arguments don't apply to a .pdf document: ${wrongArgs.join(', ')}.`) };
     }
   } else {
     const wrongArgs = presentArgNames(args, PDF_ONLY_ARGS);
     if (wrongArgs.length > 0) {
-      return err(`These arguments don't apply to a .${meta.ext} document: ${wrongArgs.join(', ')}.`);
+      return {
+        ok: false,
+        result: err(`These arguments don't apply to a .${meta.ext} document: ${wrongArgs.join(', ')}.`),
+      };
     }
   }
 
@@ -3648,9 +3661,8 @@ async function fillOneDocument(
   // it's now a per-slug lock, a concurrent fill/refresh of a *different*
   // document never waits on it at all.
   const lockPath = rawFileLockPath(opts.baseDir, meta.slug);
-  let snapshotRawPath: string;
   try {
-    snapshotRawPath = await withLock(lockPath, () => {
+    const snapshotRawPath = await withLock(lockPath, () => {
       if (!fs.existsSync(rawPath)) {
         throw new Error(`Saved raw file for "${meta.slug}" is missing.`);
       }
@@ -3672,28 +3684,79 @@ async function fillOneDocument(
       fs.copyFileSync(rawPath, tmp);
       return tmp;
     });
+    return { ok: true, snapshotRawPath };
   } catch (e) {
-    return err(e instanceof Error ? e.message : String(e));
+    return { ok: false, result: err(e instanceof Error ? e.message : String(e)) };
   }
+}
 
+interface DispatchFillResult {
+  result: ReturnType<typeof ok> | ReturnType<typeof err>;
+  resultText: string;
+  isCompletedFill: boolean;
+}
+
+/**
+ * Pure dispatch to fillDocx/fillDoc/fillPdf (by `meta.ext`) plus result-text
+ * parsing to infer whether the call represents a completed fill (the
+ * FILL_SUCCESS_MARKER signal) versus a discovery/prompt/error response. No
+ * I/O side effects beyond the fill call itself — no history recording, no
+ * logging, no cleanup.
+ */
+async function dispatchFill(
+  snapshotRawPath: string,
+  meta: DocumentMeta,
+  args: Record<string, unknown>,
+  opts: FillOpts,
+): Promise<DispatchFillResult> {
+  const result =
+    meta.ext === 'docx'
+      ? await fillDocx(snapshotRawPath, meta, args, opts)
+      : meta.ext === 'doc'
+        ? await fillDoc(snapshotRawPath, meta, args, opts)
+        : await fillPdf(snapshotRawPath, meta, args, opts);
+
+  // History recording (spec 2-3) — the single choke point covering both
+  // fill_document_field and fill_document_field_batch, since both callers
+  // funnel through fillOneDocument. Gated on the exact same
+  // FILL_SUCCESS_MARKER signal the batch tool already uses to distinguish
+  // a completed fill from a discovery/prompt response — a discovery call
+  // or a per-item batch failure never reaches recordCompletedFill's
+  // history-write branch.
+  const resultText = typeof result.content[0]?.text === 'string' ? result.content[0].text : '';
+  const isCompletedFill = !('isError' in result && result.isError) && resultText.includes(FILL_SUCCESS_MARKER);
+  return { result, resultText, isCompletedFill };
+}
+
+/** Best-effort removal of a fill's snapshot read-copy under `.fill-tmp/` — never surfaced to the user. */
+function cleanupSnapshot(snapshotRawPath: string): void {
   try {
-    const result =
-      meta.ext === 'docx'
-        ? await fillDocx(snapshotRawPath, meta, args, opts)
-        : meta.ext === 'doc'
-          ? await fillDoc(snapshotRawPath, meta, args, opts)
-          : await fillPdf(snapshotRawPath, meta, args, opts);
+    fs.unlinkSync(snapshotRawPath);
+  } catch {
+    // Best effort — a leftover temp read-copy under .fill-tmp/ is
+    // harmless and never surfaced to the user.
+  }
+}
 
-    // History recording (spec 2-3) — the single choke point covering both
-    // fill_document_field and fill_document_field_batch, since both callers
-    // funnel through fillOneDocument. Gated on the exact same
-    // FILL_SUCCESS_MARKER signal the batch tool already uses to distinguish
-    // a completed fill from a discovery/prompt response — a discovery call
-    // or a per-item batch failure never reaches this point.
-    const resultText = typeof result.content[0]?.text === 'string' ? result.content[0].text : '';
-    const isCompletedFill = !('isError' in result && result.isError) && resultText.includes(FILL_SUCCESS_MARKER);
-    if (isCompletedFill) {
-      const outputPath = extractFillOutputPath(resultText);
+/**
+ * Records fill history (spec 2-3) for a completed fill, logs the outcome,
+ * and cleans up the snapshot read-copy — always, regardless of whether
+ * history recording succeeded. Called once dispatchFill has produced a
+ * result; callers that see dispatchFill itself throw must clean up the
+ * snapshot themselves (see fillOneDocument below) since this function never
+ * runs in that case.
+ */
+async function recordCompletedFill(
+  meta: DocumentMeta,
+  args: Record<string, unknown>,
+  opts: FillOpts,
+  callerLabel: string,
+  snapshotRawPath: string,
+  dispatch: DispatchFillResult,
+): Promise<ReturnType<typeof ok> | ReturnType<typeof err>> {
+  try {
+    if (dispatch.isCompletedFill) {
+      const outputPath = extractFillOutputPath(dispatch.resultText);
       if (outputPath) {
         try {
           await recordFillHistory(opts.baseDir, meta.slug, {
@@ -3718,16 +3781,58 @@ async function fillOneDocument(
       }
     }
 
-    log(`${callerLabel}: ${meta.slug} (${meta.ext}) -> ${'isError' in result && result.isError ? 'error' : 'ok'}`);
-    return result;
+    log(
+      `${callerLabel}: ${meta.slug} (${meta.ext}) -> ${'isError' in dispatch.result && dispatch.result.isError ? 'error' : 'ok'}`,
+    );
+    return dispatch.result;
   } finally {
-    try {
-      fs.unlinkSync(snapshotRawPath);
-    } catch {
-      // Best effort — a leftover temp read-copy under .fill-tmp/ is
-      // harmless and never surfaced to the user.
-    }
+    cleanupSnapshot(snapshotRawPath);
   }
+}
+
+/**
+ * Per-document fill body, shared by fill_document_field (single call, Story
+ * 1.2 onward) and fill_document_field_batch (spec 2-2) — takes an
+ * already-resolved DocumentMeta and `filesDir`, applies the exact same
+ * file-type auto-detection, DOCX_ONLY_ARGS/PDF_ONLY_ARGS validation, and
+ * fillDocx/fillDoc/fillPdf dispatch fill_document_field has always used.
+ * Document *resolution* (turning a free-text query into a DocumentMeta,
+ * including the ambiguous/not-found handshake) is deliberately the caller's
+ * job, not this helper's — fill_document_field and the batch tool resolve
+ * differently (resolveDocument's single-match-only contract vs. the batch
+ * tool's per-entry/matchQuery resolution), so folding resolution in here
+ * would force one shape onto both.
+ *
+ * A thin orchestrator over resolveAndSnapshot / dispatchFill /
+ * recordCompletedFill (see those functions above) — composes the three in
+ * order, preserving the pre-split function's exact snapshot-cleanup timing:
+ * the snapshot is removed exactly once, whether dispatchFill returns
+ * normally (recordCompletedFill's own finally) or throws (the catch below).
+ */
+async function fillOneDocument(
+  meta: DocumentMeta,
+  filesDir: string,
+  args: Record<string, unknown>,
+  opts: FillOpts,
+  // Only affects the log line's prefix (so a batch-triggered fill is
+  // distinguishable from a single-call fill in nanoclaw.log) — never
+  // affects behavior. Defaults to the single-call tool's own name since
+  // that's this function's original, still-primary caller.
+  callerLabel: string = 'fill_document_field',
+): Promise<ReturnType<typeof ok> | ReturnType<typeof err>> {
+  const resolution = await resolveAndSnapshot(meta, filesDir, args, opts);
+  if (!resolution.ok) return resolution.result;
+
+  const { snapshotRawPath } = resolution;
+  let dispatch: DispatchFillResult;
+  try {
+    dispatch = await dispatchFill(snapshotRawPath, meta, args, opts);
+  } catch (e) {
+    cleanupSnapshot(snapshotRawPath);
+    throw e;
+  }
+
+  return recordCompletedFill(meta, args, opts, callerLabel, snapshotRawPath, dispatch);
 }
 
 export async function fillDocumentFieldImpl(
