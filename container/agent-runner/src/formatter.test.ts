@@ -13,7 +13,14 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
 import { initTestSessionDb, closeSessionDb, getInboundDb } from './db/connection.js';
 import { getPendingMessages } from './db/messages-in.js';
-import { extractRouting, formatMessages, stripInternalTags, stripLegacyTaskContract } from './formatter.js';
+import {
+  extractRouting,
+  formatMessages,
+  isCommandEligible,
+  isRunnerCommand,
+  stripInternalTags,
+  stripLegacyTaskContract,
+} from './formatter.js';
 import { TIMEZONE, formatLocalTime } from './timezone.js';
 
 beforeEach(() => {
@@ -266,6 +273,42 @@ describe('eval-run routing and formatting', () => {
     expect(result).toContain('sender="Judge"');
     expect(result).toContain('eval scenario text');
     expect(result).toContain('<message');
+  });
+});
+
+describe('isCommandEligible — single source of truth for the runner command-handling gate', () => {
+  // deferred-work.md finding (spec-eval-session-output-capture.md): the
+  // runner's own command-handling checks (isClearCommand/isUploadTraceCommand
+  // in poll-loop.ts, formatMessagesWithCommands' native passthrough, and
+  // isRunnerCommand below) must all agree on which kinds are eligible —
+  // 'chat'/'chat-sdk' only, deliberately excluding 'eval' — via this one
+  // shared predicate rather than re-typing the kind check separately at each
+  // call site.
+  it('is true for chat and chat-sdk', () => {
+    expect(isCommandEligible('chat')).toBe(true);
+    expect(isCommandEligible('chat-sdk')).toBe(true);
+  });
+
+  it('is false for eval — deliberately excluded, unlike formatMessages\' chat-rendering filter', () => {
+    expect(isCommandEligible('eval')).toBe(false);
+  });
+
+  it('is false for task, webhook, and system', () => {
+    expect(isCommandEligible('task')).toBe(false);
+    expect(isCommandEligible('webhook')).toBe(false);
+    expect(isCommandEligible('system')).toBe(false);
+  });
+
+  it('isRunnerCommand is false for an eval-kind message even with passthrough-shaped command text', () => {
+    insertMessage('e1', 'eval', { sender: 'Judge', text: '/some-unknown-command args' });
+    const [msg] = getPendingMessages();
+    expect(isRunnerCommand(msg)).toBe(false);
+  });
+
+  it('isRunnerCommand is true for the equivalent chat-kind message', () => {
+    insertMessage('m1', 'chat', { sender: 'Alice', text: '/some-unknown-command args' });
+    const [msg] = getPendingMessages();
+    expect(isRunnerCommand(msg)).toBe(true);
   });
 });
 

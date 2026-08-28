@@ -57,6 +57,30 @@ export function categorizeMessage(msg: MessageInRow): CommandInfo {
 }
 
 /**
+ * True for a message `kind` eligible for the runner's own slash-command
+ * handling: `isClearCommand`/`isUploadTraceCommand` checks (poll-loop.ts),
+ * `formatMessagesWithCommands`' native-slash-command passthrough
+ * (poll-loop.ts), and `isRunnerCommand` below — chat/chat-sdk only.
+ *
+ * Deliberately excludes `'eval'`, unlike `formatMessages`' own chat-rendering
+ * filter just below (which treats `'eval'` the same as `'chat'`/`'chat-sdk'`
+ * for display purposes). A scripted eval-scenario message's text is authored,
+ * static test data (`eval/scenarios/*.ts`) — it must never be interpreted as
+ * a live administrative command (clearing the session, uploading a trace)
+ * just because it happens to start with `/`. Letting that happen would
+ * silently break eval determinism: a scenario's own scripted content could
+ * trigger a runner-level side effect the scenario author never intended.
+ * Practical risk is low today (no scenario text starts with `/`), but this
+ * makes the exclusion a single, deliberate, named decision instead of the
+ * same `kind === 'chat' || kind === 'chat-sdk'` literal re-typed separately
+ * at each call site, where it could silently drift out of sync with the
+ * others (deferred-work.md finding, spec-eval-session-output-capture.md).
+ */
+export function isCommandEligible(kind: string): boolean {
+  return kind === 'chat' || kind === 'chat-sdk';
+}
+
+/**
  * Narrow check for /clear — the only command the runner handles directly.
  * All other command gating (filtered, admin) is done by the host router
  * before messages reach the container.
@@ -74,7 +98,7 @@ export function isClearCommand(msg: MessageInRow): boolean {
  * the outer loop reopen the query.
  */
 export function isRunnerCommand(msg: MessageInRow): boolean {
-  if (msg.kind !== 'chat' && msg.kind !== 'chat-sdk') return false;
+  if (!isCommandEligible(msg.kind)) return false;
   const cat = categorizeMessage(msg).category;
   return cat === 'admin' || cat === 'passthrough';
 }
