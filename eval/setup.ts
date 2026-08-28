@@ -178,8 +178,19 @@ export function ensureEvalPeopleMount(agentGroupId: string): void {
 
   const mount: AdditionalMountConfig = { hostPath, containerPath, readonly: true };
   const existing = safeJsonParse(row.additional_mounts, [] as AdditionalMountConfig[], 'additional_mounts', agentGroupId);
-  if (!existing.some((m) => m.hostPath === hostPath && m.containerPath === containerPath)) {
+  const existingIndex = existing.findIndex((m) => m.hostPath === hostPath && m.containerPath === containerPath);
+  if (existingIndex === -1) {
     existing.push(mount);
+    updateContainerConfigJson(agentGroupId, 'additional_mounts', existing);
+  } else if (existing[existingIndex].readonly !== mount.readonly) {
+    // Reconcile a same-(hostPath, containerPath) entry whose `readonly` value
+    // disagrees with what this function always wants (`true`, hardcoded —
+    // never caller-supplied) — mirrors `config add-calendar`'s own
+    // override-by-name convention (filter-then-push the corrected entry)
+    // rather than failing loud, since there's exactly one correct value here
+    // and no caller intent to conflict with (deferred-work.md finding,
+    // spec-eval-1-2).
+    existing[existingIndex] = mount;
     updateContainerConfigJson(agentGroupId, 'additional_mounts', existing);
   }
 }

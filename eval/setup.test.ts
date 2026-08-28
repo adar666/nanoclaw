@@ -49,7 +49,7 @@ vi.mock('../src/modules/mount-security/index.js', () => ({
 import { closeDb, initTestDb, runMigrations } from '../src/db/index.js';
 import { getAgentGroupByFolder, getAllAgentGroups } from '../src/db/agent-groups.js';
 import { initGroupFilesystem } from '../src/group-init.js';
-import { getContainerConfig } from '../src/db/container-configs.js';
+import { getContainerConfig, updateContainerConfigJson } from '../src/db/container-configs.js';
 import { getDestinations } from '../src/modules/agent-to-agent/db/agent-destinations.js';
 import { readEnvFile } from '../src/env.js';
 import { validateMount } from '../src/modules/mount-security/index.js';
@@ -338,6 +338,30 @@ describe('ensureEvalPeopleMount', () => {
     expect(JSON.parse(config.additional_mounts)).toEqual([]);
   });
 
+  it('reconciles a pre-existing (hostPath, containerPath) entry whose readonly value disagrees with true, rather than leaving it writable (deferred-work.md, spec-eval-1-2)', () => {
+    const group = ensureAgentGroup('eval-mount-reconcile', 'Eval Mount Test (reconcile)');
+    const hostPath = `${TEST_ROOT}/groups/household/memory/household/people.md`;
+    const containerPath = 'household-shared/people.md';
+    // Seed a pre-existing entry for the identical (hostPath, containerPath)
+    // pair, but writable — simulates a hand-edited/stale config row the old
+    // (hostPath, containerPath)-only dedup check would have silently kept as-is.
+    updateContainerConfigJson(group.id, 'additional_mounts', [{ hostPath, containerPath, readonly: false }]);
+
+    ensureEvalPeopleMount(group.id);
+
+    const config = getContainerConfig(group.id)!;
+    expect(JSON.parse(config.additional_mounts)).toEqual([{ hostPath, containerPath, readonly: true }]);
+  });
+
+  it('does not rewrite the config when the existing entry already matches exactly', () => {
+    const group = ensureAgentGroup('eval-mount-no-op', 'Eval Mount Test (no-op)');
+    ensureEvalPeopleMount(group.id);
+    const before = getContainerConfig(group.id)!.additional_mounts;
+
+    ensureEvalPeopleMount(group.id);
+
+    expect(getContainerConfig(group.id)!.additional_mounts).toBe(before);
+  });
 });
 
 describe('ensureAgentGroup', () => {
