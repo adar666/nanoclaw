@@ -3067,6 +3067,46 @@ describe.skipIf(!SOFFICE_AVAILABLE)('save_document / fill_document_field — .do
     }
   });
 
+  // Simulates a genuine JS-level throw landing between "scratch dir claimed"
+  // (convertDocToDocx has already run real LibreOffice and produced a valid
+  // converted .docx in the scratch dir) and fillDoc's `finally` cleanup
+  // running — the gap deferred-work.md flagged: only the happy path and
+  // synchronous-failure paths (soffice missing, malformed input, etc. — all
+  // of which return an err() *before* any throw) were previously covered.
+  // Forced here by pre-creating `.document-fills` as a plain file instead of
+  // a directory, so writeFillOutput's own fs.mkdirSync (called only after a
+  // real, successful conversion) throws EEXIST uncaught — a realistic
+  // disk/permission-shaped failure, not a contrived one. A real out-of-process
+  // crash (OOM, host restart) can't be simulated in-process at all; os.tmpdir()
+  // placement (see fillDoc's own comment) is what bounds *that* case's blast
+  // radius, not this test.
+  it('still cleans up the scratch dir via finally when a throw happens after a real conversion succeeds', async () => {
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'doc-fixture-'));
+    try {
+      const docBytes = buildDocViaSoffice(work, ['Name: ___________']);
+      const filePath = writeInboxFile('intake.doc', docBytes);
+      await saveDocumentImpl({ path: filePath }, opts());
+
+      // Blocks writeFillOutput's fs.mkdirSync(dir, { recursive: true }) with
+      // an uncaught EEXIST — this only fires *after* convertDocToDocx has
+      // already succeeded and fillDocx has already parsed/edited the real
+      // converted .docx, i.e. strictly between scratch-dir-claim and finally.
+      fs.writeFileSync(path.join(baseDir, '.document-fills'), 'blocking file, not a directory');
+
+      const before = conversionScratchLeftoverCount();
+      const result = await fillDocumentFieldImpl({ document: 'intake', lineNumber: 1, value: 'Ada Lovelace' }, opts());
+
+      // fillDocumentFieldImpl's own outer try/catch converts the throw into
+      // an err() result rather than propagating it — the thing under test
+      // here is that the scratch dir doesn't leak despite the throw, not the
+      // exact shape of the resulting error.
+      expect(result.isError).toBe(true);
+      expect(conversionScratchLeftoverCount()).toBe(before);
+    } finally {
+      fs.rmSync(work, { recursive: true, force: true });
+    }
+  });
+
   it('reuses the real (unmodified) fillDocx table dispatch after conversion — no table present, so it declines with the same "no tables" error', async () => {
     const work = fs.mkdtempSync(path.join(os.tmpdir(), 'doc-fixture-'));
     try {
