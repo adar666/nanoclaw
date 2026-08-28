@@ -403,12 +403,14 @@ export async function processQuery(
   // because host-sweep only resets rows still stuck in 'processing'.
   let pendingFollowUpIds: string[] = [];
   const pollHandle = setInterval(() => {
+    log(`DIAG-TICK done=${done} pollInFlight=${pollInFlight} endedForCommand=${endedForCommand}`);
     if (done || pollInFlight || endedForCommand) return;
     pollInFlight = true;
 
     void (async () => {
       try {
         const pending = getPendingMessages();
+        log(`DIAG-PENDING count=${pending.length}`);
 
         // Slash commands need a fresh query: /clear resets the SDK's
         // resume id (fixed at sdkQuery() time); admin/passthrough commands
