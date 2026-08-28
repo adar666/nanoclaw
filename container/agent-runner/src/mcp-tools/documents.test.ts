@@ -1095,6 +1095,15 @@ function buildDocxWithRawTable(tableInnerXml: string): Buffer {
   return buildStoredZip([{ name: 'word/document.xml', data: Buffer.from(xml, 'utf-8') }]);
 }
 
+/** Same shape as buildDocxWithRawTable, but binds the WordprocessingML namespace to a non-"w:" prefix — simulates a document authored/re-saved by a tool that made a different (but still spec-legal) prefix choice, which parseOoxmlTree's "w:"-only tokenizer cannot see. */
+function buildDocxWithRawTableNonWPrefix(tableInnerXml: string, prefix = 'ns0'): Buffer {
+  const xml =
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' +
+    `<${prefix}:document xmlns:${prefix}="http://schemas.openxmlformats.org/wordprocessingml/2006/main">` +
+    `<${prefix}:body><${prefix}:tbl><${prefix}:tblPr/>${tableInnerXml.replace(/w:/g, `${prefix}:`)}</${prefix}:tbl></${prefix}:body></${prefix}:document>`;
+  return buildStoredZip([{ name: 'word/document.xml', data: Buffer.from(xml, 'utf-8') }]);
+}
+
 async function readDocxXml(buf: Buffer): Promise<string> {
   const JSZip = (await import('jszip')).default;
   const zip = await JSZip.loadAsync(buf);
@@ -2751,6 +2760,48 @@ describe('fill_document_field — docx, merged cell (gridSpan)', () => {
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain('merged cell');
     expect(fs.existsSync(path.join(baseDir, '.document-fills'))).toBe(false);
+  });
+});
+
+// --- 5b. Non-"w:"-prefixed namespace binding --------------------------------
+
+describe('fill_document_field — docx, non-"w:" OOXML namespace prefix', () => {
+  it('names the real cause instead of the generic "no tables" message, on the row-targeting path', async () => {
+    const filePath = writeInboxFile(
+      'report.docx',
+      buildDocxWithRawTableNonWPrefix(rowXml(['Name', ''])),
+    );
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, value: 'X' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('ns0:');
+    expect(result.content[0].text).toContain('"w:"');
+    // Not the plain, misleading "genuinely no tables" message.
+    expect(result.content[0].text).not.toBe('This document has no tables to fill.');
+  });
+
+  it('names the real cause instead of the generic "no tables" message, on the bare-discovery path', async () => {
+    const filePath = writeInboxFile(
+      'report.docx',
+      buildDocxWithRawTableNonWPrefix(rowXml(['Name', ''])),
+    );
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'report' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('ns0:');
+    expect(result.content[0].text).toContain('"w:"');
+  });
+
+  it('still reports the plain "no tables" message for a genuinely table-less, standard-"w:" document', async () => {
+    const filePath = writeInboxFile('report.docx', buildDocx(['Just a plain paragraph, no table here.']));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, value: 'X' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('This document has no tables to fill.');
+    expect(result.content[0].text).not.toContain('prefix');
   });
 });
 

@@ -1868,6 +1868,38 @@ function treeIsWellFormed(nodes: XmlNode[]): boolean {
   return nodes.every((n) => n.close !== -1 && n.end !== -1 && treeIsWellFormed(n.children));
 }
 
+/**
+ * `parseOoxmlTree`'s tokenizer only recognizes the `w:` prefix (Word's own
+ * default, and what every real-world .docx this tool has been tested
+ * against uses). A document produced/re-saved by a tool that binds the
+ * WordprocessingML namespace to a *different* prefix has its tables (and
+ * everything else) silently invisible to the tokenizer — `tables.length`
+ * comes back 0 even though a `<otherprefix:tbl>` genuinely exists. Detected
+ * by reading the actual `xmlns:` declaration off the document root rather
+ * than guessing from tag shapes, so this only fires on a real prefix
+ * mismatch, never on a genuinely table-less document (which has no `xmlns:`
+ * mismatch to find). Full non-`w:` namespace support is out of scope (see
+ * deferred-work.md) — this exists only to make the resulting "no tables"
+ * failure legible instead of misleading.
+ */
+function detectNonWNamespacePrefix(xml: string): string | undefined {
+  const m = /xmlns:([A-Za-z0-9_]+)="http:\/\/schemas\.openxmlformats\.org\/wordprocessingml\/2006\/main"/.exec(xml);
+  if (!m) return undefined;
+  const prefix = m[1];
+  return prefix !== 'w' ? prefix : undefined;
+}
+
+/** Wraps a "no tables" fallback message with the more specific non-`w:`-namespace diagnosis when that's the actual cause, so the failure points at the real reason instead of reading as "this document genuinely has no tables." */
+function noTablesMessage(xml: string, fallback: string): string {
+  const prefix = detectNonWNamespacePrefix(xml);
+  if (!prefix) return fallback;
+  return (
+    `This document binds the Word XML namespace to the "${prefix}:" prefix instead of the standard "w:" prefix ` +
+    'this tool recognizes — table (and fill-in-the-blank line) detection only supports "w:"-prefixed documents, ' +
+    'so any tables in this file could not be found even though they may exist. Not supported.'
+  );
+}
+
 function collectDescendants(node: XmlNode, tag: OoxmlTag): XmlNode[] {
   const found: XmlNode[] = [];
   for (const child of node.children) {
@@ -2533,11 +2565,14 @@ function formatDocxLineCandidates(candidates: DocxLineCandidate[]): string {
 }
 
 /** Discovery response for a table-less docx (or one where the caller explicitly asked for line targeting). */
-function docxListLines(candidates: DocxLineCandidate[]): ReturnType<typeof ok> | ReturnType<typeof err> {
+function docxListLines(xml: string, candidates: DocxLineCandidate[]): ReturnType<typeof ok> | ReturnType<typeof err> {
   if (candidates.length === 0) {
     return err(
-      'This document has no tables to fill, and no fill-in-the-blank line (an underscore blank or a ' +
-        'trailing-colon label) was detected either.',
+      noTablesMessage(
+        xml,
+        'This document has no tables to fill, and no fill-in-the-blank line (an underscore blank or a ' +
+          'trailing-colon label) was detected either.',
+      ),
     );
   }
   return ok(
@@ -2556,10 +2591,11 @@ const TABLE_ROW_REQUIRED_MESSAGE = 'row is required for a .docx fill (1-indexed 
  * only ever surfacing the table prompt with the blank lines undiscoverable.
  */
 function docxDiscoveryResponse(
+  xml: string,
   tables: XmlNode[],
   candidates: DocxLineCandidate[],
 ): ReturnType<typeof ok> | ReturnType<typeof err> {
-  if (tables.length === 0) return docxListLines(candidates);
+  if (tables.length === 0) return docxListLines(xml, candidates);
   if (candidates.length === 0) return err(TABLE_ROW_REQUIRED_MESSAGE);
   return ok(
     `${TABLE_ROW_REQUIRED_MESSAGE} Or use "lineNumber" instead to fill one of the detected fill-in-the-blank ` +
@@ -2700,12 +2736,12 @@ async function fillDocx(
     // resolved (or errored) above but is otherwise unused here — this
     // response is identical whether or not one was passed, mirroring
     // fillPdf's own "no target given" branches.
-    return docxDiscoveryResponse(tables, findDocxLineCandidates(xml, roots));
+    return docxDiscoveryResponse(xml, tables, findDocxLineCandidates(xml, roots));
   }
 
   if (row === undefined) return err('row is required for a .docx fill (1-indexed row within the target table).');
   if (value === undefined && signaturePng === undefined) return err('value or signatureName is required.');
-  if (tables.length === 0) return err('This document has no tables to fill.');
+  if (tables.length === 0) return err(noTablesMessage(xml, 'This document has no tables to fill.'));
 
   let tableIndex: number;
   if (tableArg !== undefined) {
