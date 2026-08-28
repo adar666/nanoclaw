@@ -268,10 +268,36 @@ function isPidAlive(pid: number): boolean {
   }
 }
 
-async function withLock<T>(lockPath: string, fn: () => T): Promise<T> {
-  for (let attempt = 0; attempt < LOCK_MAX_ATTEMPTS; attempt++) {
+/**
+ * Test-only overrides for the retry/attempt/staleness constants below —
+ * every real call site omits this and gets the production defaults
+ * unchanged. Exists so a regression test can exercise the retry-exhaustion
+ * and stale-reclaim-on-the-last-attempt paths deterministically (maxAttempts:
+ * 1-2, a short retryMs) instead of needing a real ~2s/30s wait, mirroring why
+ * eval/lock.ts's own reimplementation of this algorithm takes the same shape
+ * of `opts`.
+ */
+interface WithLockTestOpts {
+  retryMs?: number;
+  maxAttempts?: number;
+  staleMs?: number;
+}
+
+export async function withLock<T>(lockPath: string, fn: () => T, testOpts?: WithLockTestOpts): Promise<T> {
+  const retryMs = testOpts?.retryMs ?? LOCK_RETRY_MS;
+  const maxAttempts = testOpts?.maxAttempts ?? LOCK_MAX_ATTEMPTS;
+  const staleMs = testOpts?.staleMs ?? LOCK_STALE_MS;
+
+  // This call's own fencing token (see the finally block below) — written as
+  // the lock file's content at acquire time, checked again at release. Plain
+  // process.pid (not a per-call uuid) is deliberate: it doubles as the value
+  // the dead-pid liveness check below reads back, exactly mirroring
+  // eval/lock.ts's own reimplementation of this same algorithm.
+  const myToken = String(process.pid);
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
     try {
-      fs.writeFileSync(lockPath, String(process.pid), { flag: 'wx' });
+      fs.writeFileSync(lockPath, myToken, { flag: 'wx' });
       break;
     } catch (e) {
       if (errnoCode(e) !== 'EEXIST') throw e;
@@ -293,6 +319,7 @@ async function withLock<T>(lockPath: string, fn: () => T): Promise<T> {
         if (Number.isInteger(heldByPid) && heldByPid > 0 && !isPidAlive(heldByPid)) {
           fs.unlinkSync(lockPath);
           log(`withLock: reclaimed a lock held by dead pid ${heldByPid}: ${lockPath}`);
+          attempt--; // guarantee a genuine re-acquire attempt, even on the last iteration (deferred-work.md off-by-one fix, ported from eval/lock.ts)
           continue; // retry the exclusive-create immediately, no need to sleep
         }
       } catch {
@@ -302,8 +329,9 @@ async function withLock<T>(lockPath: string, fn: () => T): Promise<T> {
 
       try {
         const st = fs.statSync(lockPath);
-        if (Date.now() - st.mtimeMs > LOCK_STALE_MS) {
+        if (Date.now() - st.mtimeMs > staleMs) {
           fs.unlinkSync(lockPath);
+          attempt--; // guarantee a genuine re-acquire attempt, even on the last iteration (deferred-work.md off-by-one fix, ported from eval/lock.ts)
           continue; // retry the exclusive-create immediately, no need to sleep
         }
       } catch {
@@ -311,17 +339,26 @@ async function withLock<T>(lockPath: string, fn: () => T): Promise<T> {
         // holder likely just released it; fall through to the normal retry.
       }
 
-      if (attempt === LOCK_MAX_ATTEMPTS - 1) {
+      if (attempt === maxAttempts - 1) {
         throw new Error(`Timed out waiting for memory index lock: ${lockPath}`);
       }
-      await new Promise((resolve) => setTimeout(resolve, LOCK_RETRY_MS));
+      await new Promise((resolve) => setTimeout(resolve, retryMs));
     }
   }
   try {
     return fn();
   } finally {
     try {
-      fs.unlinkSync(lockPath);
+      // Fencing (deferred-work.md finding, ported from eval/lock.ts): only
+      // release if this call still owns the lock. If this call's own fn()
+      // ran long enough to cross LOCK_STALE_MS (or its holder pid looked
+      // dead to a racing caller), another caller may have already reclaimed
+      // the lock and written its own token in — an unconditional unlink here
+      // would delete THAT caller's live lock instead of this one's own,
+      // silently breaking mutual exclusion.
+      if (fs.readFileSync(lockPath, 'utf-8') === myToken) {
+        fs.unlinkSync(lockPath);
+      }
     } catch {
       // Already gone (or never created) — nothing to clean up.
     }

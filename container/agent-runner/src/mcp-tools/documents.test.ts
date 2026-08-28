@@ -26,6 +26,7 @@ import {
   listDocumentVersionsImpl,
   listDocumentVersions,
   describePdfReadError,
+  withLock,
 } from './documents.js';
 
 // ---------------------------------------------------------------------------
@@ -5059,5 +5060,155 @@ describe('save_document — refresh racing a concurrent fill of the same documen
     const readRefreshed = filledText.includes('refreshed-a');
     expect(readOriginal || readRefreshed).toBe(true);
     expect(readOriginal && readRefreshed).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// withLock — off-by-one + fencing regressions (deferred-work.md, eval-1-3
+// item)
+//
+// eval/lock.ts's own reimplementation of this exact algorithm found (and
+// fixed) two real correctness bugs, later ported back here. Both are
+// exercised directly against this file's own `withLock`, using the
+// test-only `testOpts` override (retryMs/maxAttempts/staleMs) so the
+// retry-exhaustion and stale-reclaim-on-the-last-attempt paths run
+// deterministically instead of needing a real multi-second wait. Test
+// shapes are inspired by `eval/lock.test.ts`'s own withLock suite, adapted
+// to bun:test and to this file's two independent reclaim paths (dead-pid,
+// then mtime-staleness fallback).
+// ---------------------------------------------------------------------------
+
+describe('withLock — off-by-one and fencing regressions', () => {
+  it('acquires immediately, writes its own pid, runs fn, and removes the lock file afterward', async () => {
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'withlock-test-'));
+    const lockPath = path.join(work, '.test.lock');
+    try {
+      let ran = false;
+      const result = await withLock(lockPath, () => {
+        ran = true;
+        expect(fs.existsSync(lockPath)).toBe(true);
+        expect(fs.readFileSync(lockPath, 'utf-8')).toBe(String(process.pid));
+        return 'ok';
+      });
+
+      expect(ran).toBe(true);
+      expect(result).toBe('ok');
+      expect(fs.existsSync(lockPath)).toBe(false);
+    } finally {
+      fs.rmSync(work, { recursive: true, force: true });
+    }
+  });
+
+  it('still reclaims a dead-pid lock when the reclaim happens on the very last retry attempt (off-by-one regression, pid-liveness path)', async () => {
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'withlock-test-'));
+    const lockPath = path.join(work, '.test.lock');
+    try {
+      // A pid essentially guaranteed not to be alive in this sandbox — the
+      // dead-pid check fires immediately, no mtime backdating/waiting needed.
+      const deadPid = 2 ** 30;
+      fs.writeFileSync(lockPath, String(deadPid), { flag: 'wx' });
+
+      // maxAttempts: 1 — the dead-pid reclaim fires on the loop's one and
+      // only iteration. The pre-fix version's bare `continue` here still
+      // runs the for-loop's own increment, so `attempt` reaches
+      // maxAttempts and the loop exits WITHOUT ever retrying the
+      // exclusive-create — fn() would then run holding no lock at all.
+      let ran = false;
+      const result = await withLock(
+        lockPath,
+        () => {
+          ran = true;
+          expect(fs.existsSync(lockPath)).toBe(true);
+          expect(fs.readFileSync(lockPath, 'utf-8')).toBe(String(process.pid));
+          return 'reclaimed-on-last-attempt';
+        },
+        { retryMs: 2, maxAttempts: 1, staleMs: 30_000 },
+      );
+
+      expect(ran).toBe(true);
+      expect(result).toBe('reclaimed-on-last-attempt');
+      expect(fs.existsSync(lockPath)).toBe(false);
+    } finally {
+      fs.rmSync(work, { recursive: true, force: true });
+    }
+  });
+
+  it('still reclaims a stale (non-pid) lock when the reclaim happens on the very last retry attempt (off-by-one regression, mtime path)', async () => {
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'withlock-test-'));
+    const lockPath = path.join(work, '.test.lock');
+    try {
+      // Non-numeric content (falls through the dead-pid check entirely) plus
+      // a backdated mtime — exercises the second, mtime-based reclaim path.
+      fs.writeFileSync(lockPath, 'not-a-pid', { flag: 'wx' });
+      const old = new Date(Date.now() - 60_000);
+      fs.utimesSync(lockPath, old, old);
+
+      let ran = false;
+      const result = await withLock(
+        lockPath,
+        () => {
+          ran = true;
+          expect(fs.existsSync(lockPath)).toBe(true);
+          expect(fs.readFileSync(lockPath, 'utf-8')).toBe(String(process.pid));
+          return 'reclaimed-on-last-attempt';
+        },
+        { retryMs: 2, maxAttempts: 1, staleMs: 1_000 },
+      );
+
+      expect(ran).toBe(true);
+      expect(result).toBe('reclaimed-on-last-attempt');
+      expect(fs.existsSync(lockPath)).toBe(false);
+    } finally {
+      fs.rmSync(work, { recursive: true, force: true });
+    }
+  });
+
+  it("does not delete a different holder's lock on release (fencing regression)", async () => {
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'withlock-test-'));
+    const lockPath = path.join(work, '.test.lock');
+    try {
+      // Simulates the real failure mode: this call's fn() outlives staleMs,
+      // another process (a different pid/token) reclaims the lock as
+      // abandoned and writes its own token in — all *while our fn() is
+      // still running*. When our fn() finally returns, the pre-fix
+      // version's unconditional unlink would delete that other, still-live
+      // holder's lock. The fix only unlinks if the file still holds the
+      // exact token this call itself wrote.
+      const otherHoldersToken = 'a-different-process-reclaimed-this';
+
+      await withLock(lockPath, () => {
+        expect(fs.readFileSync(lockPath, 'utf-8')).toBe(String(process.pid));
+        fs.writeFileSync(lockPath, otherHoldersToken);
+      });
+
+      expect(fs.existsSync(lockPath)).toBe(true);
+      expect(fs.readFileSync(lockPath, 'utf-8')).toBe(otherHoldersToken);
+    } finally {
+      fs.rmSync(work, { recursive: true, force: true });
+    }
+  });
+
+  it('throws, naming lockPath, after exhausting the retry budget against a live (fresh) lock', async () => {
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'withlock-test-'));
+    const lockPath = path.join(work, '.test.lock');
+    try {
+      fs.writeFileSync(lockPath, String(process.pid), { flag: 'wx' });
+
+      let threw: unknown;
+      try {
+        await withLock(lockPath, () => 'should not run', { retryMs: 2, maxAttempts: 3, staleMs: 30_000 });
+      } catch (e) {
+        threw = e;
+      }
+
+      expect(threw).toBeInstanceOf(Error);
+      expect((threw as Error).message).toContain(lockPath);
+      // Our own live lock is untouched — only a failed acquire attempt's
+      // own bookkeeping should ever be cleaned up, never a real live holder.
+      expect(fs.existsSync(lockPath)).toBe(true);
+      expect(fs.readFileSync(lockPath, 'utf-8')).toBe(String(process.pid));
+    } finally {
+      fs.rmSync(work, { recursive: true, force: true });
+    }
   });
 });
