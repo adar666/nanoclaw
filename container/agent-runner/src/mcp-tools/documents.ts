@@ -792,6 +792,16 @@ function renderFileNameFor(resolvedPath: string, originalFilename: string): stri
 // Bounds both worker init (which includes that first-time language-data
 // fetch) and the recognize() call itself in one combined budget — a stuck
 // fetch or a stalled OCR pass must not block save_document indefinitely.
+// Same accepted limitation already noted above for PDF_TIMEOUT_MS
+// (deferred-work.md, epic-2 retro finding): withTimeout races the call
+// against a timer without actually cancelling the underlying work if the
+// timer wins — tesseract.js's worker has no cancellation API to call into
+// (only terminate(), which the finally block below already calls on the
+// normal completion path, not on a timeout), so the worker keeps running
+// in the background until it settles on its own, unbounded by the timeout
+// the caller was told applies. A retry after a timeout can spawn a second
+// worker on top of the still-running first one; best achievable without a
+// real tesseract worker-lifecycle redesign, out of scope here.
 const OCR_TIMEOUT_MS = 60_000;
 // ---------------------------------------------------------------------------
 
