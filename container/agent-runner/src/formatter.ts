@@ -1,5 +1,6 @@
 import { findByRouting } from './destinations.js';
 import type { MessageInRow } from './db/messages-in.js';
+import { isEvalThread } from './db/session-routing.js';
 import { TIMEZONE, formatLocalTime } from './timezone.js';
 
 /**
@@ -56,6 +57,30 @@ export function categorizeMessage(msg: MessageInRow): CommandInfo {
 }
 
 /**
+ * True for a message `kind` eligible for the runner's own slash-command
+ * handling: `isClearCommand`/`isUploadTraceCommand` checks (poll-loop.ts),
+ * `formatMessagesWithCommands`' native-slash-command passthrough
+ * (poll-loop.ts), and `isRunnerCommand` below — chat/chat-sdk only.
+ *
+ * Deliberately excludes `'eval'`, unlike `formatMessages`' own chat-rendering
+ * filter just below (which treats `'eval'` the same as `'chat'`/`'chat-sdk'`
+ * for display purposes). A scripted eval-scenario message's text is authored,
+ * static test data (`eval/scenarios/*.ts`) — it must never be interpreted as
+ * a live administrative command (clearing the session, uploading a trace)
+ * just because it happens to start with `/`. Letting that happen would
+ * silently break eval determinism: a scenario's own scripted content could
+ * trigger a runner-level side effect the scenario author never intended.
+ * Practical risk is low today (no scenario text starts with `/`), but this
+ * makes the exclusion a single, deliberate, named decision instead of the
+ * same `kind === 'chat' || kind === 'chat-sdk'` literal re-typed separately
+ * at each call site, where it could silently drift out of sync with the
+ * others (deferred-work.md finding, spec-eval-session-output-capture.md).
+ */
+export function isCommandEligible(kind: string): boolean {
+  return kind === 'chat' || kind === 'chat-sdk';
+}
+
+/**
  * Narrow check for /clear — the only command the runner handles directly.
  * All other command gating (filtered, admin) is done by the host router
  * before messages reach the container.
@@ -73,7 +98,7 @@ export function isClearCommand(msg: MessageInRow): boolean {
  * the outer loop reopen the query.
  */
 export function isRunnerCommand(msg: MessageInRow): boolean {
-  if (msg.kind !== 'chat' && msg.kind !== 'chat-sdk') return false;
+  if (!isCommandEligible(msg.kind)) return false;
   const cat = categorizeMessage(msg).category;
   return cat === 'admin' || cat === 'passthrough';
 }
@@ -111,6 +136,22 @@ export interface RoutingContext {
 /**
  * Extract routing context from a batch of messages.
  * Uses the first message's routing fields.
+ *
+ * `evalRun` is derived from `isEvalThread()` (db/session-routing.ts) — the
+ * session's own thread id, the same canonical signal `index.ts` uses to pick
+ * `SessionMode` for the system prompt — rather than re-deriving independently
+ * from each message's own `kind` field. A deferred-work.md finding
+ * (spec-eval-session-output-capture.md) flagged the old kind-based derivation
+ * as a second, independent "is this an eval run" check that could silently
+ * drift from the session-identity one: a message written with the wrong
+ * `kind` (a bug elsewhere) would have misrouted an eval session's own batch as
+ * a normal chat run, or vice versa. The session's thread id is set once, only
+ * by `eval/session.ts`'s `resolveEvalSession`, and can't be spoofed by
+ * whatever code happens to write a `messages_in` row — a strictly more
+ * reliable signal than a per-message tag. `taskRun` keeps its own,
+ * pre-existing per-message-kind derivation unchanged — that duality is a
+ * separate, already-accepted precedent this same finding explicitly declined
+ * to touch (out of scope for the eval-only consolidation).
  */
 export function extractRouting(messages: MessageInRow[]): RoutingContext {
   const first = messages[0];
@@ -120,7 +161,7 @@ export function extractRouting(messages: MessageInRow[]): RoutingContext {
     threadId: first?.thread_id ?? null,
     inReplyTo: first?.id ?? null,
     taskRun: messages.length > 0 && messages.every((m) => m.kind === 'task'),
-    evalRun: messages.length > 0 && messages.every((m) => m.kind === 'eval'),
+    evalRun: messages.length > 0 && isEvalThread(),
   };
 }
 

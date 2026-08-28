@@ -10,7 +10,7 @@
  */
 import { randomUUID } from 'crypto';
 
-import { findSystemSession, createSession, updateSession } from '../src/db/sessions.js';
+import { findSystemSession, createSession, setSessionManagedBy } from '../src/db/sessions.js';
 import { log } from '../src/log.js';
 import { initSessionFolder } from '../src/session-manager.js';
 import type { Session } from '../src/types.js';
@@ -48,7 +48,7 @@ export function resolveEvalSession(agentGroupId: string, threadId: string): { se
     // that lands — defensive, not currently reachable in this install (no
     // eval session predates this marker), but cheap to close.
     if (existing.managed_by !== EVAL_MANAGED_BY) {
-      updateSession(existing.id, { managed_by: EVAL_MANAGED_BY });
+      setSessionManagedBy(existing.id, EVAL_MANAGED_BY);
       existing.managed_by = EVAL_MANAGED_BY;
     }
     return { session: existing, created: false };

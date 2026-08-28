@@ -4,7 +4,7 @@ import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from '
 import { getPendingMessages, markCompleted } from './db/messages-in.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { formatMessages, extractRouting } from './formatter.js';
-import { isCorruptionError, processQuery } from './poll-loop.js';
+import { formatMessagesWithCommands, isCorruptionError, processQuery } from './poll-loop.js';
 import { markToolDelivery } from './db/session-state.js';
 import { MockProvider } from './providers/mock.js';
 import type { AgentQuery, ProviderEvent } from './providers/types.js';
@@ -93,6 +93,35 @@ describe('formatter', () => {
     const prompt = formatMessages(messages);
     expect(prompt).toContain('A&lt;B');
     expect(prompt).toContain('x &gt; y &amp;&amp; z');
+  });
+});
+
+describe('formatMessagesWithCommands — eval excluded from native slash-command passthrough', () => {
+  // deferred-work.md finding (spec-eval-session-output-capture.md): this
+  // native-slash-command passthrough branch, and the /clear + /upload-trace
+  // checks in the main poll loop just above it, must all agree with
+  // formatter.ts's own isCommandEligible() on which kinds get command
+  // treatment — 'chat'/'chat-sdk' only, deliberately not 'eval'.
+  it('formats an eval-kind message with command-shaped text as normal XML, not raw passthrough', () => {
+    insertMessage('e1', 'eval', { sender: 'Judge', text: '/some-unknown-command args' });
+    const prompt = formatMessagesWithCommands(getPendingMessages(), true);
+    // Normal XML rendering wraps it in a <message> block — raw passthrough
+    // would have emitted the bare command text with no wrapping at all.
+    expect(prompt).toContain('<message');
+    expect(prompt).toContain('sender="Judge"');
+  });
+
+  it('passes the equivalent chat-kind message through raw when nativeSlashCommands is true', () => {
+    insertMessage('m1', 'chat', { sender: 'Alice', text: '/some-unknown-command args' });
+    const prompt = formatMessagesWithCommands(getPendingMessages(), true);
+    expect(prompt).not.toContain('<message');
+    expect(prompt).toContain('/some-unknown-command args');
+  });
+
+  it('formats the eval-kind message as normal XML even when nativeSlashCommands is false (both kinds unaffected)', () => {
+    insertMessage('e1', 'eval', { sender: 'Judge', text: '/some-unknown-command args' });
+    const prompt = formatMessagesWithCommands(getPendingMessages(), false);
+    expect(prompt).toContain('<message');
   });
 });
 

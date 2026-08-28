@@ -22,6 +22,7 @@ import {
   extractRouting,
   categorizeMessage,
   isClearCommand,
+  isCommandEligible,
   isRunnerCommand,
   stripInternalTags,
   type RoutingContext,
@@ -167,7 +168,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const commandIds: string[] = [];
 
     for (const msg of messages) {
-      if ((msg.kind === 'chat' || msg.kind === 'chat-sdk') && isClearCommand(msg)) {
+      // isCommandEligible() deliberately excludes 'eval' — see its own doc
+      // comment (formatter.ts). A scripted eval-scenario message's text must
+      // never be able to clear the session just because it starts with /clear.
+      if (isCommandEligible(msg.kind) && isClearCommand(msg)) {
         log('Clearing session (resetting continuation)');
         continuation = undefined;
         clearContinuation(config.providerName);
@@ -182,7 +186,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         commandIds.push(msg.id);
         continue;
       }
-      if ((msg.kind === 'chat' || msg.kind === 'chat-sdk') && isUploadTraceCommand(msg)) {
+      // Same isCommandEligible() exclusion of 'eval' as the /clear check above.
+      if (isCommandEligible(msg.kind) && isUploadTraceCommand(msg)) {
         log('Uploading session trace to Hugging Face');
         writeMessageOut({
           id: generateId(),
@@ -308,13 +313,19 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
  * When the provider handles slash commands natively (Claude Code),
  * passthrough commands are sent raw (no XML wrapping) so the SDK can
  * dispatch them. Otherwise they fall through to standard XML formatting.
+ *
+ * Exported for direct testing of the isCommandEligible() exclusion below.
  */
-function formatMessagesWithCommands(messages: MessageInRow[], nativeSlashCommands: boolean): string {
+export function formatMessagesWithCommands(messages: MessageInRow[], nativeSlashCommands: boolean): string {
   const parts: string[] = [];
   const normalBatch: MessageInRow[] = [];
 
   for (const msg of messages) {
-    if (nativeSlashCommands && (msg.kind === 'chat' || msg.kind === 'chat-sdk')) {
+    // isCommandEligible() deliberately excludes 'eval' — see its own doc
+    // comment (formatter.ts). An eval-scenario message whose text happens to
+    // start with '/' must be formatted as normal XML content, not passed
+    // through raw to the SDK as a native slash command.
+    if (nativeSlashCommands && isCommandEligible(msg.kind)) {
       const cmdInfo = categorizeMessage(msg);
       if (cmdInfo.category === 'passthrough' || cmdInfo.category === 'admin') {
         // Flush normal batch first
