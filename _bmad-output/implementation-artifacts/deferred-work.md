@@ -113,6 +113,7 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-eval-1-1-scaffold-the-isolated-eval-agent-group-and-safety-checks.md`
   summary: Whether to wire a CI job step for `pnpm run typecheck:eval` was deliberately deferred (the spec's own "Ask First" boundary) to avoid touching `.github/workflows/ci.yml` in this story; tracked here so it isn't simply forgotten.
   evidence: Blind-hunter finding; the spec's own Boundaries & Constraints section already named this as a fast-follow, this entry just makes it durable.
+  resolved: 2026-08-28 — a new `Typecheck eval` step (`pnpm run typecheck:eval`) added to `.github/workflows/ci.yml`, placed right after the existing `Typecheck container` step, mirroring the same one-line `run:` shape as the host/container typecheck steps immediately above it. `.github/workflows/ci.yml`.
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-eval-1-1-scaffold-the-isolated-eval-agent-group-and-safety-checks.md`
   summary: `eval/session.ts`'s `resolveEvalSession`, `eval/safety.ts`'s `assertNoDestinations`, and `eval/setup.ts`'s `ensureAgentGroup` never validate that the `agentGroupId`/`folder` argument they're given actually exists or is well-formed (e.g. a folder like `"../x"` isn't rejected before reaching `initGroupFilesystem`'s `path.resolve`). Worth hardening once Story 1.4 wires real spawn-path callers into these functions, so a caller bug can't silently pass an id/folder these safety primitives were never meant to guard.
