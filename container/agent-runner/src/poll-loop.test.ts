@@ -572,8 +572,17 @@ describe('task-run turn wiring (real processQuery)', () => {
 
       // A SECOND task run lands while the query is open — the follow-up poller
       // pushes it and must reset the per-turn correction state.
+      //
+      // 15000ms (not the framework's own default 5000ms — this is a real
+      // wall-clock poll of a real background mechanism, unrelated to bun:test's
+      // own per-test timeout): CI found real, reproducible here (2 consecutive
+      // GitHub Actions runs, this exact test, ~50-100ms past a bare 5000ms
+      // budget both times, never on a local dev machine) — a shared CI runner
+      // under load can genuinely take longer than 5s for the follow-up poller
+      // to notice the new row and push it. Same pattern repeats at every other
+      // `Date.now() + 15000` deadline in this file, all for the same reason.
       insertMessage('t2', 'task', { prompt: 'fire two' });
-      const deadline = Date.now() + 5000;
+      const deadline = Date.now() + 15000;
       while (!pushes.some((p) => p.includes('fire two')) && Date.now() < deadline) {
         await new Promise((r) => setTimeout(r, 50));
       }
@@ -760,7 +769,7 @@ describe('follow-up completion timing (crash-recovery correctness)', () => {
       // A follow-up arrives while the query stays open — e.g. the
       // background transcription-complete job writing a new inbound row.
       insertMessage('m2', 'chat', { sender: 'System', text: 'follow-up content' });
-      const deadline = Date.now() + 5000;
+      const deadline = Date.now() + 15000;
       while (!pushes.some((p) => p.includes('follow-up content')) && Date.now() < deadline) {
         await new Promise((r) => setTimeout(r, 50));
       }
@@ -796,7 +805,7 @@ describe('follow-up completion timing (crash-recovery correctness)', () => {
       yield { type: 'result', text: 'turn 1 done' };
 
       insertMessage('m2', 'chat', { sender: 'System', text: 'follow-up content' });
-      const pushDeadline = Date.now() + 5000;
+      const pushDeadline = Date.now() + 15000;
       while (!pushes.some((p) => p.includes('follow-up content')) && Date.now() < pushDeadline) {
         await new Promise((r) => setTimeout(r, 50));
       }
@@ -804,7 +813,7 @@ describe('follow-up completion timing (crash-recovery correctness)', () => {
       // abort() fires (e.g. a slash command landed) before the model's
       // result for the follow-up is ever yielded — a real provider would
       // drop it here too (see providers/claude.ts's `if (aborted) return`).
-      const abortDeadline = Date.now() + 5000;
+      const abortDeadline = Date.now() + 15000;
       while (!aborted && Date.now() < abortDeadline) {
         await new Promise((r) => setTimeout(r, 50));
       }
@@ -826,7 +835,7 @@ describe('follow-up completion timing (crash-recovery correctness)', () => {
 
     // Simulate the follow-up poller detecting a slash command and aborting
     // the stream mid-turn, once the follow-up has actually been pushed.
-    const deadline = Date.now() + 5000;
+    const deadline = Date.now() + 15000;
     while (!pushes.some((p) => p.includes('follow-up content')) && Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 50));
     }
@@ -846,7 +855,7 @@ describe('follow-up completion timing (crash-recovery correctness)', () => {
       yield { type: 'result', text: 'turn 1 done' };
 
       insertMessage('m2', 'chat', { sender: 'System', text: 'follow-up content' });
-      const deadline = Date.now() + 5000;
+      const deadline = Date.now() + 15000;
       while (!pushes.some((p) => p.includes('follow-up content')) && Date.now() < deadline) {
         await new Promise((r) => setTimeout(r, 50));
       }
