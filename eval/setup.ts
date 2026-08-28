@@ -13,13 +13,14 @@ import path from 'path';
 
 import { DATA_DIR, GROUPS_DIR } from '../src/config.js';
 import { CALENDAR_ID_RE, type AdditionalMountConfig } from '../src/container-config.js';
-import { createAgentGroup, getAgentGroupByFolder } from '../src/db/agent-groups.js';
+import { createAgentGroup, deleteAgentGroup, getAgentGroupByFolder } from '../src/db/agent-groups.js';
 import { initDb } from '../src/db/connection.js';
 import { getContainerConfig, updateContainerConfigJson } from '../src/db/container-configs.js';
 import { runMigrations } from '../src/db/migrations/index.js';
 import { readEnvFile } from '../src/env.js';
 import { initGroupFilesystem } from '../src/group-init.js';
 import { log } from '../src/log.js';
+import { validateMount } from '../src/modules/mount-security/index.js';
 import type { AgentGroup } from '../src/types.js';
 
 /**
@@ -56,7 +57,18 @@ export function ensureAgentGroup(folder: string, name: string): AgentGroup {
   const id = `ag-${randomUUID()}`;
   const group: AgentGroup = { id, name, folder, agent_provider: null, created_at: new Date().toISOString() };
   createAgentGroup(group);
-  initGroupFilesystem(group);
+  try {
+    initGroupFilesystem(group);
+  } catch (err) {
+    // Rollback (deferred-work.md finding, spec-eval-1-1): the DB insert above
+    // already committed — if the follow-up filesystem step throws, delete the
+    // row rather than leave an orphaned `agent_groups` row with no matching
+    // workspace for a later `getAgentGroupByFolder(folder)` call to trip over
+    // (it would return a group whose `initGroupFilesystem` never actually
+    // finished, silently skipping the repair-on-existing branch above).
+    deleteAgentGroup(id);
+    throw err;
+  }
   return group;
 }
 
@@ -144,13 +156,41 @@ export function ensureEvalPeopleMount(agentGroupId: string): void {
     );
   }
 
+  // Fail loud at setup time, not silently at container-spawn time (deferred-
+  // work.md finding, spec-eval-1-2): reuses mount-security's own
+  // allowlist-loading/validation logic (rather than re-parsing
+  // ~/.config/nanoclaw/mount-allowlist.json here) so this check can never
+  // drift from what buildMounts()/validateAdditionalMounts() will actually
+  // enforce at spawn time. A missing allowlist entry (wrong machine, edited
+  // allowlist) would otherwise WARN-reject the mount deep inside
+  // container-runner.ts with no signal here at all — see the CLAUDE.md
+  // pitfall on exactly this failure mode.
+  const mountCheck = validateMount({ hostPath, containerPath, readonly: true });
+  if (!mountCheck.allowed) {
+    throw new Error(
+      `ensureEvalPeopleMount: mount-security would reject this mount at container spawn time — ${mountCheck.reason}. ` +
+        `Add "${hostPath}" as an allowed root in ~/.config/nanoclaw/mount-allowlist.json before running eval setup.`,
+    );
+  }
+
   const row = getContainerConfig(agentGroupId);
   if (!row) throw new Error(`No container config for group: ${agentGroupId}`);
 
   const mount: AdditionalMountConfig = { hostPath, containerPath, readonly: true };
   const existing = safeJsonParse(row.additional_mounts, [] as AdditionalMountConfig[], 'additional_mounts', agentGroupId);
-  if (!existing.some((m) => m.hostPath === hostPath && m.containerPath === containerPath)) {
+  const existingIndex = existing.findIndex((m) => m.hostPath === hostPath && m.containerPath === containerPath);
+  if (existingIndex === -1) {
     existing.push(mount);
+    updateContainerConfigJson(agentGroupId, 'additional_mounts', existing);
+  } else if (existing[existingIndex].readonly !== mount.readonly) {
+    // Reconcile a same-(hostPath, containerPath) entry whose `readonly` value
+    // disagrees with what this function always wants (`true`, hardcoded —
+    // never caller-supplied) — mirrors `config add-calendar`'s own
+    // override-by-name convention (filter-then-push the corrected entry)
+    // rather than failing loud, since there's exactly one correct value here
+    // and no caller intent to conflict with (deferred-work.md finding,
+    // spec-eval-1-2).
+    existing[existingIndex] = mount;
     updateContainerConfigJson(agentGroupId, 'additional_mounts', existing);
   }
 }

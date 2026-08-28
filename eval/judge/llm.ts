@@ -33,6 +33,28 @@ export interface LlmJudgeResult {
 }
 
 /**
+ * Thrown ONLY for `judgeLlm`'s own two documented business-logic failure
+ * modes below (an incomplete judge turn, an unparseable judge reply) —
+ * deliberately never used for anything that bubbles up from
+ * `runScenarioTurn`'s own AD-4 loud-failure conditions (a destination
+ * violation, a spawn failure, malformed opts). That distinction is what lets
+ * a caller (`cli.ts`'s `runOneScenario`) tell "the judge failed to judge"
+ * (a per-scenario `'judge-error'` outcome, matching its own `check()`-throw
+ * precedent for the deterministic branch) apart from "the harness itself
+ * broke" (must propagate loud and abort the run, same as the scenario's own
+ * uncaught `runScenarioTurn` call) via `instanceof JudgeLlmError` — without
+ * this, a genuine AD-4 failure inside the judge's own turn would be silently
+ * absorbed into an ordinary per-scenario outcome instead of aborting the
+ * whole run (deferred-work.md finding, spec-eval-2-3, resolved 2026-08-28).
+ */
+export class JudgeLlmError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'JudgeLlmError';
+  }
+}
+
+/**
  * Case-insensitive, global — the judge's reply may carry preamble before the
  * real verdict line, and the prompt itself mentions both "VERDICT: PASS" and
  * "VERDICT: FAIL" together as instructions, which a judge can plausibly echo
@@ -127,7 +149,7 @@ export async function judgeLlm(
   const result = await runScenarioTurn(judgeAgentGroupId, threadId, prompt, opts);
 
   if (result.status !== 'completed') {
-    throw new Error(
+    throw new JudgeLlmError(
       `judgeLlm: judge turn did not complete — expected status "completed", got "${result.status}" ` +
         `(session ${result.sessionId}); refusing to invent a verdict from an incomplete transcript`,
     );
@@ -142,7 +164,7 @@ export async function judgeLlm(
   const lastVerdict = findTrailingMatch(replyText, VERDICT_PATTERN);
 
   if (!lastVerdict || !reasoning) {
-    throw new Error(
+    throw new JudgeLlmError(
       `judgeLlm: could not parse the judge's reply — expected lines matching ` +
         `"VERDICT: PASS|FAIL" and "REASONING: ...", got: ${JSON.stringify(truncateForError(replyText))}`,
     );

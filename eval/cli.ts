@@ -19,7 +19,7 @@
 import { EVAL_CLI_ONESHOT_TOKEN, killAllActiveContainers } from '../src/container-runner.js';
 import { log } from '../src/log.js';
 import { judgeDeterministic } from './judge/deterministic.js';
-import { judgeLlm } from './judge/llm.js';
+import { JudgeLlmError, judgeLlm } from './judge/llm.js';
 import { loadScenarios, SCENARIO_SETS, type Scenario } from './loader.js';
 import { releaseEvalLockIfOwned, withEvalLock } from './lock.js';
 import { makeRunId, writeReport, type Report, type ScenarioReportEntry } from './reporter.js';
@@ -74,14 +74,17 @@ function parseArgs(argv: string[]): ParsedArgs {
 /**
  * Runs one scenario's turn, judging, and cleanup, producing its report
  * entry. Never throws for a scenario-level outcome (a failed/timed-out turn,
- * a failing verdict, a `check` that throws, a failed cleanup) — all of those
- * are reported, not raised, so one scenario's fate never aborts the rest of
- * the run. Only a
- * structural failure out of `runScenarioTurn` itself (bad opts, a
- * destination violation, a spawn failure — AD-4 loud-failure conditions)
- * propagates out of this function, which is deliberate: those are
- * environmental problems the whole run should abort loudly for, not a
- * per-scenario verdict.
+ * a failing verdict, a `check` that throws, a `judgeLlm` `JudgeLlmError`, a
+ * failed cleanup) — all of those are reported, not raised, so one scenario's
+ * fate never aborts the rest of the run. Only a structural failure (bad
+ * opts, a destination violation, a spawn failure — AD-4 loud-failure
+ * conditions) propagates out of this function, which is deliberate: those
+ * are environmental problems the whole run should abort loudly for, not a
+ * per-scenario verdict. This applies uniformly whether the structural
+ * failure comes from the scenario's own (uncaught) `runScenarioTurn` call or
+ * leaks out of `judgeLlm`'s internal one — the `llmJudge` branch's catch
+ * only absorbs `JudgeLlmError`, rethrowing anything else (deferred-work.md
+ * finding, spec-eval-2-3).
  *
  * `judgeAgentGroupId` is infrastructure (which isolated agent group the
  * judge's own turn spawns under), never scenario content — `runCli`
@@ -123,13 +126,24 @@ export async function runOneScenario(scenario: Scenario, judgeAgentGroupId: stri
         evidence: verdict.reasoning,
       };
     } catch (err) {
-      // Mirrors the deterministic branch's own check()-throwing case below
-      // exactly: judgeLlm's own documented failure modes (an incomplete
-      // judge turn, an unparseable judge reply) are caught here rather than
-      // left to propagate — a judging failure on one scenario must not abort
-      // the whole run, skip that scenario's own cleanup, or discard every
-      // other scenario's already-computed report entry.
-      const message = err instanceof Error ? err.message : String(err);
+      // Mirrors the deterministic branch's own check()-throwing case below —
+      // but ONLY for judgeLlm's own documented business-logic failure modes
+      // (an incomplete judge turn, an unparseable judge reply), signaled via
+      // `JudgeLlmError` — caught here rather than left to propagate, since a
+      // judging failure on one scenario must not abort the whole run, skip
+      // that scenario's own cleanup, or discard every other scenario's
+      // already-computed report entry.
+      //
+      // Anything else — a genuine AD-4-style structural failure that leaked
+      // out of judgeLlm's own internal runScenarioTurn call (a destination
+      // violation, a spawn failure, malformed opts) rather than one of its
+      // documented failure modes — must propagate loud and abort the whole
+      // run, exactly like the scenario's own (uncaught) runScenarioTurn call
+      // above, NOT get silently absorbed into a per-scenario 'judge-error'
+      // outcome (deferred-work.md finding, spec-eval-2-3).
+      if (!(err instanceof JudgeLlmError)) throw err;
+
+      const message = err.message;
       log.error('Scenario llmJudge threw', { scenarioId: scenario.id, err });
       entry = {
         id: scenario.id,

@@ -202,6 +202,30 @@ describe('runScenarioTurn', () => {
     expect(result.transcript).toEqual([]);
   });
 
+  it(
+    "returns status timeout within a bounded number of iterations even when the deadline check's own clock never " +
+      'advances (belt-and-suspenders max-iteration cap, deferred-work.md spec-eval-1-4) — without the cap, a frozen ' +
+      '`Date.now()` would make `Date.now() < deadline` stay true forever and this test would hang',
+    async () => {
+      vi.mocked(wakeContainer).mockResolvedValue(true); // never writes processing_ack
+
+      const frozenAt = Date.now();
+      const dateNowSpy = vi.spyOn(Date, 'now').mockReturnValue(frozenAt);
+      try {
+        const threadId = `${EVAL_THREAD_PREFIX}:turn-frozen-clock`;
+        // timeoutMs/pollIntervalMs chosen small so the real (unmocked) setTimeout
+        // sleeps between iterations resolve quickly — the cap, not the deadline
+        // check, is what has to end this loop.
+        const result = await runScenarioTurn(AG, threadId, 'hi there', { timeoutMs: 200, pollIntervalMs: 20 });
+
+        expect(result.status).toBe('timeout');
+      } finally {
+        dateNowSpy.mockRestore();
+      }
+    },
+    10_000,
+  );
+
   it("excludes an older run's messages_out rows when the same session is reused", async () => {
     vi.mocked(wakeContainer).mockImplementation(async (session: Session) => {
       const messageId = latestInboundMessageId(session);

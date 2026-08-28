@@ -27,11 +27,32 @@ vi.mock('../src/env.js', () => ({
   readEnvFile: vi.fn(() => ({})),
 }));
 
+// Calls through to the real implementation by default (every existing test
+// below relies on the real filesystem side effects) — only the rollback test
+// overrides it, via mockImplementationOnce, to simulate the follow-up
+// filesystem step throwing after the DB insert already committed.
+vi.mock('../src/group-init.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/group-init.js')>();
+  return { ...actual, initGroupFilesystem: vi.fn(actual.initGroupFilesystem) };
+});
+
+// Real mount-allowlist.json state (a real file at ~/.config/nanoclaw/...) is
+// not deterministic across machines/CI — every test below needs a controlled
+// verdict rather than whatever this host's real allowlist happens to say.
+// Defaults to "allowed" so every pre-existing test (which doesn't care about
+// mount-security specifically) keeps passing; only the dedicated tests below
+// override it.
+vi.mock('../src/modules/mount-security/index.js', () => ({
+  validateMount: vi.fn(() => ({ allowed: true, reason: 'test default: allowed' })),
+}));
+
 import { closeDb, initTestDb, runMigrations } from '../src/db/index.js';
 import { getAgentGroupByFolder, getAllAgentGroups } from '../src/db/agent-groups.js';
-import { getContainerConfig } from '../src/db/container-configs.js';
+import { initGroupFilesystem } from '../src/group-init.js';
+import { getContainerConfig, updateContainerConfigJson } from '../src/db/container-configs.js';
 import { getDestinations } from '../src/modules/agent-to-agent/db/agent-destinations.js';
 import { readEnvFile } from '../src/env.js';
+import { validateMount } from '../src/modules/mount-security/index.js';
 import {
   ensureAgentGroup,
   ensureEvalCalendarOverride,
@@ -55,6 +76,7 @@ beforeEach(() => {
   runMigrations(initTestDb());
   delete process.env.EVAL_TEST_CALENDAR_ID;
   mockedReadEnvFile.mockReturnValue({});
+  vi.mocked(validateMount).mockReset().mockReturnValue({ allowed: true, reason: 'test default: allowed' });
 });
 
 afterEach(() => {
@@ -290,6 +312,56 @@ describe('ensureEvalPeopleMount', () => {
     const config = getContainerConfig(group.id)!;
     expect(JSON.parse(config.additional_mounts)).toEqual([]);
   });
+
+  it('validates the mount against mount-security before writing it, passing the real hostPath/containerPath/readonly (deferred-work.md, spec-eval-1-2)', () => {
+    const group = ensureAgentGroup('eval-mount-validate-call', 'Eval Mount Test (validate call)');
+
+    ensureEvalPeopleMount(group.id);
+
+    expect(validateMount).toHaveBeenCalledWith({
+      hostPath: `${TEST_ROOT}/groups/household/memory/household/people.md`,
+      containerPath: 'household-shared/people.md',
+      readonly: true,
+    });
+  });
+
+  it('throws loud, writing nothing, when mount-security would reject the mount (missing allowlist entry) — never a silent WARN-rejection at spawn time', () => {
+    vi.mocked(validateMount).mockReturnValue({
+      allowed: false,
+      reason: 'Path "/tmp/nanoclaw-eval-setup-test/groups/household/memory/household/people.md" is not under any allowed root',
+    });
+    const group = ensureAgentGroup('eval-mount-not-allowlisted', 'Eval Mount Test (not allowlisted)');
+
+    expect(() => ensureEvalPeopleMount(group.id)).toThrow(/mount-allowlist\.json/);
+
+    const config = getContainerConfig(group.id)!;
+    expect(JSON.parse(config.additional_mounts)).toEqual([]);
+  });
+
+  it('reconciles a pre-existing (hostPath, containerPath) entry whose readonly value disagrees with true, rather than leaving it writable (deferred-work.md, spec-eval-1-2)', () => {
+    const group = ensureAgentGroup('eval-mount-reconcile', 'Eval Mount Test (reconcile)');
+    const hostPath = `${TEST_ROOT}/groups/household/memory/household/people.md`;
+    const containerPath = 'household-shared/people.md';
+    // Seed a pre-existing entry for the identical (hostPath, containerPath)
+    // pair, but writable — simulates a hand-edited/stale config row the old
+    // (hostPath, containerPath)-only dedup check would have silently kept as-is.
+    updateContainerConfigJson(group.id, 'additional_mounts', [{ hostPath, containerPath, readonly: false }]);
+
+    ensureEvalPeopleMount(group.id);
+
+    const config = getContainerConfig(group.id)!;
+    expect(JSON.parse(config.additional_mounts)).toEqual([{ hostPath, containerPath, readonly: true }]);
+  });
+
+  it('does not rewrite the config when the existing entry already matches exactly', () => {
+    const group = ensureAgentGroup('eval-mount-no-op', 'Eval Mount Test (no-op)');
+    ensureEvalPeopleMount(group.id);
+    const before = getContainerConfig(group.id)!.additional_mounts;
+
+    ensureEvalPeopleMount(group.id);
+
+    expect(getContainerConfig(group.id)!.additional_mounts).toBe(before);
+  });
 });
 
 describe('ensureAgentGroup', () => {
@@ -309,5 +381,30 @@ describe('ensureAgentGroup', () => {
 
     expect(again.id).toBe(group.id);
     expect(fs.existsSync(`${TEST_ROOT}/groups/eval-repair`)).toBe(true);
+  });
+
+  it('rolls back (deletes) the agent_groups row when the filesystem step throws after the DB insert commits (deferred-work.md, spec-eval-1-1)', () => {
+    vi.mocked(initGroupFilesystem).mockImplementationOnce(() => {
+      throw new Error('disk full');
+    });
+
+    expect(() => ensureAgentGroup('eval-rollback', 'Rollback Test')).toThrow(/disk full/);
+
+    // No orphaned row left behind for a later ensureAgentGroup(folder, ...)
+    // call to find and treat as already-provisioned (silently skipping the
+    // repair-on-existing branch, since initGroupFilesystem never finished).
+    expect(getAgentGroupByFolder('eval-rollback')).toBeUndefined();
+  });
+
+  it('a later ensureAgentGroup call for the same folder after a rollback creates a fresh group rather than silently no-oping', () => {
+    vi.mocked(initGroupFilesystem).mockImplementationOnce(() => {
+      throw new Error('disk full');
+    });
+    expect(() => ensureAgentGroup('eval-rollback-retry', 'Rollback Retry Test')).toThrow();
+
+    const group = ensureAgentGroup('eval-rollback-retry', 'Rollback Retry Test');
+
+    expect(group.folder).toBe('eval-rollback-retry');
+    expect(fs.existsSync(`${TEST_ROOT}/groups/eval-rollback-retry`)).toBe(true);
   });
 });
