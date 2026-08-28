@@ -403,14 +403,20 @@ export async function processQuery(
   // because host-sweep only resets rows still stuck in 'processing'.
   let pendingFollowUpIds: string[] = [];
   const pollHandle = setInterval(() => {
-    log(`DIAG-TICK done=${done} pollInFlight=${pollInFlight} endedForCommand=${endedForCommand}`);
     if (done || pollInFlight || endedForCommand) return;
     pollInFlight = true;
 
     void (async () => {
       try {
+        // Re-check `done` after the (synchronous-at-this-point) guard above —
+        // a tick that already passed it can still be resolving this async
+        // IIFE well after processQuery's own `finally` sets `done = true` and
+        // clears `pollHandle` (clearInterval only stops FUTURE ticks, never
+        // an already-in-flight one). Bail before any DB read/write: an
+        // orphaned tick that keeps running past its own query's lifetime has
+        // nothing legitimate left to claim or push into.
+        if (done) return;
         const pending = getPendingMessages();
-        log(`DIAG-PENDING count=${pending.length}`);
 
         // Slash commands need a fresh query: /clear resets the SDK's
         // resume id (fixed at sdkQuery() time); admin/passthrough commands
