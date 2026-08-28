@@ -442,7 +442,12 @@ function escapeMarkdown(s: string): string {
 // ---------------------------------------------------------------------------
 
 function decodeXmlEntities(s: string): string {
-  return s.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, '&');
+  return s
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&');
 }
 
 export function docxXmlToText(xml: string): string {
@@ -734,9 +739,7 @@ async function renderFirstPageToPng(filePath: string, outPath: string): Promise<
  * (a random/timestamped name would make that lookup impossible).
  */
 function renderFileNameFor(resolvedPath: string, originalFilename: string): string {
-  const hash = crc32(Buffer.from(resolvedPath, 'utf-8'))
-    .toString(16)
-    .padStart(8, '0');
+  const hash = crc32(Buffer.from(resolvedPath, 'utf-8')).toString(16).padStart(8, '0');
   return `${slugify(originalFilename)}-${hash}-p1.png`;
 }
 
@@ -788,6 +791,13 @@ function renderFileNameFor(resolvedPath: string, originalFilename: string): stri
 // (matches the spec's no-Dockerfile-change constraint, which is about the
 // *code* dependency, not this data fetch), but worth knowing if OCR ever
 // fails specifically on a fresh cacheDir with no network reachable.
+// Checksum-pinned (deferred-work.md finding, resolved 2026-08-28): see
+// `ensureOcrLangData` below — the file is fetched and SHA-256-verified by
+// this tool itself, before tesseract.js's own loadLanguage step ever runs,
+// so a compromised/corrupted CDN response is rejected instead of silently
+// loaded. Deliberately not bundled into the image (operator decision) — the
+// "not present until first use" shape is unchanged, only the integrity
+// guarantee on that first fetch is new.
 //
 // Bounds both worker init (which includes that first-time language-data
 // fetch) and the recognize() call itself in one combined budget — a stuck
@@ -832,6 +842,106 @@ function withOcrCacheDirLock<T>(cacheDir: string, fn: () => Promise<T>): Promise
   return result;
 }
 
+/**
+ * Checksum-pinned OCR language data (deferred-work.md finding, ocr-fallback
+ * item, 2026-08-28): `tesseract.js`'s own `loadLanguage` step would otherwise
+ * fetch `eng.traineddata`/`heb.traineddata` from `cdn.jsdelivr.net` with no
+ * integrity check at all — a compromised CDN or a MITM on that first-ever
+ * download could hand tesseract.js an arbitrary binary to load. This
+ * pre-populates `${cacheDir}/${lang}.traineddata` ourselves, verified against
+ * a pinned SHA-256 of both the downloaded `.gz` and its decompressed
+ * contents, before `createWorker` ever runs — `loadLanguage`'s own cache
+ * check (reads `${cachePath}/${lang}.traineddata` first, before touching the
+ * network at all) then finds the file already present and never fetches
+ * anything itself. Deliberately NOT bundling the files into the image
+ * (operator decision, 2026-08-28): that would add a permanent, unconditional
+ * image-size cost for every install; a checksum-pinned CDN fetch keeps the
+ * "not present until first OCR use" shape while closing the supply-chain
+ * gap.
+ *
+ * Version pinned to `4.0.0`, matching tesseract.js's own default `langPath`
+ * (see `loadLanguage` in its `worker-script/index.js`) — a version bump
+ * upstream would need these hashes re-pinned deliberately, not silently
+ * trusted.
+ */
+const OCR_LANG_DATA_VERSION = '4.0.0';
+
+/** SHA-256 of the `.gz` as served, and of its decompressed `.traineddata` contents — both checked. */
+export const OCR_LANG_DATA_HASHES: Record<string, { gz: string; decompressed: string }> = {
+  eng: {
+    gz: 'ed350f3752f81ee8f38769edc14d92d997dababe23b565c59879372cc46a2468',
+    decompressed: 'daa0c97d651c19fba3b25e81317cd697e9908c8208090c94c3905381c23fc047',
+  },
+  heb: {
+    gz: 'd18b4db5beccd16b41cfc7f38b53f6bf614d256696560444dc78753fbab54f1e',
+    decompressed: '7da6ea6b7a2620ec8e8b41de2967a13d429635a56657a0b30b622501a573d3e1',
+  },
+};
+
+function sha256Hex(data: Buffer): string {
+  return crypto.createHash('sha256').update(data).digest('hex');
+}
+
+/**
+ * Ensure `${cacheDir}/${lang}.traineddata` exists and is checksum-verified.
+ * No-op if already present (an existing cache entry is trusted as-is — this
+ * only pins the download, not a standing integrity re-check on every OCR
+ * call). Exported for direct testing; the fetch fn is injectable so tests
+ * never hit the real network.
+ */
+export async function ensureOcrLangData(
+  cacheDir: string,
+  lang: string,
+  fetchFn: typeof fetch = fetch,
+  hashes: Record<string, { gz: string; decompressed: string }> = OCR_LANG_DATA_HASHES,
+): Promise<void> {
+  const targetPath = path.join(cacheDir, `${lang}.traineddata`);
+  if (fs.existsSync(targetPath)) return;
+
+  const pinned = hashes[lang];
+  if (!pinned) {
+    throw new Error(`ensureOcrLangData: no pinned checksum for OCR language "${lang}" — refusing to fetch unpinned.`);
+  }
+
+  const url = `https://cdn.jsdelivr.net/npm/@tesseract.js-data/${lang}/${OCR_LANG_DATA_VERSION}/${lang}.traineddata.gz`;
+  let gz: Buffer;
+  try {
+    const response = await fetchFn(url, { signal: AbortSignal.timeout(60_000) });
+    if (!response.ok) {
+      throw new Error(`OCR language data fetch for "${lang}" returned HTTP ${response.status} from ${url}`);
+    }
+    gz = Buffer.from(await response.arrayBuffer());
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`OCR language data fetch for "${lang}" failed: ${msg}`);
+  }
+
+  const gzHash = sha256Hex(gz);
+  if (gzHash !== pinned.gz) {
+    throw new Error(
+      `OCR language data integrity check failed for "${lang}": expected gz sha256 ${pinned.gz}, got ${gzHash} — ` +
+        'refusing to use this download (possible CDN compromise or corruption).',
+    );
+  }
+
+  const decompressed = zlib.gunzipSync(gz);
+  const decompressedHash = sha256Hex(decompressed);
+  if (decompressedHash !== pinned.decompressed) {
+    throw new Error(
+      `OCR language data integrity check failed for "${lang}": expected decompressed sha256 ` +
+        `${pinned.decompressed}, got ${decompressedHash} — refusing to use this download.`,
+    );
+  }
+
+  fs.mkdirSync(cacheDir, { recursive: true });
+  // Write-then-rename: a crash/interruption mid-write must never leave a
+  // partial file at the real target path for loadLanguage's own cache check
+  // to find and (wrongly) trust on the next call.
+  const tmpPath = `${targetPath}.tmp-${process.pid}-${Date.now()}`;
+  fs.writeFileSync(tmpPath, decompressed);
+  fs.renameSync(tmpPath, targetPath);
+}
+
 export async function ocrPngText(pngPath: string, ocrOpts: { cacheDir: string }): Promise<string> {
   const work = (async () => {
     const tesseractModule = await import('tesseract.js');
@@ -841,7 +951,17 @@ export async function ocrPngText(pngPath: string, ocrOpts: { cacheDir: string })
     }
 
     const moduleDir = path.dirname(fileURLToPath(import.meta.url));
-    const workerPath = path.join(moduleDir, '..', '..', 'node_modules', 'tesseract.js', 'src', 'worker-script', 'node', 'index.js');
+    const workerPath = path.join(
+      moduleDir,
+      '..',
+      '..',
+      'node_modules',
+      'tesseract.js',
+      'src',
+      'worker-script',
+      'node',
+      'index.js',
+    );
 
     // Fail fast and specifically (spec-2 retro item 8) — without this check,
     // an unexpected node_modules layout (this path is anchored relative to
@@ -864,9 +984,11 @@ export async function ocrPngText(pngPath: string, ocrOpts: { cacheDir: string })
     // so a second, already-queued caller's own createWorker call proceeds
     // needing no download at all — concurrent recognize() calls against an
     // already-populated cache are never serialized by this lock.
-    const worker = await withOcrCacheDirLock(ocrOpts.cacheDir, () =>
-      createWorker('eng+heb', undefined, { workerPath, cachePath: ocrOpts.cacheDir }),
-    );
+    const worker = await withOcrCacheDirLock(ocrOpts.cacheDir, async () => {
+      await ensureOcrLangData(ocrOpts.cacheDir, 'eng');
+      await ensureOcrLangData(ocrOpts.cacheDir, 'heb');
+      return createWorker('eng+heb', undefined, { workerPath, cachePath: ocrOpts.cacheDir });
+    });
     try {
       const { data } = await worker.recognize(pngPath);
       return (data.text ?? '').trim();
@@ -1050,7 +1172,7 @@ export async function saveDocumentImpl(
       if (resolution.meta.ambiguousExtensions) {
         return err(
           `Multiple files found for document "${resolution.meta.slug}" (${resolution.meta.ambiguousExtensions.join(', ')}) — ` +
-            'this shouldn\'t normally happen. Check memory/documents/files/ for this slug manually before retrying.',
+            "this shouldn't normally happen. Check memory/documents/files/ for this slug manually before retrying.",
         );
       }
       refreshTarget = resolution.meta;
@@ -1228,7 +1350,7 @@ export async function saveDocumentImpl(
         if (recheck.meta.ambiguousExtensions) {
           throw new Error(
             `Multiple files found for document "${recheck.meta.slug}" (${recheck.meta.ambiguousExtensions.join(', ')}) — ` +
-              'this shouldn\'t normally happen. Check memory/documents/files/ for this slug manually before retrying.',
+              "this shouldn't normally happen. Check memory/documents/files/ for this slug manually before retrying.",
           );
         }
         const meta = recheck.meta;
@@ -1360,7 +1482,13 @@ export async function saveDocumentImpl(
           fs.copyFileSync(resolvedPath, rawDestPath, fs.constants.COPYFILE_EXCL);
           rawWritten = true;
 
-          const { conceptBody, savedDate, description } = buildConceptBody(originalFilename, slug, ext, bodyText, extractionNote);
+          const { conceptBody, savedDate, description } = buildConceptBody(
+            originalFilename,
+            slug,
+            ext,
+            bodyText,
+            extractionNote,
+          );
           fs.writeFileSync(conceptPath, conceptBody, { flag: 'wx' });
           conceptWritten = true;
 
@@ -1374,7 +1502,12 @@ export async function saveDocumentImpl(
           );
 
           log(`save_document: saved "${originalFilename}" as "${slug}"`);
-          return { kind: 'fresh', response: ok(`Saved "${originalFilename}" to memory as "${slug}". Recorded in memory/documents/${slug}.md.`) };
+          return {
+            kind: 'fresh',
+            response: ok(
+              `Saved "${originalFilename}" to memory as "${slug}". Recorded in memory/documents/${slug}.md.`,
+            ),
+          };
         } catch (e) {
           // Partial failure — a raw copy or concept file already landed with
           // no complete, consistent entry to show for it. Roll back whatever
@@ -2085,7 +2218,8 @@ const CONTENT_TYPES_NS = 'http://schemas.openxmlformats.org/package/2006/content
 // anything the source actually had, since these fallbacks are only ever used
 // when the part was entirely absent.
 const DEFAULT_RELS_XML =
-  '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + `<Relationships xmlns="${RELATIONSHIPS_XML_NS}"></Relationships>`;
+  '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' +
+  `<Relationships xmlns="${RELATIONSHIPS_XML_NS}"></Relationships>`;
 const DEFAULT_CONTENT_TYPES_XML =
   '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + `<Types xmlns="${CONTENT_TYPES_NS}"></Types>`;
 
@@ -2307,7 +2441,12 @@ async function prepareSignatureStamp(
 }
 
 /** Writes all three new/updated zip parts together, alongside the (already-spliced) new document.xml — never a partial subset. */
-function applySignatureZipParts(zip: JSZipType, newDocumentXml: string, signaturePng: Buffer, parts: SignatureStampParts): void {
+function applySignatureZipParts(
+  zip: JSZipType,
+  newDocumentXml: string,
+  signaturePng: Buffer,
+  parts: SignatureStampParts,
+): void {
   zip.file('word/document.xml', newDocumentXml);
   zip.file(`word/media/image${parts.mediaNumber}.png`, signaturePng);
   zip.file('word/_rels/document.xml.rels', parts.relsXml);
@@ -2453,7 +2592,9 @@ function readFillHistory(baseDir: string, slug: string): FillHistoryEntry[] {
       );
     });
     if (validRaw.length < parsed.length) {
-      log(`fill history for "${slug}" had ${parsed.length - validRaw.length} malformed entr(y/ies) — dropped, keeping the rest`);
+      log(
+        `fill history for "${slug}" had ${parsed.length - validRaw.length} malformed entr(y/ies) — dropped, keeping the rest`,
+      );
     }
     return validRaw.map((candidate) => ({
       timestamp: candidate.timestamp as string,
@@ -2462,7 +2603,9 @@ function readFillHistory(baseDir: string, slug: string): FillHistoryEntry[] {
       kind: candidate.kind === 'pre-refresh-snapshot' ? 'pre-refresh-snapshot' : 'fill',
     }));
   } catch (e) {
-    log(`fill history for "${slug}" is not valid JSON — ignoring corrupted index, treating as empty: ${e instanceof Error ? e.message : String(e)}`);
+    log(
+      `fill history for "${slug}" is not valid JSON — ignoring corrupted index, treating as empty: ${e instanceof Error ? e.message : String(e)}`,
+    );
     return [];
   }
 }
@@ -2499,7 +2642,10 @@ async function recordFillHistory(baseDir: string, slug: string, entry: FillHisto
     const existing = readFillHistory(baseDir, slug);
     const updated = [...existing, entry].slice(-FILL_HISTORY_CAP);
     const finalPath = fillHistoryPath(baseDir, slug);
-    const tmpPath = path.join(dir, `.${slug}.json.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+    const tmpPath = path.join(
+      dir,
+      `.${slug}.json.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    );
     fs.writeFileSync(tmpPath, JSON.stringify(updated, null, 2));
     fs.renameSync(tmpPath, finalPath);
   });
@@ -2782,9 +2928,7 @@ async function fillDocx(
   // priority, dropping lineNumber with no acknowledgment — an explicit
   // error is safer than a silent resolution.
   if (usesTablePath && lineNumberArg !== undefined) {
-    return err(
-      'Pass either "row"/"table" for the table-fill path or "lineNumber" for the text-line path, not both.',
-    );
+    return err('Pass either "row"/"table" for the table-fill path or "lineNumber" for the text-line path, not both.');
   }
   // column only means something for table-row targeting — without row/table
   // it used to be silently ignored.
@@ -3316,7 +3460,9 @@ async function pdfFillAcroForm(
   try {
     textField = form.getTextField(fieldName);
   } catch (e) {
-    return err(`Field "${fieldName}" exists but isn't a fillable text field: ${e instanceof Error ? e.message : String(e)}`);
+    return err(
+      `Field "${fieldName}" exists but isn't a fillable text field: ${e instanceof Error ? e.message : String(e)}`,
+    );
   }
 
   if (signaturePng !== undefined) {
@@ -3567,7 +3713,12 @@ function tailOf(buf: unknown): string {
  * truth for the flag set, so a future flag change can't silently drift the
  * production invocation and the test fixture's invocation apart.
  */
-export function sofficeConvertArgs(inputPath: string, targetFormat: string, outDir: string, profileDir: string): string[] {
+export function sofficeConvertArgs(
+  inputPath: string,
+  targetFormat: string,
+  outDir: string,
+  profileDir: string,
+): string[] {
   return [
     '--headless',
     '--norestore',
@@ -3727,7 +3878,7 @@ async function fillOneDocument(
   if (meta.ambiguousExtensions) {
     return err(
       `Multiple files found for document "${meta.slug}" (${meta.ambiguousExtensions.join(', ')}) — this ` +
-        'shouldn\'t normally happen. Check memory/documents/files/ for this slug manually before retrying.',
+        "shouldn't normally happen. Check memory/documents/files/ for this slug manually before retrying.",
     );
   }
 
@@ -3833,7 +3984,9 @@ async function fillOneDocument(
         // extractFillOutputPath parses — but a future copy change to that
         // text could silently break extraction. Log it rather than letting a
         // completed fill silently get no history entry with zero trace.
-        log(`fill history: completed fill for ${meta.slug} matched FILL_SUCCESS_MARKER but no output path could be extracted from the result text`);
+        log(
+          `fill history: completed fill for ${meta.slug} matched FILL_SUCCESS_MARKER but no output path could be extracted from the result text`,
+        );
       }
     }
 
@@ -3856,7 +4009,7 @@ export async function fillDocumentFieldImpl(
   try {
     const documentQueryRaw = typeof args.document === 'string' ? args.document : undefined;
     const documentQuery = documentQueryRaw?.trim();
-    if (!documentQuery) return err('document is required — the saved document\'s name/slug/topic to fill.');
+    if (!documentQuery) return err("document is required — the saved document's name/slug/topic to fill.");
 
     const documentsDir = path.join(opts.baseDir, 'memory', 'documents');
     const filesDir = path.join(documentsDir, 'files');
@@ -3888,10 +4041,10 @@ export const fillDocumentField: McpToolDefinition = {
     name: 'fill_document_field',
     description:
       'Fill a value into a named target in a document already saved via save_document, and produce a new file ' +
-      "(the stored copy is never modified) — call send_file with the returned path to deliver it. For a .docx " +
+      '(the stored copy is never modified) — call send_file with the returned path to deliver it. For a .docx ' +
       "with a table: targets a table row (table/row, column optional — defaults to the row's last cell) — this " +
       'always wins over line targeting when row/table is given. For a .docx with no table (or when you give ' +
-      'lineNumber instead of row): targets a plain paragraph\'s fill-in-the-blank line — an underscore blank or ' +
+      "lineNumber instead of row): targets a plain paragraph's fill-in-the-blank line — an underscore blank or " +
       'a trailing-colon label — a first call with neither row nor lineNumber returns a discovery response ' +
       '(the detected blank lines, the table-row prompt, or both if the document has both a table and non-table ' +
       'blanks). Never pass row/table together with lineNumber. For a .pdf: targets an AcroForm field (fieldName) ' +
@@ -3899,7 +4052,7 @@ export const fillDocumentField: McpToolDefinition = {
       'detected lines to choose from) or, for a scanned PDF, a pixel position on a rendered page (a first call ' +
       'with no pixelX/pixelY renders page 1 and returns its pixel dimensions). For any file type, "signatureName" ' +
       '(instead of, or together with, "value") stamps a signature already saved via save_signature at whichever ' +
-      'target the call resolves to — for a .pdf: image only for the AcroForm case (the field\'s text is left ' +
+      "target the call resolves to — for a .pdf: image only for the AcroForm case (the field's text is left " +
       'unset), image plus text beside it if "value" is also given for the line/pixel cases; for a .docx: the ' +
       'image is always an additional inserted run (never a replacement) at the same table-cell or ' +
       'fill-in-the-blank-line target row/lineNumber would otherwise resolve, with an additional text run right ' +
@@ -3943,8 +4096,8 @@ export const fillDocumentField: McpToolDefinition = {
         lineNumber: {
           type: 'integer',
           description:
-            '1-indexed line (from a prior discovery call\'s numbered list) — for a .pdf text-layer, draws the ' +
-            'value after that line on the same baseline; for a .docx, fills that fill-in-the-blank paragraph\'s ' +
+            "1-indexed line (from a prior discovery call's numbered list) — for a .pdf text-layer, draws the " +
+            "value after that line on the same baseline; for a .docx, fills that fill-in-the-blank paragraph's " +
             'underscore run (each blank in a paragraph is its own numbered line) or trailing-colon label. ' +
             'Mutually exclusive with row/table for a .docx — passing both is an error.',
         },
@@ -4250,7 +4403,7 @@ export const saveDocument: McpToolDefinition = {
       'extractedText — and so does a scanned PDF in the rare case OCR finds little to no readable text), and ' +
       'records an entry in memory/index.md so it can be recalled later without resending it. Declines cleanly ' +
       'for any other file type. Give "document" to refresh an already-saved document in place instead of saving ' +
-      'a new one — see that argument\'s own description before using it.',
+      "a new one — see that argument's own description before using it.",
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -4274,14 +4427,14 @@ export const saveDocument: McpToolDefinition = {
           description:
             'Only set this when the user explicitly asked to replace/update/re-save an already-saved document ' +
             "with this new file's content — never as a default after a fill, and never just because the file " +
-            'looks related. Free-text match (same as every other tool here) against an already-saved document\'s ' +
+            "looks related. Free-text match (same as every other tool here) against an already-saved document's " +
             "slug/filename/description. When it resolves, that document's raw file and stored text are " +
             "overwritten in place with this call's content (same slug, extension changes if the new file is a " +
             'different type) — the pre-refresh version is snapshotted for recovery via list_document_versions, ' +
             'but this is still a real, deliberate overwrite, not a preview. Nothing checks that the file you pass ' +
             "actually corresponds to the document named in `document` — pointing it at the wrong document's " +
             'content is on you, not verified automatically. Omit entirely (the default) to save a new, ' +
-            "separately-slugged document as always. If it matches more than one saved document, returns a " +
+            'separately-slugged document as always. If it matches more than one saved document, returns a ' +
             'numbered candidate list instead of refreshing anything; if it matches none, errors instead of ' +
             'silently falling back to creating a new document.',
         },
@@ -4316,7 +4469,7 @@ export async function listDocumentVersionsImpl(
     const documentQueryRaw = typeof args.document === 'string' ? args.document : undefined;
     const documentQuery = documentQueryRaw?.trim();
     if (!documentQuery) {
-      return err('document is required — the saved document\'s name/slug/topic to list fill history for.');
+      return err("document is required — the saved document's name/slug/topic to list fill history for.");
     }
 
     const documentsDir = path.join(opts.baseDir, 'memory', 'documents');
@@ -4382,7 +4535,7 @@ export const listDocumentVersions: McpToolDefinition = {
     description:
       'List the version history of a document already saved via save_document, oldest to newest, each entry ' +
       'labeled with its kind: a completed fill_document_field/fill_document_field_batch output ("fill"), or a ' +
-      'save_document refresh\'s snapshot of the document as it was right before that refresh overwrote it ' +
+      "save_document refresh's snapshot of the document as it was right before that refresh overwrote it " +
       '("pre-refresh snapshot") — both share this same history index. Every entry still on disk gets a timestamp, ' +
       'a short description (e.g. "row 2", "fieldName: Date" for a fill; "pre-refresh snapshot" for a refresh), and ' +
       'its output path. Use this to find and resend an earlier version (an "undo") — pass the chosen output path ' +
@@ -4406,4 +4559,11 @@ export const listDocumentVersions: McpToolDefinition = {
   handler: (args) => listDocumentVersionsImpl(args, { baseDir: '/workspace/agent' }),
 };
 
-registerTools([saveDocument, listDocuments, fillDocumentField, fillDocumentFieldBatch, saveSignature, listDocumentVersions]);
+registerTools([
+  saveDocument,
+  listDocuments,
+  fillDocumentField,
+  fillDocumentFieldBatch,
+  saveSignature,
+  listDocumentVersions,
+]);

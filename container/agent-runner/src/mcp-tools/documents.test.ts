@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, mock } from 'bun:test';
 import { execFileSync } from 'child_process';
+import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -28,6 +29,7 @@ import {
   describePdfReadError,
   withLock,
   ocrPngText,
+  ensureOcrLangData,
 } from './documents.js';
 
 // ---------------------------------------------------------------------------
@@ -52,7 +54,9 @@ import {
 // ---------------------------------------------------------------------------
 
 let mockOcrResult: { text: string } | { error: string } = { text: '' };
-let lastCreateWorkerCall: { langs: unknown; oem: unknown; options: { workerPath?: string; cachePath?: string } } | undefined;
+let lastCreateWorkerCall:
+  | { langs: unknown; oem: unknown; options: { workerPath?: string; cachePath?: string } }
+  | undefined;
 
 // Concurrency instrumentation for the withOcrCacheDirLock regression test
 // below (deferred-work.md, ocr-fallback item) — `createWorkerDelayMs` lets a
@@ -356,12 +360,26 @@ let tmpRoot: string;
 let baseDir: string;
 let inboxDir: string;
 
+// ensureOcrLangData (deferred-work.md, checksum-pin item, 2026-08-28) checks
+// `${cacheDir}/${lang}.traineddata` before ever touching the network — pre-
+// seeding both files with dummy content makes every test below hit that
+// already-cached short-circuit, exactly like a real install's second-and-
+// later OCR call would, with zero network dependency and no need to fake a
+// real checksum match. `ensureOcrLangData` itself is unit-tested directly,
+// separately, against a real fetch mock (see its own describe block).
+function seedOcrCache(cacheDir: string): void {
+  fs.mkdirSync(cacheDir, { recursive: true });
+  fs.writeFileSync(path.join(cacheDir, 'eng.traineddata'), 'fake-eng-traineddata');
+  fs.writeFileSync(path.join(cacheDir, 'heb.traineddata'), 'fake-heb-traineddata');
+}
+
 beforeEach(() => {
   tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'save-document-test-'));
   baseDir = path.join(tmpRoot, 'agent');
   inboxDir = path.join(tmpRoot, 'inbox', 'msg1');
   fs.mkdirSync(baseDir, { recursive: true });
   fs.mkdirSync(inboxDir, { recursive: true });
+  seedOcrCache(path.join(baseDir, '.ocr-cache'));
   mockOcrResult = { text: '' };
   lastCreateWorkerCall = undefined;
   createWorkerDelayMs = 0;
@@ -462,10 +480,12 @@ describe('save_document — happy path, PDF with text layer', () => {
 });
 
 describe('describePdfReadError', () => {
-  it('names a password-protected PDF distinctly, rather than surfacing pdfjs-dist\'s generic error text', () => {
+  it("names a password-protected PDF distinctly, rather than surfacing pdfjs-dist's generic error text", () => {
     const e = new Error('No password given');
     e.name = 'PasswordException';
-    expect(describePdfReadError(e)).toBe('this PDF is password-protected and cannot be read — please provide an unprotected copy');
+    expect(describePdfReadError(e)).toBe(
+      'this PDF is password-protected and cannot be read — please provide an unprotected copy',
+    );
   });
 
   it('falls through to the plain error message for any other error', () => {
@@ -1223,17 +1243,17 @@ function buildDocxWithSingleQuotedParts(tables: string[][][]): Buffer {
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' +
     '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">' +
     `<w:body>${body}<w:p><w:r><w:drawing>` +
-    "<wp:inline xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\">" +
+    '<wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">' +
     "<wp:docPr id='7' name='Picture 7'/>" +
     '</wp:inline></w:drawing></w:r></w:p></w:body></w:document>';
   const relsXml =
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' +
-    "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" +
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
     "<Relationship Id='rId5' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/image' " +
     "Target='media/image5.png'/></Relationships>";
   const contentTypesXml =
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' +
-    "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">" +
+    '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">' +
     "<Default Extension='png' ContentType='image/png'/></Types>";
   const existingImage = buildSignaturePng({ width: 10, height: 10, ink: { x: 0, y: 0, w: 5, h: 5 } });
   return buildStoredZip([
@@ -1357,7 +1377,9 @@ function buildMultilineTextPdf(lines: string[]): Buffer {
   const page =
     '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] ' +
     '/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>';
-  const streamContent = lines.map((text, i) => `BT /F1 14 Tf 20 ${160 - i * 20} Td (${escapePdfString(text)}) Tj ET`).join('\n');
+  const streamContent = lines
+    .map((text, i) => `BT /F1 14 Tf 20 ${160 - i * 20} Td (${escapePdfString(text)}) Tj ET`)
+    .join('\n');
   const font = '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>';
 
   const parts: string[] = ['%PDF-1.4\n'];
@@ -1437,7 +1459,7 @@ describe('save_document — refresh, unambiguous match', () => {
   });
 });
 
-describe('save_document — document omitted, unchanged today\'s behavior', () => {
+describe("save_document — document omitted, unchanged today's behavior", () => {
   it('still creates a new, separately-slugged document even when a same-named one already exists', async () => {
     await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocx(['First'])) }, opts());
     fs.mkdirSync(path.join(inboxDir, 'msg2'), { recursive: true });
@@ -1522,7 +1544,17 @@ describe('save_document — refresh, pre-refresh raw file is snapshotted into fi
 describe('save_document — refresh, a second fill afterward compounds on the refreshed content', () => {
   it('fill_document_field operates on the refreshed document, not the pre-refresh original', async () => {
     await saveDocumentImpl(
-      { path: writeInboxFile('report.docx', buildDocxWithTables([[['Name:', 'orig1'], ['Date:', 'orig2']]])) },
+      {
+        path: writeInboxFile(
+          'report.docx',
+          buildDocxWithTables([
+            [
+              ['Name:', 'orig1'],
+              ['Date:', 'orig2'],
+            ],
+          ]),
+        ),
+      },
       opts(),
     );
 
@@ -1547,7 +1579,7 @@ describe('save_document — refresh, a second fill afterward compounds on the re
 });
 
 describe('save_document — refresh, source file type differs from the original', () => {
-  it('changes the raw file\'s extension, updates the raw-file frontmatter pointer, and snapshots the old-extension file', async () => {
+  it("changes the raw file's extension, updates the raw-file frontmatter pointer, and snapshots the old-extension file", async () => {
     const originalPdfBytes = buildMinimalPdf('Original PDF text');
     await saveDocumentImpl({ path: writeInboxFile('report.pdf', originalPdfBytes) }, opts());
     expect(fs.existsSync(path.join(baseDir, 'memory', 'documents', 'files', 'report.pdf'))).toBe(true);
@@ -1634,8 +1666,8 @@ describe('save_document — refresh, rollback on partial failure inside the crit
   });
 });
 
-describe('save_document — refresh preserves the original document\'s source-filename/description/heading', () => {
-  it('does not overwrite them with the refresh source\'s own (often machine-generated) filename', async () => {
+describe("save_document — refresh preserves the original document's source-filename/description/heading", () => {
+  it("does not overwrite them with the refresh source's own (often machine-generated) filename", async () => {
     await saveDocumentImpl({ path: writeInboxFile('Quarterly Report.docx', buildDocx(['Original content'])) }, opts());
 
     fs.mkdirSync(path.join(inboxDir, 'msg2'), { recursive: true });
@@ -1901,7 +1933,7 @@ describe('fill_document_field — document resolution', () => {
 // ---------------------------------------------------------------------------
 
 describe('fill_document_field — docx happy path', () => {
-  it('fills the row\'s last cell by default, leaving everything else byte-identical', async () => {
+  it("fills the row's last cell by default, leaving everything else byte-identical", async () => {
     const original = buildDocxWithTables([
       [
         ['a1', 'b1'],
@@ -2135,7 +2167,7 @@ describe('fill_document_field — docx text-line, underscore run fragmented acro
 });
 
 describe('fill_document_field — docx text-line, trailing-colon blank (no underscores)', () => {
-  it('inserts a new run right after the paragraph\'s last existing run', async () => {
+  it("inserts a new run right after the paragraph's last existing run", async () => {
     const original = buildDocxRawBody([bodyParagraphXml('תאריך:'), bodyParagraphXml('Untouched paragraph.')]);
     const filePath = writeInboxFile('intake.docx', original);
     await saveDocumentImpl({ path: filePath }, opts());
@@ -2249,10 +2281,7 @@ describe('fill_document_field — docx, column given without row/table', () => {
     const filePath = writeInboxFile('intake.docx', buildDocx(['שם: ___________']));
     await saveDocumentImpl({ path: filePath }, opts());
 
-    const result = await fillDocumentFieldImpl(
-      { document: 'intake', column: 2, lineNumber: 1, value: 'X' },
-      opts(),
-    );
+    const result = await fillDocumentFieldImpl({ document: 'intake', column: 2, lineNumber: 1, value: 'X' }, opts());
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain('column');
     expect(result.content[0].text).toContain('row');
@@ -2292,10 +2321,7 @@ describe('fill_document_field — docx text-line, two blanks in one paragraph', 
 
 describe('fill_document_field — docx text-line, purely decorative underscore divider', () => {
   it('is never offered as a fill target (no label text once underscores are stripped)', async () => {
-    const filePath = writeInboxFile(
-      'intake.docx',
-      buildDocx(['_____________________________', 'שם: ___________']),
-    );
+    const filePath = writeInboxFile('intake.docx', buildDocx(['_____________________________', 'שם: ___________']));
     await saveDocumentImpl({ path: filePath }, opts());
 
     const result = await fillDocumentFieldImpl({ document: 'intake' }, opts());
@@ -2640,13 +2666,12 @@ async function getPageContentsText(page: any): Promise<string> {
   const { PDFArray, PDFRawStream, decodePDFRawStream } = await import('pdf-lib');
   const contents = page.node.Contents();
   if (!contents) return '';
-  const streams = contents instanceof PDFArray
-    ? // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (Array.from({ length: contents.size() }, (_, i) => contents.lookup(i, PDFRawStream)) as any[])
-    : [contents];
-  return streams
-    .map((s) => Buffer.from(decodePDFRawStream(s).decode()).toString('latin1'))
-    .join('\n');
+  const streams =
+    contents instanceof PDFArray
+      ? // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (Array.from({ length: contents.size() }, (_, i) => contents.lookup(i, PDFRawStream)) as any[])
+      : [contents];
+  return streams.map((s) => Buffer.from(decodePDFRawStream(s).decode()).toString('latin1')).join('\n');
 }
 
 function extractCmMatrices(text: string): number[][] {
@@ -2797,10 +2822,7 @@ describe('fill_document_field — docx, merged cell (gridSpan)', () => {
 
 describe('fill_document_field — docx, non-"w:" OOXML namespace prefix', () => {
   it('names the real cause instead of the generic "no tables" message, on the row-targeting path', async () => {
-    const filePath = writeInboxFile(
-      'report.docx',
-      buildDocxWithRawTableNonWPrefix(rowXml(['Name', ''])),
-    );
+    const filePath = writeInboxFile('report.docx', buildDocxWithRawTableNonWPrefix(rowXml(['Name', ''])));
     await saveDocumentImpl({ path: filePath }, opts());
 
     const result = await fillDocumentFieldImpl({ document: 'report', row: 1, value: 'X' }, opts());
@@ -2812,10 +2834,7 @@ describe('fill_document_field — docx, non-"w:" OOXML namespace prefix', () => 
   });
 
   it('names the real cause instead of the generic "no tables" message, on the bare-discovery path', async () => {
-    const filePath = writeInboxFile(
-      'report.docx',
-      buildDocxWithRawTableNonWPrefix(rowXml(['Name', ''])),
-    );
+    const filePath = writeInboxFile('report.docx', buildDocxWithRawTableNonWPrefix(rowXml(['Name', ''])));
     await saveDocumentImpl({ path: filePath }, opts());
 
     const result = await fillDocumentFieldImpl({ document: 'report' }, opts());
@@ -3254,9 +3273,7 @@ describe('save_signature — happy path', () => {
     const result = await saveSignatureImpl({ path: filePath, name: 'threshold-test' }, opts());
     expect(result.isError).toBeFalsy();
 
-    const decoded = PNG.sync.read(
-      fs.readFileSync(path.join(baseDir, 'memory', 'signatures', 'threshold-test.png')),
-    );
+    const decoded = PNG.sync.read(fs.readFileSync(path.join(baseDir, 'memory', 'signatures', 'threshold-test.png')));
     // Bounding box crops out the now-transparent near-white pixel at x=0,
     // leaving just the two surviving pixels (the borderline-dark one and ink).
     expect(decoded.width).toBe(2);
@@ -3394,9 +3411,7 @@ describe('save_signature — name collision', () => {
     expect(r2.content[0].text).toContain('uriel-2');
 
     // Original untouched, second written alongside it under the suffixed name.
-    expect(fs.readFileSync(path.join(baseDir, 'memory', 'signatures', 'uriel.png')).equals(originalBytes)).toBe(
-      true,
-    );
+    expect(fs.readFileSync(path.join(baseDir, 'memory', 'signatures', 'uriel.png')).equals(originalBytes)).toBe(true);
     expect(fs.existsSync(path.join(baseDir, 'memory', 'signatures', 'uriel-2.png'))).toBe(true);
   });
 
@@ -3529,7 +3544,7 @@ describe('save_signature — sequential same-group saves (not a genuine race)', 
 });
 
 describe('save_signature — EEXIST retry path (writeSignaturePng), genuinely forced', () => {
-  it('recovers from a real EEXIST on the wx write (not just uniqueName\'s up-front check) and completes on retry', async () => {
+  it("recovers from a real EEXIST on the wx write (not just uniqueName's up-front check) and completes on retry", async () => {
     const signaturesDir = path.join(baseDir, 'memory', 'signatures');
     fs.mkdirSync(signaturesDir, { recursive: true });
     // Base name already taken, so uniqueName's first legitimate candidate is "uriel-2".
@@ -3608,7 +3623,10 @@ describe('fill_document_field — PDF, signature stamped into AcroForm field', (
     // 2:1 aspect ratio source image.
     writeSavedSignature('uriel', buildSignaturePng({ width: 100, height: 50, ink: { x: 10, y: 10, w: 80, h: 30 } }));
 
-    const result = await fillDocumentFieldImpl({ document: 'form', fieldName: 'Signature', signatureName: 'uriel' }, opts());
+    const result = await fillDocumentFieldImpl(
+      { document: 'form', fieldName: 'Signature', signatureName: 'uriel' },
+      opts(),
+    );
     expect(result.isError).toBeFalsy();
     expect(result.content[0].text).toContain('field text left unset');
 
@@ -3650,7 +3668,7 @@ describe('fill_document_field — PDF, signature stamped into AcroForm field', (
     expect(draw.height).toBeLessThanOrEqual(rect.height + 0.01);
   });
 
-  it('draws text beside the image, at the image\'s own bottom, when value is also given', async () => {
+  it("draws text beside the image, at the image's own bottom, when value is also given", async () => {
     const pdfBytes = await buildAcroFormPdf('Signature');
     const filePath = writeInboxFile('form.pdf', pdfBytes);
     await saveDocumentImpl({ path: filePath }, opts());
@@ -3775,7 +3793,10 @@ describe('fill_document_field — PDF, AcroForm signature stamp against a non-te
     await saveDocumentImpl({ path: filePath, extractedText: 'A form with a checkbox.' }, opts());
     writeSavedSignature('uriel', buildSignaturePng({ width: 40, height: 20, ink: { x: 5, y: 5, w: 20, h: 10 } }));
 
-    const result = await fillDocumentFieldImpl({ document: 'form', fieldName: 'Agree', signatureName: 'uriel' }, opts());
+    const result = await fillDocumentFieldImpl(
+      { document: 'form', fieldName: 'Agree', signatureName: 'uriel' },
+      opts(),
+    );
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain('Agree');
     expect(result.content[0].text).toContain("isn't a fillable text field");
@@ -3942,7 +3963,10 @@ describe('fill_document_field — PDF scanned pixel, signature stamp', () => {
     // page — less than SIGNATURE_MAX_HEIGHT_PT (45), which the off-page
     // bounding-box check (rightly) declines. pixelY=140 -> pdfY=130, 70pt
     // of headroom, comfortably fits.
-    const result = await fillDocumentFieldImpl({ document: 'scan', pixelX: 40, pixelY: 140, signatureName: 'uriel' }, opts());
+    const result = await fillDocumentFieldImpl(
+      { document: 'scan', pixelX: 40, pixelY: 140, signatureName: 'uriel' },
+      opts(),
+    );
     expect(result.isError).toBeFalsy();
 
     const outPath = extractOutPath(result.content[0].text);
@@ -4049,7 +4073,10 @@ describe('fill_document_field — .docx signature stamping, table cell target', 
     await saveDocumentImpl({ path: filePath }, opts());
     writeSavedSignature('uriel', buildSignaturePng({ width: 100, height: 50, ink: { x: 10, y: 10, w: 80, h: 30 } }));
 
-    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, column: 2, signatureName: 'uriel' }, opts());
+    const result = await fillDocumentFieldImpl(
+      { document: 'report', row: 1, column: 2, signatureName: 'uriel' },
+      opts(),
+    );
     expect(result.isError).toBeFalsy();
     expect(result.content[0].text).toContain('New file at ');
     expect(result.content[0].text).toContain('table 1, row 1, column 2');
@@ -4066,9 +4093,8 @@ describe('fill_document_field — .docx signature stamping, table cell target', 
     expect(docxXmlToText(docXml)).toContain('John Doe');
 
     const relsXml = await zip.file('word/_rels/document.xml.rels')!.async('string');
-    const relMatch = /<Relationship Id="rId(\d+)" Type="[^"]*\/relationships\/image" Target="media\/(image\d+\.png)"\/>/.exec(
-      relsXml,
-    );
+    const relMatch =
+      /<Relationship Id="rId(\d+)" Type="[^"]*\/relationships\/image" Target="media\/(image\d+\.png)"\/>/.exec(relsXml);
     expect(relMatch).not.toBeNull();
     const [, relId, mediaTarget] = relMatch!;
     expect(docXml).toContain(`r:embed="rId${relId}"`);
@@ -4197,7 +4223,10 @@ describe('fill_document_field — .docx signature stamping, target cell already 
     await saveDocumentImpl({ path: filePath }, opts());
     writeSavedSignature('uriel', buildSignaturePng({ width: 100, height: 50, ink: { x: 10, y: 10, w: 80, h: 30 } }));
 
-    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, column: 2, signatureName: 'uriel' }, opts());
+    const result = await fillDocumentFieldImpl(
+      { document: 'report', row: 1, column: 2, signatureName: 'uriel' },
+      opts(),
+    );
     expect(result.isError).toBeFalsy();
 
     const outPath = extractOutPath(result.content[0].text);
@@ -4336,29 +4365,35 @@ describe('fill_document_field — .docx signature stamping, stored canonical cop
   });
 });
 
-describe.skipIf(!SOFFICE_AVAILABLE)('fill_document_field — .doc signature stamping (via the unmodified conversion delegation)', () => {
-  it('stamps the signature into the converted .docx and discloses the .doc-origin note', async () => {
-    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'doc-signature-test-'));
-    try {
-      const docBuf = buildDocViaSoffice(work, ['Name: ______']);
-      const filePath = writeInboxFile('form.doc', docBuf);
-      await saveDocumentImpl({ path: filePath }, opts());
-      writeSavedSignature('uriel', buildSignaturePng({ width: 100, height: 50, ink: { x: 10, y: 10, w: 80, h: 30 } }));
+describe.skipIf(!SOFFICE_AVAILABLE)(
+  'fill_document_field — .doc signature stamping (via the unmodified conversion delegation)',
+  () => {
+    it('stamps the signature into the converted .docx and discloses the .doc-origin note', async () => {
+      const work = fs.mkdtempSync(path.join(os.tmpdir(), 'doc-signature-test-'));
+      try {
+        const docBuf = buildDocViaSoffice(work, ['Name: ______']);
+        const filePath = writeInboxFile('form.doc', docBuf);
+        await saveDocumentImpl({ path: filePath }, opts());
+        writeSavedSignature(
+          'uriel',
+          buildSignaturePng({ width: 100, height: 50, ink: { x: 10, y: 10, w: 80, h: 30 } }),
+        );
 
-      const result = await fillDocumentFieldImpl({ document: 'form', lineNumber: 1, signatureName: 'uriel' }, opts());
-      expect(result.isError).toBeFalsy();
-      expect(result.content[0].text).toContain('legacy .doc file');
-      expect(result.content[0].text).toContain('.docx, not a');
+        const result = await fillDocumentFieldImpl({ document: 'form', lineNumber: 1, signatureName: 'uriel' }, opts());
+        expect(result.isError).toBeFalsy();
+        expect(result.content[0].text).toContain('legacy .doc file');
+        expect(result.content[0].text).toContain('.docx, not a');
 
-      const outPath = extractOutPath(result.content[0].text);
-      expect(outPath.endsWith('.docx')).toBe(true);
-      const newXml = await readDocxXml(fs.readFileSync(outPath));
-      expect(newXml).toContain('<w:drawing>');
-    } finally {
-      fs.rmSync(work, { recursive: true, force: true });
-    }
-  });
-});
+        const outPath = extractOutPath(result.content[0].text);
+        expect(outPath.endsWith('.docx')).toBe(true);
+        const newXml = await readDocxXml(fs.readFileSync(outPath));
+        expect(newXml).toContain('<w:drawing>');
+      } finally {
+        fs.rmSync(work, { recursive: true, force: true });
+      }
+    });
+  },
+);
 
 describe('fill_document_field — PDF, no target given, signatureName present', () => {
   it('returns the identical discovery response the text-only path already returns', async () => {
@@ -4471,7 +4506,10 @@ describe('fill_document_field_batch — mixed success/failure across the batch',
   it('fills the existing document, names the missing one as a per-item failure, no batch abort', async () => {
     await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
 
-    const result = await fillDocumentFieldBatchImpl({ documents: ['report', 'missing-doc'], row: 1, value: 'X' }, opts());
+    const result = await fillDocumentFieldBatchImpl(
+      { documents: ['report', 'missing-doc'], row: 1, value: 'X' },
+      opts(),
+    );
     expect(result.isError).toBeFalsy();
     const text = result.content[0].text;
     expect(text).toContain('1/2 succeeded');
@@ -4527,7 +4565,7 @@ describe('fill_document_field_batch — neither or both of documents/matchQuery 
   });
 });
 
-describe('fill_document_field_batch — targeting args do not apply to one document\'s file type', () => {
+describe("fill_document_field_batch — targeting args do not apply to one document's file type", () => {
   it('reports that document as a per-item failure with the existing validation error text; others unaffected', async () => {
     await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
 
@@ -4592,10 +4630,7 @@ describe('fill_document_field_batch — signatureName is not supported', () => {
     await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
     writeSavedSignature('uriel', buildSignaturePng({ width: 20, height: 10, ink: { x: 2, y: 2, w: 10, h: 5 } }));
 
-    const result = await fillDocumentFieldBatchImpl(
-      { documents: ['report'], row: 1, signatureName: 'uriel' },
-      opts(),
-    );
+    const result = await fillDocumentFieldBatchImpl({ documents: ['report'], row: 1, signatureName: 'uriel' }, opts());
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain('signatureName is not supported by fill_document_field_batch');
     expect(fs.existsSync(path.join(baseDir, '.document-fills'))).toBe(false);
@@ -4614,7 +4649,10 @@ describe('fill_document_field_batch — duplicate documents[] entries resolving 
   });
 
   it('also dedupes when two different query strings resolve to the same document', async () => {
-    await saveDocumentImpl({ path: writeInboxFile('quarterly-report.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
+    await saveDocumentImpl(
+      { path: writeInboxFile('quarterly-report.docx', buildDocxWithTables([[['a1', 'b1']]])) },
+      opts(),
+    );
 
     const result = await fillDocumentFieldBatchImpl(
       { documents: ['quarterly-report', 'report'], row: 1, value: 'X' },
@@ -4682,7 +4720,10 @@ describe('fill_document_field_batch — resolveBatchTargets input-shape validati
 
 describe('fill_document_field_batch — every documents[] entry fails to resolve', () => {
   it('is a soft 0/N report, not a whole-call error', async () => {
-    const result = await fillDocumentFieldBatchImpl({ documents: ['missing-a', 'missing-b'], row: 1, value: 'X' }, opts());
+    const result = await fillDocumentFieldBatchImpl(
+      { documents: ['missing-a', 'missing-b'], row: 1, value: 'X' },
+      opts(),
+    );
     expect(result.isError).toBeFalsy();
     const text = result.content[0].text;
     expect(text).toContain('0/2 succeeded');
@@ -4879,7 +4920,10 @@ describe('list_document_versions — a batch fill completes', () => {
     await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
     await saveDocumentImpl({ path: writeInboxFile('letter.docx', buildDocxWithTables([[['c1', 'd1']]])) }, opts());
 
-    const batchResult = await fillDocumentFieldBatchImpl({ documents: ['report', 'letter'], row: 1, value: 'X' }, opts());
+    const batchResult = await fillDocumentFieldBatchImpl(
+      { documents: ['report', 'letter'], row: 1, value: 'X' },
+      opts(),
+    );
     expect(batchResult.isError).toBeFalsy();
     expect(batchResult.content[0].text).toContain('2/2 succeeded');
 
@@ -4907,7 +4951,12 @@ describe('list_document_versions — a discovery/prompt call or per-item batch f
 
   it('a discovery/prompt response within a batch call records nothing for that document', async () => {
     await saveDocumentImpl(
-      { path: writeInboxFile('mixed.docx', buildDocxRawBody([tableXml([['a1', 'b1']]), bodyParagraphXml('שם: ___________')])) },
+      {
+        path: writeInboxFile(
+          'mixed.docx',
+          buildDocxRawBody([tableXml([['a1', 'b1']]), bodyParagraphXml('שם: ___________')]),
+        ),
+      },
       opts(),
     );
 
@@ -5275,10 +5324,14 @@ describe('ocrPngText — concurrent calls against the same cacheDir', () => {
   it('does not serialize createWorker calls against two different cacheDirs', async () => {
     createWorkerDelayMs = 20;
     mockOcrResult = { text: 'ocr text' };
+    const cacheDirA = path.join(baseDir, 'group-a', '.ocr-cache');
+    const cacheDirB = path.join(baseDir, 'group-b', '.ocr-cache');
+    seedOcrCache(cacheDirA);
+    seedOcrCache(cacheDirB);
 
     const [a, b] = await Promise.all([
-      ocrPngText('/fake/page-a.png', { cacheDir: path.join(baseDir, 'group-a', '.ocr-cache') }),
-      ocrPngText('/fake/page-b.png', { cacheDir: path.join(baseDir, 'group-b', '.ocr-cache') }),
+      ocrPngText('/fake/page-a.png', { cacheDir: cacheDirA }),
+      ocrPngText('/fake/page-b.png', { cacheDir: cacheDirB }),
     ]);
 
     // Different agent groups' cache dirs are independent locks — no reason
@@ -5298,5 +5351,102 @@ describe('ocrPngText — concurrent calls against the same cacheDir', () => {
     mockOcrResult = { text: 'recovered' };
     const result = await ocrPngText('/fake/page-b.png', { cacheDir });
     expect(result).toBe('recovered');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ensureOcrLangData — checksum-pinned OCR language data (deferred-work.md,
+// ocr-fallback item, resolved 2026-08-28). Never hits the real network or
+// real tesseract.js CDN hashes — a self-contained fake lang + matching
+// hashes, built fresh per test, exercises the same fetch→verify→write logic
+// the real 'eng'/'heb' entries go through.
+// ---------------------------------------------------------------------------
+
+describe('ensureOcrLangData — checksum-pinned OCR language data', () => {
+  function fakeHashes(decompressed: Buffer): Record<string, { gz: string; decompressed: string }> {
+    const gz = zlib.gzipSync(decompressed);
+    return {
+      testlang: {
+        gz: crypto.createHash('sha256').update(gz).digest('hex'),
+        decompressed: crypto.createHash('sha256').update(decompressed).digest('hex'),
+      },
+    };
+  }
+
+  it('fetches, verifies, and writes the file when not yet cached', async () => {
+    const cacheDir = path.join(baseDir, 'fresh-ocr-cache');
+    const content = Buffer.from('real language data contents');
+    const gz = zlib.gzipSync(content);
+    const hashes = fakeHashes(content);
+    const fetchFn = mock(async () => new Response(gz, { status: 200 }));
+
+    await ensureOcrLangData(cacheDir, 'testlang', fetchFn as unknown as typeof fetch, hashes);
+
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+    const written = fs.readFileSync(path.join(cacheDir, 'testlang.traineddata'));
+    expect(written.equals(content)).toBe(true);
+  });
+
+  it('is a no-op (never calls fetch) when the file already exists', async () => {
+    const cacheDir = path.join(baseDir, 'existing-ocr-cache');
+    fs.mkdirSync(cacheDir, { recursive: true });
+    fs.writeFileSync(path.join(cacheDir, 'testlang.traineddata'), 'already here');
+    const fetchFn = mock(async () => new Response(Buffer.from('should never be used'), { status: 200 }));
+
+    await ensureOcrLangData(cacheDir, 'testlang', fetchFn as unknown as typeof fetch, fakeHashes(Buffer.from('x')));
+
+    expect(fetchFn).not.toHaveBeenCalled();
+    expect(fs.readFileSync(path.join(cacheDir, 'testlang.traineddata'), 'utf8')).toBe('already here');
+  });
+
+  it('rejects a download whose gz bytes do not match the pinned hash', async () => {
+    const cacheDir = path.join(baseDir, 'tampered-gz-cache');
+    const pinnedContent = Buffer.from('the real expected content');
+    const hashes = fakeHashes(pinnedContent);
+    // Server returns something else entirely — a compromised/corrupted CDN.
+    const tamperedGz = zlib.gzipSync(Buffer.from('tampered content'));
+    const fetchFn = mock(async () => new Response(tamperedGz, { status: 200 }));
+
+    await expect(ensureOcrLangData(cacheDir, 'testlang', fetchFn as unknown as typeof fetch, hashes)).rejects.toThrow(
+      /integrity check failed/,
+    );
+    expect(fs.existsSync(path.join(cacheDir, 'testlang.traineddata'))).toBe(false);
+  });
+
+  it('rejects when the decompressed content does not match the pinned hash (gz hash matches, decompressed does not)', async () => {
+    const cacheDir = path.join(baseDir, 'tampered-decompressed-cache');
+    const content = Buffer.from('actual content');
+    const gz = zlib.gzipSync(content);
+    const hashes = {
+      testlang: {
+        gz: crypto.createHash('sha256').update(gz).digest('hex'), // correct
+        decompressed: '0'.repeat(64), // deliberately wrong
+      },
+    };
+    const fetchFn = mock(async () => new Response(gz, { status: 200 }));
+
+    await expect(ensureOcrLangData(cacheDir, 'testlang', fetchFn as unknown as typeof fetch, hashes)).rejects.toThrow(
+      /integrity check failed/,
+    );
+    expect(fs.existsSync(path.join(cacheDir, 'testlang.traineddata'))).toBe(false);
+  });
+
+  it('refuses to fetch a language with no pinned checksum', async () => {
+    const cacheDir = path.join(baseDir, 'unpinned-lang-cache');
+    const fetchFn = mock(async () => new Response(Buffer.from('x'), { status: 200 }));
+
+    await expect(ensureOcrLangData(cacheDir, 'unpinned', fetchFn as unknown as typeof fetch, {})).rejects.toThrow(
+      /no pinned checksum/,
+    );
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it('surfaces a non-2xx response as a clear error, not a generic parse failure', async () => {
+    const cacheDir = path.join(baseDir, 'http-error-cache');
+    const fetchFn = mock(async () => new Response('not found', { status: 404 }));
+
+    await expect(
+      ensureOcrLangData(cacheDir, 'testlang', fetchFn as unknown as typeof fetch, fakeHashes(Buffer.from('x'))),
+    ).rejects.toThrow(/HTTP 404/);
   });
 });
