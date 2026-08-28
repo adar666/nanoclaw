@@ -2804,17 +2804,121 @@ describe('fill_document_field — wrong-file-type arguments', () => {
   });
 });
 
-// --- 5. Merged-cell (gridSpan) detect-and-decline ---------------------------
+// --- 5. Merged-cell (gridSpan) visual-column targeting -----------------------
+//
+// gridSpanRowXml(): cell 1 has gridSpan=2 (occupies visual columns 1-2,
+// text "merged"), cell 2 is ordinary (visual column 3, text "c3"). Raw
+// <w:tc> count is 2; total visual width is 3.
 
-describe('fill_document_field — docx, merged cell (gridSpan)', () => {
-  it('declines cleanly instead of miscounting the visual column', async () => {
+function threeGridSpanCellsRowXml(): string {
+  return (
+    '<w:tr>' +
+    '<w:tc><w:tcPr><w:gridSpan w:val="2"/></w:tcPr><w:p><w:r><w:t xml:space="preserve">a</w:t></w:r></w:p></w:tc>' +
+    '<w:tc><w:tcPr><w:gridSpan w:val="2"/></w:tcPr><w:p><w:r><w:t xml:space="preserve">b</w:t></w:r></w:p></w:tc>' +
+    '<w:tc><w:p><w:r><w:t xml:space="preserve">c</w:t></w:r></w:p></w:tc>' +
+    '</w:tr>'
+  );
+}
+
+function malformedGridSpanRowXml(gridSpanVal: string): string {
+  return (
+    '<w:tr>' +
+    `<w:tc><w:tcPr><w:gridSpan w:val="${gridSpanVal}"/></w:tcPr>` +
+    '<w:p><w:r><w:t xml:space="preserve">first</w:t></w:r></w:p></w:tc>' +
+    '<w:tc><w:p><w:r><w:t xml:space="preserve">second</w:t></w:r></w:p></w:tc>' +
+    '</w:tr>'
+  );
+}
+
+describe('fill_document_field — docx, merged cell (gridSpan) visual-column targeting', () => {
+  it('targets the merged cell when the requested column falls inside its span', async () => {
     const filePath = writeInboxFile('report.docx', buildDocxWithRawTable(gridSpanRowXml()));
     await saveDocumentImpl({ path: filePath }, opts());
 
     const result = await fillDocumentFieldImpl({ document: 'report', row: 1, column: 2, value: 'X' }, opts());
+    expect(result.isError).toBeFalsy();
+
+    const outPath = extractOutPath(result.content[0].text);
+    const newXml = await readDocxXml(fs.readFileSync(outPath));
+    const text = docxXmlToText(newXml);
+    expect(text).toContain('X');
+    expect(text).not.toContain('merged');
+    expect(text).toContain('c3'); // the ordinary cell after the span is untouched
+  });
+
+  it('targets the ordinary cell after a merged span when the requested column falls there', async () => {
+    const filePath = writeInboxFile('report.docx', buildDocxWithRawTable(gridSpanRowXml()));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, column: 3, value: 'X' }, opts());
+    expect(result.isError).toBeFalsy();
+
+    const outPath = extractOutPath(result.content[0].text);
+    const newXml = await readDocxXml(fs.readFileSync(outPath));
+    const text = docxXmlToText(newXml);
+    expect(text).toContain('X');
+    expect(text).not.toContain('c3');
+    expect(text).toContain('merged'); // the merged cell is untouched
+  });
+
+  it('errors in visual-column terms, not raw <w:tc> count, when the column is beyond the row\'s visual width', async () => {
+    const filePath = writeInboxFile('report.docx', buildDocxWithRawTable(gridSpanRowXml()));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    // Raw <w:tc> count is 2; total visual width is 3 (span-2 + span-1).
+    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, column: 4, value: 'X' }, opts());
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain('merged cell');
+    expect(result.content[0].text).toContain('3 visual column(s)');
+    expect(result.content[0].text).not.toContain('2 cell(s)');
     expect(fs.existsSync(path.join(baseDir, '.document-fills'))).toBe(false);
+  });
+
+  it('resolves correctly across multiple gridSpan cells in one row', async () => {
+    const filePath = writeInboxFile('report.docx', buildDocxWithRawTable(threeGridSpanCellsRowXml()));
+    await saveDocumentImpl({ path: filePath }, opts());
+    // Visual layout: cell "a" spans cols 1-2, cell "b" spans cols 3-4, cell "c" is col 5.
+
+    const resultA = await fillDocumentFieldImpl({ document: 'report', row: 1, column: 1, value: 'X' }, opts());
+    expect(docxXmlToText(await readDocxXml(fs.readFileSync(extractOutPath(resultA.content[0].text))))).toBe('X\nb\nc');
+
+    const resultB = await fillDocumentFieldImpl({ document: 'report', row: 1, column: 4, value: 'X' }, opts());
+    expect(docxXmlToText(await readDocxXml(fs.readFileSync(extractOutPath(resultB.content[0].text))))).toBe('a\nX\nc');
+
+    const resultC = await fillDocumentFieldImpl({ document: 'report', row: 1, column: 5, value: 'X' }, opts());
+    expect(docxXmlToText(await readDocxXml(fs.readFileSync(extractOutPath(resultC.content[0].text))))).toBe('a\nb\nX');
+  });
+
+  it('treats a malformed/unparseable gridSpan value defensively as span 1 rather than crashing', async () => {
+    const filePath = writeInboxFile('report.docx', buildDocxWithRawTable(malformedGridSpanRowXml('not-a-number')));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    // Treated as span 1 -> visual layout is just [first, second], column 2 hits "second".
+    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, column: 2, value: 'X' }, opts());
+    expect(result.isError).toBeFalsy();
+    const text = docxXmlToText(await readDocxXml(fs.readFileSync(extractOutPath(result.content[0].text))));
+    expect(text).toBe('first\nX');
+  });
+
+  it('treats a zero gridSpan value defensively as span 1', async () => {
+    const filePath = writeInboxFile('report.docx', buildDocxWithRawTable(malformedGridSpanRowXml('0')));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, column: 1, value: 'X' }, opts());
+    expect(result.isError).toBeFalsy();
+    const text = docxXmlToText(await readDocxXml(fs.readFileSync(extractOutPath(result.content[0].text))));
+    expect(text).toBe('X\nsecond');
+  });
+
+  it('leaves an unmerged row unaffected (regression safety)', async () => {
+    // No gridSpan anywhere in this row — visual columns == raw <w:tc> position,
+    // exactly as before merged-cell support existed.
+    const filePath = writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1', 'c1']]]));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, column: 2, value: 'X' }, opts());
+    expect(result.isError).toBeFalsy();
+    const text = docxXmlToText(await readDocxXml(fs.readFileSync(extractOutPath(result.content[0].text))));
+    expect(text).toBe('a1\nX\nc1');
   });
 });
 
@@ -4325,14 +4429,39 @@ describe('fill_document_field — .docx signature stamping, degenerate signature
 });
 
 describe('fill_document_field — .docx signature stamping, existing decline conditions still apply', () => {
-  it('declines a gridSpan row exactly as it would for a plain value fill, before any image branch is reached', async () => {
+  it('stamps into the correct visual column of a gridSpan row, the same resolution the value-fill path uses', async () => {
     const filePath = writeInboxFile('report.docx', buildDocxWithRawTable(gridSpanRowXml()));
     await saveDocumentImpl({ path: filePath }, opts());
     writeSavedSignature('uriel', buildSignaturePng({ width: 40, height: 20, ink: { x: 5, y: 5, w: 20, h: 10 } }));
 
-    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, signatureName: 'uriel' }, opts());
+    // column 2 falls inside the gridSpan=2 "merged" cell (visual cols 1-2).
+    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, column: 2, signatureName: 'uriel' }, opts());
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('table 1, row 1, column 2');
+
+    const outPath = extractOutPath(result.content[0].text);
+    const zip = await loadDocxZip(fs.readFileSync(outPath));
+    const docXml = await zip.file('word/document.xml')!.async('string');
+    expect(docXml).toContain('<w:drawing>');
+    // Existing cell text is untouched — an inserted run, never a replacement.
+    expect(docxXmlToText(docXml)).toContain('merged');
+    expect(docxXmlToText(docXml)).toContain('c3');
+  });
+
+  it('still declines a gridSpan row when the target cell contains a nested table', async () => {
+    const rowXml =
+      '<w:tr>' +
+      '<w:tc><w:tcPr><w:gridSpan w:val="2"/></w:tcPr><w:p><w:r><w:t xml:space="preserve">a</w:t></w:r></w:p></w:tc>' +
+      `<w:tc>${tableXml([['nested-a', 'nested-b']])}</w:tc>` +
+      '</w:tr>';
+    const filePath = writeInboxFile('report.docx', buildDocxWithRawTable(rowXml));
+    await saveDocumentImpl({ path: filePath }, opts());
+    writeSavedSignature('uriel', buildSignaturePng({ width: 40, height: 20, ink: { x: 5, y: 5, w: 20, h: 10 } }));
+
+    // column 3 resolves to the second <w:tc>, which contains a nested table.
+    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, column: 3, signatureName: 'uriel' }, opts());
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain('gridSpan');
+    expect(result.content[0].text).toContain('nested table');
     expect(fs.existsSync(path.join(baseDir, '.document-fills'))).toBe(false);
   });
 

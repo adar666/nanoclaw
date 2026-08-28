@@ -2125,6 +2125,68 @@ function collectDescendants(node: XmlNode, tag: OoxmlTag): XmlNode[] {
   return found;
 }
 
+// ---------------------------------------------------------------------------
+// Merged-cell (w:gridSpan) visual-column resolution.
+//
+// A <w:tc>'s <w:tcPr> (its cell properties, e.g. <w:gridSpan w:val="N"/>)
+// isn't one of OOXML_TAGS, so parseOoxmlTree never gives it its own node —
+// it's opaque content living between the cell's opening tag and its first
+// *tracked* child (a paragraph, or a nested table). That's exactly the
+// region cellGridSpan searches: real OOXML always places tcPr first, before
+// any w:p/w:tbl content, so slicing up to the first tracked child's start
+// both finds the cell's own gridSpan and — just as important — stops before
+// a nested table's cells could contribute a gridSpan of their own into this
+// cell's span count.
+// ---------------------------------------------------------------------------
+
+/**
+ * A cell's merged-cell width in grid columns. Absent <w:gridSpan> means an
+ * ordinary unmerged cell (span 1). A malformed/unparseable w:val (missing,
+ * non-numeric, zero, or negative) is treated defensively as span 1 with a
+ * warning log, rather than throwing or silently corrupting the row's whole
+ * visual-column layout for every cell after it — the row's actual decline
+ * guards (nested table, row/table not found) already cover the genuinely
+ * unsafe cases; a bad gridSpan value on its own is "best-effort visual
+ * width," not a reason to refuse the whole row.
+ */
+function cellGridSpan(xml: string, cell: XmlNode): number {
+  const propsEnd = cell.children[0]?.start ?? cell.close;
+  const propsRegion = xml.slice(cell.openEnd, propsEnd);
+  const m = /<w:gridSpan\b[^>]*\bw:val="(-?\d+)"/.exec(propsRegion);
+  if (!m) return 1;
+  const span = Number(m[1]);
+  if (!Number.isInteger(span) || span < 1) {
+    log(`fill_document_field: malformed w:gridSpan value "${m[1]}" — treating cell as span 1`);
+    return 1;
+  }
+  return span;
+}
+
+interface VisualCell {
+  cell: XmlNode;
+  startCol: number; // 1-indexed, inclusive
+  endCol: number; // 1-indexed, inclusive
+}
+
+/**
+ * Walks a row's <w:tc> cells left to right, accumulating the visual-column
+ * range each occupies (a span-1 cell occupies exactly one visual column; a
+ * gridSpan=N cell occupies N consecutive ones). This is what lets a
+ * requested "column" be resolved unambiguously even when earlier cells in
+ * the row are merged: the Nth visual column always falls inside exactly one
+ * cell's range, by construction.
+ */
+function computeVisualColumns(xml: string, cells: XmlNode[]): VisualCell[] {
+  const out: VisualCell[] = [];
+  let col = 1;
+  for (const cell of cells) {
+    const span = cellGridSpan(xml, cell);
+    out.push({ cell, startCol: col, endCol: col + span - 1 });
+    col += span;
+  }
+  return out;
+}
+
 // stripControlChars first: `value` is untrusted (model-controlled), same as the filenames
 // stripControlChars already guards elsewhere — a raw control byte other than tab/CR/LF is not
 // legal XML 1.0 character data and would otherwise corrupt the produced word/document.xml.
@@ -2985,23 +3047,36 @@ async function fillDocx(
   const targetRow = rows[row - 1];
   if (!targetRow) return err(`Row ${row} not found in table ${tableIndex} — it has ${rows.length} row(s).`);
 
-  // gridSpan (a merged cell) makes direct-<w:tc>-position counting unreliable
-  // for the *visual* column the user means — decline rather than silently
-  // filling the wrong one. Full merged-cell-aware targeting is out of scope
-  // (see deferred-work.md); this is detect-and-decline only.
-  if (/<w:gridSpan\b/.test(xml.slice(targetRow.start, targetRow.end))) {
-    return err(
-      `Row ${row} of table ${tableIndex} contains a merged cell (gridSpan) — column-by-position targeting isn't ` +
-        'reliable here, declining to edit it.',
-    );
-  }
-
   const cells = targetRow.children.filter((n) => n.tag === 'tc');
   if (cells.length === 0) return err(`Row ${row} in table ${tableIndex} has no cells.`);
-  const cellIndex = columnArg !== undefined ? columnArg : cells.length; // default: last cell (label|value shape)
-  const targetCell = cells[cellIndex - 1];
-  if (!targetCell) {
-    return err(`Column ${cellIndex} not found in row ${row} of table ${tableIndex} — it has ${cells.length} cell(s).`);
+
+  // Merged-cell (gridSpan) aware targeting: resolve the requested "column"
+  // (still 1-indexed, still meaning "the Nth visual column") against each
+  // cell's actual visual-column range rather than raw <w:tc> position. A
+  // gridSpan=N cell occupies N consecutive visual columns, so a request that
+  // lands inside one resolves to that single cell unambiguously — there's
+  // nothing left to decline here on gridSpan alone.
+  const visualCells = computeVisualColumns(xml, cells);
+  const totalVisualWidth = visualCells[visualCells.length - 1].endCol;
+
+  let targetCell: XmlNode;
+  let cellIndex: number; // reported to the caller — the resolved visual column
+  if (columnArg !== undefined) {
+    const match = visualCells.find((vc) => columnArg >= vc.startCol && columnArg <= vc.endCol);
+    if (!match) {
+      return err(
+        `Column ${columnArg} not found in row ${row} of table ${tableIndex} — this row has ${totalVisualWidth} ` +
+          'visual column(s).',
+      );
+    }
+    targetCell = match.cell;
+    cellIndex = columnArg;
+  } else {
+    // No column given: default to the last cell (label|value shape) — same
+    // raw-last-<w:tc> default as before gridSpan support existed. Reported
+    // as that cell's own starting visual column.
+    targetCell = cells[cells.length - 1];
+    cellIndex = visualCells[visualCells.length - 1].startCol;
   }
 
   if (nodeContainsTag(targetCell, 'tbl')) {
