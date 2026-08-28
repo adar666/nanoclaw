@@ -20,6 +20,7 @@ import { runMigrations } from '../src/db/migrations/index.js';
 import { readEnvFile } from '../src/env.js';
 import { initGroupFilesystem } from '../src/group-init.js';
 import { log } from '../src/log.js';
+import { validateMount } from '../src/modules/mount-security/index.js';
 import type { AgentGroup } from '../src/types.js';
 
 /**
@@ -152,6 +153,23 @@ export function ensureEvalPeopleMount(agentGroupId: string): void {
     throw new Error(
       `ensureEvalPeopleMount: expected household's people.md at "${hostPath}" but it doesn't exist — ` +
         'the eval group would otherwise get a mount config pointing at nothing.',
+    );
+  }
+
+  // Fail loud at setup time, not silently at container-spawn time (deferred-
+  // work.md finding, spec-eval-1-2): reuses mount-security's own
+  // allowlist-loading/validation logic (rather than re-parsing
+  // ~/.config/nanoclaw/mount-allowlist.json here) so this check can never
+  // drift from what buildMounts()/validateAdditionalMounts() will actually
+  // enforce at spawn time. A missing allowlist entry (wrong machine, edited
+  // allowlist) would otherwise WARN-reject the mount deep inside
+  // container-runner.ts with no signal here at all — see the CLAUDE.md
+  // pitfall on exactly this failure mode.
+  const mountCheck = validateMount({ hostPath, containerPath, readonly: true });
+  if (!mountCheck.allowed) {
+    throw new Error(
+      `ensureEvalPeopleMount: mount-security would reject this mount at container spawn time — ${mountCheck.reason}. ` +
+        `Add "${hostPath}" as an allowed root in ~/.config/nanoclaw/mount-allowlist.json before running eval setup.`,
     );
   }
 

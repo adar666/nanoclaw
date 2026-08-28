@@ -36,12 +36,23 @@ vi.mock('../src/group-init.js', async (importOriginal) => {
   return { ...actual, initGroupFilesystem: vi.fn(actual.initGroupFilesystem) };
 });
 
+// Real mount-allowlist.json state (a real file at ~/.config/nanoclaw/...) is
+// not deterministic across machines/CI — every test below needs a controlled
+// verdict rather than whatever this host's real allowlist happens to say.
+// Defaults to "allowed" so every pre-existing test (which doesn't care about
+// mount-security specifically) keeps passing; only the dedicated tests below
+// override it.
+vi.mock('../src/modules/mount-security/index.js', () => ({
+  validateMount: vi.fn(() => ({ allowed: true, reason: 'test default: allowed' })),
+}));
+
 import { closeDb, initTestDb, runMigrations } from '../src/db/index.js';
 import { getAgentGroupByFolder, getAllAgentGroups } from '../src/db/agent-groups.js';
 import { initGroupFilesystem } from '../src/group-init.js';
 import { getContainerConfig } from '../src/db/container-configs.js';
 import { getDestinations } from '../src/modules/agent-to-agent/db/agent-destinations.js';
 import { readEnvFile } from '../src/env.js';
+import { validateMount } from '../src/modules/mount-security/index.js';
 import {
   ensureAgentGroup,
   ensureEvalCalendarOverride,
@@ -65,6 +76,7 @@ beforeEach(() => {
   runMigrations(initTestDb());
   delete process.env.EVAL_TEST_CALENDAR_ID;
   mockedReadEnvFile.mockReturnValue({});
+  vi.mocked(validateMount).mockReset().mockReturnValue({ allowed: true, reason: 'test default: allowed' });
 });
 
 afterEach(() => {
@@ -300,6 +312,32 @@ describe('ensureEvalPeopleMount', () => {
     const config = getContainerConfig(group.id)!;
     expect(JSON.parse(config.additional_mounts)).toEqual([]);
   });
+
+  it('validates the mount against mount-security before writing it, passing the real hostPath/containerPath/readonly (deferred-work.md, spec-eval-1-2)', () => {
+    const group = ensureAgentGroup('eval-mount-validate-call', 'Eval Mount Test (validate call)');
+
+    ensureEvalPeopleMount(group.id);
+
+    expect(validateMount).toHaveBeenCalledWith({
+      hostPath: `${TEST_ROOT}/groups/household/memory/household/people.md`,
+      containerPath: 'household-shared/people.md',
+      readonly: true,
+    });
+  });
+
+  it('throws loud, writing nothing, when mount-security would reject the mount (missing allowlist entry) — never a silent WARN-rejection at spawn time', () => {
+    vi.mocked(validateMount).mockReturnValue({
+      allowed: false,
+      reason: 'Path "/tmp/nanoclaw-eval-setup-test/groups/household/memory/household/people.md" is not under any allowed root',
+    });
+    const group = ensureAgentGroup('eval-mount-not-allowlisted', 'Eval Mount Test (not allowlisted)');
+
+    expect(() => ensureEvalPeopleMount(group.id)).toThrow(/mount-allowlist\.json/);
+
+    const config = getContainerConfig(group.id)!;
+    expect(JSON.parse(config.additional_mounts)).toEqual([]);
+  });
+
 });
 
 describe('ensureAgentGroup', () => {

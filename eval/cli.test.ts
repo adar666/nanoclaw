@@ -64,6 +64,13 @@ vi.mock('./judge/llm.js', () => ({
   judgeLlm: vi.fn(),
 }));
 
+// Real mount-allowlist.json state is not deterministic across machines/CI —
+// ensureEvalScenarioGroup (called for real by runCli/runSweep below) needs a
+// controlled verdict rather than whatever this host's real allowlist says.
+vi.mock('../src/modules/mount-security/index.js', () => ({
+  validateMount: vi.fn(() => ({ allowed: true, reason: 'test default: allowed' })),
+}));
+
 import { getAgentGroupByFolder } from '../src/db/agent-groups.js';
 import { killAllActiveContainers } from '../src/container-runner.js';
 import { closeDb } from '../src/db/index.js';
