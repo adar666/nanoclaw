@@ -275,9 +275,9 @@ describe('runScenarioTurn', () => {
     });
 
     const threadId = `${EVAL_THREAD_PREFIX}:turn-blocked-by-group-identity`;
-    await expect(
-      runScenarioTurn(NOT_EVAL_AG, threadId, 'should never send', { timeoutMs: 2_000 }),
-    ).rejects.toThrow(/not one of the two provisioned eval groups/);
+    await expect(runScenarioTurn(NOT_EVAL_AG, threadId, 'should never send', { timeoutMs: 2_000 })).rejects.toThrow(
+      /not one of the two provisioned eval groups/,
+    );
 
     expect(wakeContainer).not.toHaveBeenCalled();
     expect(getSessionsByAgentGroup(NOT_EVAL_AG)).toEqual([]);

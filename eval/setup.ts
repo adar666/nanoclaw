@@ -177,7 +177,12 @@ export function ensureEvalPeopleMount(agentGroupId: string): void {
   if (!row) throw new Error(`No container config for group: ${agentGroupId}`);
 
   const mount: AdditionalMountConfig = { hostPath, containerPath, readonly: true };
-  const existing = safeJsonParse(row.additional_mounts, [] as AdditionalMountConfig[], 'additional_mounts', agentGroupId);
+  const existing = safeJsonParse(
+    row.additional_mounts,
+    [] as AdditionalMountConfig[],
+    'additional_mounts',
+    agentGroupId,
+  );
   const existingIndex = existing.findIndex((m) => m.hostPath === hostPath && m.containerPath === containerPath);
   if (existingIndex === -1) {
     existing.push(mount);

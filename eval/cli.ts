@@ -27,12 +27,7 @@ import { runScenarioTurn } from './runner.js';
 import { EVAL_THREAD_PREFIX } from './session.js';
 import { bootstrapDb, ensureEvalJudgeGroup, ensureEvalScenarioGroup } from './setup.js';
 import { runSweep, type SweepResult } from './sweep.js';
-import {
-  decommissionEvalHarness,
-  pruneEvalSessions,
-  type DecommissionResult,
-  type PruneResult,
-} from './teardown.js';
+import { decommissionEvalHarness, pruneEvalSessions, type DecommissionResult, type PruneResult } from './teardown.js';
 
 interface ParsedArgs {
   scenarioSetName: string;
@@ -226,68 +221,73 @@ export async function runCli(argv: string[]): Promise<Report> {
 
   let report: Report;
   try {
-    report = await withEvalLock(async (): Promise<Report> => {
-      bootstrapDb();
-      const group = ensureEvalScenarioGroup();
-      // Provisioned unconditionally, even for a scenario set with zero
-      // llmJudge scenarios — idempotent, cheap, matches this file's existing
-      // "provision everything up front" pattern (mirrors ensureEvalScenarioGroup
-      // just above).
-      const judgeGroup = ensureEvalJudgeGroup();
-      const scenarioSet = loadScenarios(scenarioSetName, group.id);
+    report = await withEvalLock(
+      async (): Promise<Report> => {
+        bootstrapDb();
+        const group = ensureEvalScenarioGroup();
+        // Provisioned unconditionally, even for a scenario set with zero
+        // llmJudge scenarios — idempotent, cheap, matches this file's existing
+        // "provision everything up front" pattern (mirrors ensureEvalScenarioGroup
+        // just above).
+        const judgeGroup = ensureEvalJudgeGroup();
+        const scenarioSet = loadScenarios(scenarioSetName, group.id);
 
-      const startedAt = new Date().toISOString();
-      const entries: ScenarioReportEntry[] = [];
-      try {
-        for (const scenario of scenarioSet.scenarios) {
-          const entry = await runOneScenario(scenario, judgeGroup.id);
-          printSummaryLine(entry);
-          entries.push(entry);
+        const startedAt = new Date().toISOString();
+        const entries: ScenarioReportEntry[] = [];
+        try {
+          for (const scenario of scenarioSet.scenarios) {
+            const entry = await runOneScenario(scenario, judgeGroup.id);
+            printSummaryLine(entry);
+            entries.push(entry);
+          }
+        } catch (err) {
+          // A structural (AD-4) failure out of runOneScenario/runScenarioTurn
+          // itself — spawn failure, malformed opts — used to propagate straight
+          // out of this loop uncaught: writeReport never ran, so scenarios
+          // after the one that threw were silently never attempted with no
+          // diagnostic trail at all, indistinguishable from the run never
+          // having been invoked. Write a partial report (every entry computed
+          // so far, plus `aborted: true`/`abortError`) before rethrowing, so an
+          // operator has something to look at instead of nothing.
+          const abortedAt = new Date().toISOString();
+          const message = err instanceof Error ? err.message : String(err);
+          const partial: Report = {
+            runId: makeRunId(),
+            scenarioSetName: scenarioSet.name,
+            startedAt,
+            finishedAt: abortedAt,
+            entries,
+            aborted: true,
+            abortError: message,
+          };
+          const reportPath = writeReport(partial);
+          console.error(
+            `eval: scenario loop aborted by a structural failure — partial report written to ${reportPath}`,
+          );
+          throw err;
         }
-      } catch (err) {
-        // A structural (AD-4) failure out of runOneScenario/runScenarioTurn
-        // itself — spawn failure, malformed opts — used to propagate straight
-        // out of this loop uncaught: writeReport never ran, so scenarios
-        // after the one that threw were silently never attempted with no
-        // diagnostic trail at all, indistinguishable from the run never
-        // having been invoked. Write a partial report (every entry computed
-        // so far, plus `aborted: true`/`abortError`) before rethrowing, so an
-        // operator has something to look at instead of nothing.
-        const abortedAt = new Date().toISOString();
-        const message = err instanceof Error ? err.message : String(err);
-        const partial: Report = {
+        const finishedAt = new Date().toISOString();
+
+        const passedCount = entries.filter((e) => e.passed).length;
+        const cleanupFailureCount = entries.filter((e) => e.cleanupError).length;
+        console.log(
+          `${passedCount}/${entries.length} passed` +
+            (cleanupFailureCount ? `, ${cleanupFailureCount} cleanup failure(s)` : ''),
+        );
+
+        const built: Report = {
           runId: makeRunId(),
           scenarioSetName: scenarioSet.name,
           startedAt,
-          finishedAt: abortedAt,
+          finishedAt,
           entries,
-          aborted: true,
-          abortError: message,
         };
-        const reportPath = writeReport(partial);
-        console.error(`eval: scenario loop aborted by a structural failure — partial report written to ${reportPath}`);
-        throw err;
-      }
-      const finishedAt = new Date().toISOString();
-
-      const passedCount = entries.filter((e) => e.passed).length;
-      const cleanupFailureCount = entries.filter((e) => e.cleanupError).length;
-      console.log(
-        `${passedCount}/${entries.length} passed` +
-          (cleanupFailureCount ? `, ${cleanupFailureCount} cleanup failure(s)` : ''),
-      );
-
-      const built: Report = {
-        runId: makeRunId(),
-        scenarioSetName: scenarioSet.name,
-        startedAt,
-        finishedAt,
-        entries,
-      };
-      const reportPath = writeReport(built);
-      console.log(`Report written to ${reportPath}`);
-      return built;
-    }, { staleMs: RUN_LOCK_STALE_MS });
+        const reportPath = writeReport(built);
+        console.log(`Report written to ${reportPath}`);
+        return built;
+      },
+      { staleMs: RUN_LOCK_STALE_MS },
+    );
   } finally {
     // Every eval container this invocation spawned (scenario + judge groups
     // alike) is torn down before the process exits, regardless of outcome —
@@ -377,7 +377,9 @@ async function runTeardown(): Promise<DecommissionResult> {
  * Exported for `cli.test.ts`'s own direct coverage of the dispatch routing,
  * same reasoning as `runOneScenario` above.
  */
-export async function dispatchEvalCli(argv: string[]): Promise<Report | SweepResult | PruneResult | DecommissionResult> {
+export async function dispatchEvalCli(
+  argv: string[],
+): Promise<Report | SweepResult | PruneResult | DecommissionResult> {
   const [subcommand, ...rest] = argv;
   if (subcommand === 'run') return runCli(argv);
   if (subcommand === 'sweep') {

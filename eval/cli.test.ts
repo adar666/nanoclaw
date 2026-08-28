@@ -483,7 +483,9 @@ describe('runOneScenario (llmJudge branch)', () => {
       transcript: [outboundMsg('some reply')],
       sessionId: 's1',
     });
-    const boom = new JudgeLlmError('judgeLlm: judge turn did not complete — expected status "completed", got "timeout"');
+    const boom = new JudgeLlmError(
+      'judgeLlm: judge turn did not complete — expected status "completed", got "timeout"',
+    );
     mockedJudgeLlm.mockRejectedValueOnce(boom);
 
     const entry = await runOneScenario(llmJudgeScenario, JUDGE_AGENT_GROUP_ID);
@@ -514,7 +516,7 @@ describe('runOneScenario (llmJudge branch)', () => {
   it(
     'propagates a plain (non-JudgeLlmError) throw out of judgeLlm instead of absorbing it into a judge-error — ' +
       "a genuine AD-4-style structural failure leaked out of judgeLlm's own internal runScenarioTurn call " +
-      '(a destination violation, a spawn failure) must abort the run loud, exactly like the scenario\'s own ' +
+      "(a destination violation, a spawn failure) must abort the run loud, exactly like the scenario's own " +
       'uncaught runScenarioTurn call, not become a per-scenario outcome (deferred-work.md, spec-eval-2-3)',
     async () => {
       mockedRunScenarioTurn.mockResolvedValueOnce({

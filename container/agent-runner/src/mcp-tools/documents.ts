@@ -869,9 +869,7 @@ async function renderFirstPageToPng(
  * suffix as before this function grew a page number at all.
  */
 function renderFileNameFor(resolvedPath: string, originalFilename: string, pageNumber = 1): string {
-  const hash = crc32(Buffer.from(resolvedPath, 'utf-8'))
-    .toString(16)
-    .padStart(8, '0');
+  const hash = crc32(Buffer.from(resolvedPath, 'utf-8')).toString(16).padStart(8, '0');
   return `${slugify(originalFilename)}-${hash}-p${pageNumber}.png`;
 }
 
@@ -900,9 +898,7 @@ function renderFileNameFor(resolvedPath: string, originalFilename: string, pageN
  * `saveDocumentImpl`) — a completed save has nothing left to resume.
  */
 function pdfResolvedPagesSidecarPath(renderDir: string, resolvedPath: string, originalFilename: string): string {
-  const hash = crc32(Buffer.from(resolvedPath, 'utf-8'))
-    .toString(16)
-    .padStart(8, '0');
+  const hash = crc32(Buffer.from(resolvedPath, 'utf-8')).toString(16).padStart(8, '0');
   return path.join(renderDir, `${slugify(originalFilename)}-${hash}-resolved.json`);
 }
 
@@ -940,7 +936,9 @@ function persistResolvedPage(sidecarPath: string, pageNum: number, text: string)
     fs.mkdirSync(path.dirname(sidecarPath), { recursive: true });
     fs.writeFileSync(sidecarPath, JSON.stringify(obj));
   } catch (e) {
-    log(`save_document: could not persist resolved-page sidecar at ${sidecarPath} (non-fatal): ${e instanceof Error ? e.message : String(e)}`);
+    log(
+      `save_document: could not persist resolved-page sidecar at ${sidecarPath} (non-fatal): ${e instanceof Error ? e.message : String(e)}`,
+    );
   }
 }
 
@@ -1514,7 +1512,11 @@ export async function saveDocumentImpl(
         // deterministic call for the common case (spec-2-1), now per page.
         let dims: { width: number; height: number };
         try {
-          dims = await withTimeout(renderFirstPageToPng(resolvedPath, renderPath, i), PDF_TIMEOUT_MS, 'PDF page render');
+          dims = await withTimeout(
+            renderFirstPageToPng(resolvedPath, renderPath, i),
+            PDF_TIMEOUT_MS,
+            'PDF page render',
+          );
         } catch (e) {
           return err(`Could not render scanned PDF page ${pageNum}: ${e instanceof Error ? e.message : String(e)}`);
         }
@@ -4261,9 +4263,7 @@ function presentArgNames(args: Record<string, unknown>, keys: readonly string[])
 // condition below is copied verbatim from the pre-split function.
 // ---------------------------------------------------------------------------
 
-type ResolveAndSnapshotResult =
-  | { ok: true; snapshotRawPath: string }
-  | { ok: false; result: ReturnType<typeof err> };
+type ResolveAndSnapshotResult = { ok: true; snapshotRawPath: string } | { ok: false; result: ReturnType<typeof err> };
 
 /**
  * Validation, per-file-type arg gating, per-slug lock acquisition, and

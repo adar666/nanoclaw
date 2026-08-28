@@ -3037,7 +3037,7 @@ describe('fill_document_field — docx, merged cell (gridSpan) visual-column tar
     expect(text).toContain('merged'); // the merged cell is untouched
   });
 
-  it('errors in visual-column terms, not raw <w:tc> count, when the column is beyond the row\'s visual width', async () => {
+  it("errors in visual-column terms, not raw <w:tc> count, when the column is beyond the row's visual width", async () => {
     const filePath = writeInboxFile('report.docx', buildDocxWithRawTable(gridSpanRowXml()));
     await saveDocumentImpl({ path: filePath }, opts());
 
@@ -4628,7 +4628,10 @@ describe('fill_document_field — .docx signature stamping, existing decline con
     writeSavedSignature('uriel', buildSignaturePng({ width: 40, height: 20, ink: { x: 5, y: 5, w: 20, h: 10 } }));
 
     // column 2 falls inside the gridSpan=2 "merged" cell (visual cols 1-2).
-    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, column: 2, signatureName: 'uriel' }, opts());
+    const result = await fillDocumentFieldImpl(
+      { document: 'report', row: 1, column: 2, signatureName: 'uriel' },
+      opts(),
+    );
     expect(result.isError).toBeFalsy();
     expect(result.content[0].text).toContain('table 1, row 1, column 2');
 
@@ -4652,7 +4655,10 @@ describe('fill_document_field — .docx signature stamping, existing decline con
     writeSavedSignature('uriel', buildSignaturePng({ width: 40, height: 20, ink: { x: 5, y: 5, w: 20, h: 10 } }));
 
     // column 3 resolves to the second <w:tc>, which contains a nested table.
-    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, column: 3, signatureName: 'uriel' }, opts());
+    const result = await fillDocumentFieldImpl(
+      { document: 'report', row: 1, column: 3, signatureName: 'uriel' },
+      opts(),
+    );
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain('nested table');
     expect(fs.existsSync(path.join(baseDir, '.document-fills'))).toBe(false);

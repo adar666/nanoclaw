@@ -278,7 +278,7 @@ describe('judgeLlm', () => {
   });
 
   it(
-    "throws a JudgeLlmError (not a plain Error) for its own documented business-logic failure modes, so a caller " +
+    'throws a JudgeLlmError (not a plain Error) for its own documented business-logic failure modes, so a caller ' +
       'can distinguish them from a genuine AD-4-style structural failure that merely propagated through ' +
       '(deferred-work.md finding, spec-eval-2-3): incomplete turn and unparseable reply, but NOT a rejection that ' +
       'genuinely came from runScenarioTurn itself',

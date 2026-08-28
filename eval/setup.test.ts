@@ -328,7 +328,8 @@ describe('ensureEvalPeopleMount', () => {
   it('throws loud, writing nothing, when mount-security would reject the mount (missing allowlist entry) — never a silent WARN-rejection at spawn time', () => {
     vi.mocked(validateMount).mockReturnValue({
       allowed: false,
-      reason: 'Path "/tmp/nanoclaw-eval-setup-test/groups/household/memory/household/people.md" is not under any allowed root',
+      reason:
+        'Path "/tmp/nanoclaw-eval-setup-test/groups/household/memory/household/people.md" is not under any allowed root',
     });
     const group = ensureAgentGroup('eval-mount-not-allowlisted', 'Eval Mount Test (not allowlisted)');
 
