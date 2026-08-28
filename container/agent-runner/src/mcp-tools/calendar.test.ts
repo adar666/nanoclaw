@@ -1409,6 +1409,42 @@ describe('list_calendar_events MCP tool', () => {
     expect(text).toContain('Team sync');
   });
 
+  it('surfaces guest emails on an event that has attendees (deferred-work.md finding, 2026-08-28)', async () => {
+    stubFetch(200, {
+      items: [
+        {
+          id: 'evt-guests',
+          summary: 'Meeting with guest',
+          start: { dateTime: '2026-08-29T14:00:00.000Z', timeZone: TIMEZONE },
+          end: { dateTime: '2026-08-29T15:00:00.000Z', timeZone: TIMEZONE },
+          attendees: [{ email: 'guest@example.com' }],
+        },
+      ],
+    });
+
+    const result = await listCalendarEvents.handler({ calendar: 'uriel' });
+    expect(result.isError).toBeFalsy();
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain('1 guest: guest@example.com');
+  });
+
+  it('says nothing about guests when an event has no attendees', async () => {
+    stubFetch(200, {
+      items: [
+        {
+          id: 'evt-solo',
+          summary: 'Solo block',
+          start: { dateTime: '2026-08-29T14:00:00.000Z', timeZone: TIMEZONE },
+          end: { dateTime: '2026-08-29T15:00:00.000Z', timeZone: TIMEZONE },
+        },
+      ],
+    });
+
+    const result = await listCalendarEvents.handler({ calendar: 'uriel' });
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).not.toContain('guest');
+  });
+
   it('marks a recurring-series instance with "(recurring)", leaves a one-off event unmarked (deferred-work.md finding)', async () => {
     stubFetch(200, {
       items: [

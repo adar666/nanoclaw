@@ -464,6 +464,14 @@ interface CalendarEventItem {
    * on `recurrence` above (spec cal-2.1 review loop 1 correction).
    */
   recurringEventId?: string;
+  /**
+   * Guest list, when present. Added 2026-08-28 (real gap found live: a
+   * diagnostic check of whether guest-resolution actually added an
+   * attendee to a created event had no way to confirm it — `formatEventLine`
+   * previously dropped this field entirely, so `list_calendar_events` and
+   * `update_calendar_event`'s candidate list could never show it either).
+   */
+  attendees?: Array<{ email: string }>;
 }
 
 interface EventsListApiResponse {
@@ -570,6 +578,10 @@ function formatEventLine(ev: CalendarEventItem): string {
   const title = ev.summary ?? '(no title)';
   let line = `[${ev.id}] ${title} — ${formatEventTimeRange(ev.start, ev.end)}`;
   if (ev.location) line += ` @ ${ev.location}`;
+  if (ev.attendees?.length) {
+    const noun = ev.attendees.length === 1 ? 'guest' : 'guests';
+    line += ` (${ev.attendees.length} ${noun}: ${ev.attendees.map((a) => a.email).join(', ')})`;
+  }
   if (ev.recurringEventId || ev.recurrence) line += ' (recurring)';
   return line;
 }
