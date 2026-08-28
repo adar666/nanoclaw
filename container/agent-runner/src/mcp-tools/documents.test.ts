@@ -26,6 +26,8 @@ import {
   listDocumentVersionsImpl,
   listDocumentVersions,
   describePdfReadError,
+  withLock,
+  ocrPngText,
 } from './documents.js';
 
 // ---------------------------------------------------------------------------
@@ -52,9 +54,33 @@ import {
 let mockOcrResult: { text: string } | { error: string } = { text: '' };
 let lastCreateWorkerCall: { langs: unknown; oem: unknown; options: { workerPath?: string; cachePath?: string } } | undefined;
 
+// Concurrency instrumentation for the withOcrCacheDirLock regression test
+// below (deferred-work.md, ocr-fallback item) — `createWorkerDelayMs` lets a
+// test hold createWorker "in flight" long enough for a second concurrent
+// call to genuinely overlap if the lock didn't exist;
+// `maxConcurrentCreateWorkerCalls` records the real high-water mark. Both
+// reset to their neutral defaults in beforeEach below so they never leak
+// into an unrelated test.
+let createWorkerDelayMs = 0;
+let activeCreateWorkerCalls = 0;
+let maxConcurrentCreateWorkerCalls = 0;
+// Makes createWorker() itself throw (rather than the later recognize()
+// call) — used only to test that withOcrCacheDirLock's chain doesn't get
+// permanently wedged by a failing call.
+let createWorkerShouldThrow: string | undefined;
+
 mock.module('tesseract.js', () => ({
   createWorker: async (langs: unknown, oem: unknown, options: { workerPath?: string; cachePath?: string }) => {
     lastCreateWorkerCall = { langs, oem, options };
+    activeCreateWorkerCalls++;
+    maxConcurrentCreateWorkerCalls = Math.max(maxConcurrentCreateWorkerCalls, activeCreateWorkerCalls);
+    if (createWorkerDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, createWorkerDelayMs));
+    }
+    activeCreateWorkerCalls--;
+    if (createWorkerShouldThrow !== undefined) {
+      throw new Error(createWorkerShouldThrow);
+    }
     return {
       recognize: async () => {
         if ('error' in mockOcrResult) throw new Error(mockOcrResult.error);
@@ -338,6 +364,10 @@ beforeEach(() => {
   fs.mkdirSync(inboxDir, { recursive: true });
   mockOcrResult = { text: '' };
   lastCreateWorkerCall = undefined;
+  createWorkerDelayMs = 0;
+  activeCreateWorkerCalls = 0;
+  maxConcurrentCreateWorkerCalls = 0;
+  createWorkerShouldThrow = undefined;
 });
 
 afterEach(() => {
@@ -1092,6 +1122,15 @@ function buildDocxWithRawTable(tableInnerXml: string): Buffer {
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' +
     '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">' +
     `<w:body><w:tbl><w:tblPr/>${tableInnerXml}</w:tbl></w:body></w:document>`;
+  return buildStoredZip([{ name: 'word/document.xml', data: Buffer.from(xml, 'utf-8') }]);
+}
+
+/** Same shape as buildDocxWithRawTable, but binds the WordprocessingML namespace to a non-"w:" prefix — simulates a document authored/re-saved by a tool that made a different (but still spec-legal) prefix choice, which parseOoxmlTree's "w:"-only tokenizer cannot see. */
+function buildDocxWithRawTableNonWPrefix(tableInnerXml: string, prefix = 'ns0'): Buffer {
+  const xml =
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' +
+    `<${prefix}:document xmlns:${prefix}="http://schemas.openxmlformats.org/wordprocessingml/2006/main">` +
+    `<${prefix}:body><${prefix}:tbl><${prefix}:tblPr/>${tableInnerXml.replace(/w:/g, `${prefix}:`)}</${prefix}:tbl></${prefix}:body></${prefix}:document>`;
   return buildStoredZip([{ name: 'word/document.xml', data: Buffer.from(xml, 'utf-8') }]);
 }
 
@@ -2754,6 +2793,48 @@ describe('fill_document_field — docx, merged cell (gridSpan)', () => {
   });
 });
 
+// --- 5b. Non-"w:"-prefixed namespace binding --------------------------------
+
+describe('fill_document_field — docx, non-"w:" OOXML namespace prefix', () => {
+  it('names the real cause instead of the generic "no tables" message, on the row-targeting path', async () => {
+    const filePath = writeInboxFile(
+      'report.docx',
+      buildDocxWithRawTableNonWPrefix(rowXml(['Name', ''])),
+    );
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, value: 'X' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('ns0:');
+    expect(result.content[0].text).toContain('"w:"');
+    // Not the plain, misleading "genuinely no tables" message.
+    expect(result.content[0].text).not.toBe('This document has no tables to fill.');
+  });
+
+  it('names the real cause instead of the generic "no tables" message, on the bare-discovery path', async () => {
+    const filePath = writeInboxFile(
+      'report.docx',
+      buildDocxWithRawTableNonWPrefix(rowXml(['Name', ''])),
+    );
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'report' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('ns0:');
+    expect(result.content[0].text).toContain('"w:"');
+  });
+
+  it('still reports the plain "no tables" message for a genuinely table-less, standard-"w:" document', async () => {
+    const filePath = writeInboxFile('report.docx', buildDocx(['Just a plain paragraph, no table here.']));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, value: 'X' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('This document has no tables to fill.');
+    expect(result.content[0].text).not.toContain('prefix');
+  });
+});
+
 // --- 6. Malformed-OOXML safety ----------------------------------------------
 
 describe('fill_document_field — docx, malformed table XML', () => {
@@ -3011,6 +3092,46 @@ describe.skipIf(!SOFFICE_AVAILABLE)('save_document / fill_document_field — .do
       // converted to .docx" here would be factually wrong.
       expect(result.content[0].text).not.toContain('legacy .doc file');
       expect(fs.existsSync(path.join(baseDir, '.document-fills'))).toBe(false);
+    } finally {
+      fs.rmSync(work, { recursive: true, force: true });
+    }
+  });
+
+  // Simulates a genuine JS-level throw landing between "scratch dir claimed"
+  // (convertDocToDocx has already run real LibreOffice and produced a valid
+  // converted .docx in the scratch dir) and fillDoc's `finally` cleanup
+  // running — the gap deferred-work.md flagged: only the happy path and
+  // synchronous-failure paths (soffice missing, malformed input, etc. — all
+  // of which return an err() *before* any throw) were previously covered.
+  // Forced here by pre-creating `.document-fills` as a plain file instead of
+  // a directory, so writeFillOutput's own fs.mkdirSync (called only after a
+  // real, successful conversion) throws EEXIST uncaught — a realistic
+  // disk/permission-shaped failure, not a contrived one. A real out-of-process
+  // crash (OOM, host restart) can't be simulated in-process at all; os.tmpdir()
+  // placement (see fillDoc's own comment) is what bounds *that* case's blast
+  // radius, not this test.
+  it('still cleans up the scratch dir via finally when a throw happens after a real conversion succeeds', async () => {
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'doc-fixture-'));
+    try {
+      const docBytes = buildDocViaSoffice(work, ['Name: ___________']);
+      const filePath = writeInboxFile('intake.doc', docBytes);
+      await saveDocumentImpl({ path: filePath }, opts());
+
+      // Blocks writeFillOutput's fs.mkdirSync(dir, { recursive: true }) with
+      // an uncaught EEXIST — this only fires *after* convertDocToDocx has
+      // already succeeded and fillDocx has already parsed/edited the real
+      // converted .docx, i.e. strictly between scratch-dir-claim and finally.
+      fs.writeFileSync(path.join(baseDir, '.document-fills'), 'blocking file, not a directory');
+
+      const before = conversionScratchLeftoverCount();
+      const result = await fillDocumentFieldImpl({ document: 'intake', lineNumber: 1, value: 'Ada Lovelace' }, opts());
+
+      // fillDocumentFieldImpl's own outer try/catch converts the throw into
+      // an err() result rather than propagating it — the thing under test
+      // here is that the scratch dir doesn't leak despite the throw, not the
+      // exact shape of the resulting error.
+      expect(result.isError).toBe(true);
+      expect(conversionScratchLeftoverCount()).toBe(before);
     } finally {
       fs.rmSync(work, { recursive: true, force: true });
     }
@@ -4968,5 +5089,214 @@ describe('save_document — refresh racing a concurrent fill of the same documen
     const readRefreshed = filledText.includes('refreshed-a');
     expect(readOriginal || readRefreshed).toBe(true);
     expect(readOriginal && readRefreshed).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// withLock — off-by-one + fencing regressions (deferred-work.md, eval-1-3
+// item)
+//
+// eval/lock.ts's own reimplementation of this exact algorithm found (and
+// fixed) two real correctness bugs, later ported back here. Both are
+// exercised directly against this file's own `withLock`, using the
+// test-only `testOpts` override (retryMs/maxAttempts/staleMs) so the
+// retry-exhaustion and stale-reclaim-on-the-last-attempt paths run
+// deterministically instead of needing a real multi-second wait. Test
+// shapes are inspired by `eval/lock.test.ts`'s own withLock suite, adapted
+// to bun:test and to this file's two independent reclaim paths (dead-pid,
+// then mtime-staleness fallback).
+// ---------------------------------------------------------------------------
+
+describe('withLock — off-by-one and fencing regressions', () => {
+  it('acquires immediately, writes its own pid, runs fn, and removes the lock file afterward', async () => {
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'withlock-test-'));
+    const lockPath = path.join(work, '.test.lock');
+    try {
+      let ran = false;
+      const result = await withLock(lockPath, () => {
+        ran = true;
+        expect(fs.existsSync(lockPath)).toBe(true);
+        expect(fs.readFileSync(lockPath, 'utf-8')).toBe(String(process.pid));
+        return 'ok';
+      });
+
+      expect(ran).toBe(true);
+      expect(result).toBe('ok');
+      expect(fs.existsSync(lockPath)).toBe(false);
+    } finally {
+      fs.rmSync(work, { recursive: true, force: true });
+    }
+  });
+
+  it('still reclaims a dead-pid lock when the reclaim happens on the very last retry attempt (off-by-one regression, pid-liveness path)', async () => {
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'withlock-test-'));
+    const lockPath = path.join(work, '.test.lock');
+    try {
+      // A pid essentially guaranteed not to be alive in this sandbox — the
+      // dead-pid check fires immediately, no mtime backdating/waiting needed.
+      const deadPid = 2 ** 30;
+      fs.writeFileSync(lockPath, String(deadPid), { flag: 'wx' });
+
+      // maxAttempts: 1 — the dead-pid reclaim fires on the loop's one and
+      // only iteration. The pre-fix version's bare `continue` here still
+      // runs the for-loop's own increment, so `attempt` reaches
+      // maxAttempts and the loop exits WITHOUT ever retrying the
+      // exclusive-create — fn() would then run holding no lock at all.
+      let ran = false;
+      const result = await withLock(
+        lockPath,
+        () => {
+          ran = true;
+          expect(fs.existsSync(lockPath)).toBe(true);
+          expect(fs.readFileSync(lockPath, 'utf-8')).toBe(String(process.pid));
+          return 'reclaimed-on-last-attempt';
+        },
+        { retryMs: 2, maxAttempts: 1, staleMs: 30_000 },
+      );
+
+      expect(ran).toBe(true);
+      expect(result).toBe('reclaimed-on-last-attempt');
+      expect(fs.existsSync(lockPath)).toBe(false);
+    } finally {
+      fs.rmSync(work, { recursive: true, force: true });
+    }
+  });
+
+  it('still reclaims a stale (non-pid) lock when the reclaim happens on the very last retry attempt (off-by-one regression, mtime path)', async () => {
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'withlock-test-'));
+    const lockPath = path.join(work, '.test.lock');
+    try {
+      // Non-numeric content (falls through the dead-pid check entirely) plus
+      // a backdated mtime — exercises the second, mtime-based reclaim path.
+      fs.writeFileSync(lockPath, 'not-a-pid', { flag: 'wx' });
+      const old = new Date(Date.now() - 60_000);
+      fs.utimesSync(lockPath, old, old);
+
+      let ran = false;
+      const result = await withLock(
+        lockPath,
+        () => {
+          ran = true;
+          expect(fs.existsSync(lockPath)).toBe(true);
+          expect(fs.readFileSync(lockPath, 'utf-8')).toBe(String(process.pid));
+          return 'reclaimed-on-last-attempt';
+        },
+        { retryMs: 2, maxAttempts: 1, staleMs: 1_000 },
+      );
+
+      expect(ran).toBe(true);
+      expect(result).toBe('reclaimed-on-last-attempt');
+      expect(fs.existsSync(lockPath)).toBe(false);
+    } finally {
+      fs.rmSync(work, { recursive: true, force: true });
+    }
+  });
+
+  it("does not delete a different holder's lock on release (fencing regression)", async () => {
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'withlock-test-'));
+    const lockPath = path.join(work, '.test.lock');
+    try {
+      // Simulates the real failure mode: this call's fn() outlives staleMs,
+      // another process (a different pid/token) reclaims the lock as
+      // abandoned and writes its own token in — all *while our fn() is
+      // still running*. When our fn() finally returns, the pre-fix
+      // version's unconditional unlink would delete that other, still-live
+      // holder's lock. The fix only unlinks if the file still holds the
+      // exact token this call itself wrote.
+      const otherHoldersToken = 'a-different-process-reclaimed-this';
+
+      await withLock(lockPath, () => {
+        expect(fs.readFileSync(lockPath, 'utf-8')).toBe(String(process.pid));
+        fs.writeFileSync(lockPath, otherHoldersToken);
+      });
+
+      expect(fs.existsSync(lockPath)).toBe(true);
+      expect(fs.readFileSync(lockPath, 'utf-8')).toBe(otherHoldersToken);
+    } finally {
+      fs.rmSync(work, { recursive: true, force: true });
+    }
+  });
+
+  it('throws, naming lockPath, after exhausting the retry budget against a live (fresh) lock', async () => {
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'withlock-test-'));
+    const lockPath = path.join(work, '.test.lock');
+    try {
+      fs.writeFileSync(lockPath, String(process.pid), { flag: 'wx' });
+
+      let threw: unknown;
+      try {
+        await withLock(lockPath, () => 'should not run', { retryMs: 2, maxAttempts: 3, staleMs: 30_000 });
+      } catch (e) {
+        threw = e;
+      }
+
+      expect(threw).toBeInstanceOf(Error);
+      expect((threw as Error).message).toContain(lockPath);
+      // Our own live lock is untouched — only a failed acquire attempt's
+      // own bookkeeping should ever be cleaned up, never a real live holder.
+      expect(fs.existsSync(lockPath)).toBe(true);
+      expect(fs.readFileSync(lockPath, 'utf-8')).toBe(String(process.pid));
+    } finally {
+      fs.rmSync(work, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ocrPngText — per-cacheDir download-race lock (deferred-work.md,
+// ocr-fallback item)
+//
+// Two concurrent first-ever OCR calls against the same fresh (not-yet-
+// populated) `.ocr-cache/` dir could otherwise both trigger createWorker's
+// own internal eng.traineddata/heb.traineddata download at once. Verified
+// here without a real network call: the mocked createWorker (module-level
+// mock above) holds "in flight" for `createWorkerDelayMs` and records the
+// real concurrent high-water mark via `maxConcurrentCreateWorkerCalls` — if
+// the lock weren't there, two calls started together would both be in
+// flight at once and that mark would read 2.
+// ---------------------------------------------------------------------------
+
+describe('ocrPngText — concurrent calls against the same cacheDir', () => {
+  it('never runs two createWorker calls concurrently against the same cacheDir', async () => {
+    const cacheDir = path.join(baseDir, '.ocr-cache');
+    createWorkerDelayMs = 20;
+    mockOcrResult = { text: 'ocr text' };
+
+    const [a, b] = await Promise.all([
+      ocrPngText('/fake/page-a.png', { cacheDir }),
+      ocrPngText('/fake/page-b.png', { cacheDir }),
+    ]);
+
+    expect(maxConcurrentCreateWorkerCalls).toBe(1);
+    expect(a).toBe('ocr text');
+    expect(b).toBe('ocr text');
+  });
+
+  it('does not serialize createWorker calls against two different cacheDirs', async () => {
+    createWorkerDelayMs = 20;
+    mockOcrResult = { text: 'ocr text' };
+
+    const [a, b] = await Promise.all([
+      ocrPngText('/fake/page-a.png', { cacheDir: path.join(baseDir, 'group-a', '.ocr-cache') }),
+      ocrPngText('/fake/page-b.png', { cacheDir: path.join(baseDir, 'group-b', '.ocr-cache') }),
+    ]);
+
+    // Different agent groups' cache dirs are independent locks — no reason
+    // for one group's OCR call to wait on an unrelated group's.
+    expect(maxConcurrentCreateWorkerCalls).toBe(2);
+    expect(a).toBe('ocr text');
+    expect(b).toBe('ocr text');
+  });
+
+  it("one call's createWorker failure never wedges a later call against the same cacheDir", async () => {
+    const cacheDir = path.join(baseDir, '.ocr-cache');
+    createWorkerShouldThrow = 'simulated createWorker failure (e.g. a failed language-data download)';
+
+    await expect(ocrPngText('/fake/page-a.png', { cacheDir })).rejects.toThrow(createWorkerShouldThrow);
+
+    createWorkerShouldThrow = undefined;
+    mockOcrResult = { text: 'recovered' };
+    const result = await ocrPngText('/fake/page-b.png', { cacheDir });
+    expect(result).toBe('recovered');
   });
 });

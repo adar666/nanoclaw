@@ -268,10 +268,36 @@ function isPidAlive(pid: number): boolean {
   }
 }
 
-async function withLock<T>(lockPath: string, fn: () => T): Promise<T> {
-  for (let attempt = 0; attempt < LOCK_MAX_ATTEMPTS; attempt++) {
+/**
+ * Test-only overrides for the retry/attempt/staleness constants below —
+ * every real call site omits this and gets the production defaults
+ * unchanged. Exists so a regression test can exercise the retry-exhaustion
+ * and stale-reclaim-on-the-last-attempt paths deterministically (maxAttempts:
+ * 1-2, a short retryMs) instead of needing a real ~2s/30s wait, mirroring why
+ * eval/lock.ts's own reimplementation of this algorithm takes the same shape
+ * of `opts`.
+ */
+interface WithLockTestOpts {
+  retryMs?: number;
+  maxAttempts?: number;
+  staleMs?: number;
+}
+
+export async function withLock<T>(lockPath: string, fn: () => T, testOpts?: WithLockTestOpts): Promise<T> {
+  const retryMs = testOpts?.retryMs ?? LOCK_RETRY_MS;
+  const maxAttempts = testOpts?.maxAttempts ?? LOCK_MAX_ATTEMPTS;
+  const staleMs = testOpts?.staleMs ?? LOCK_STALE_MS;
+
+  // This call's own fencing token (see the finally block below) — written as
+  // the lock file's content at acquire time, checked again at release. Plain
+  // process.pid (not a per-call uuid) is deliberate: it doubles as the value
+  // the dead-pid liveness check below reads back, exactly mirroring
+  // eval/lock.ts's own reimplementation of this same algorithm.
+  const myToken = String(process.pid);
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
     try {
-      fs.writeFileSync(lockPath, String(process.pid), { flag: 'wx' });
+      fs.writeFileSync(lockPath, myToken, { flag: 'wx' });
       break;
     } catch (e) {
       if (errnoCode(e) !== 'EEXIST') throw e;
@@ -293,6 +319,7 @@ async function withLock<T>(lockPath: string, fn: () => T): Promise<T> {
         if (Number.isInteger(heldByPid) && heldByPid > 0 && !isPidAlive(heldByPid)) {
           fs.unlinkSync(lockPath);
           log(`withLock: reclaimed a lock held by dead pid ${heldByPid}: ${lockPath}`);
+          attempt--; // guarantee a genuine re-acquire attempt, even on the last iteration (deferred-work.md off-by-one fix, ported from eval/lock.ts)
           continue; // retry the exclusive-create immediately, no need to sleep
         }
       } catch {
@@ -302,8 +329,9 @@ async function withLock<T>(lockPath: string, fn: () => T): Promise<T> {
 
       try {
         const st = fs.statSync(lockPath);
-        if (Date.now() - st.mtimeMs > LOCK_STALE_MS) {
+        if (Date.now() - st.mtimeMs > staleMs) {
           fs.unlinkSync(lockPath);
+          attempt--; // guarantee a genuine re-acquire attempt, even on the last iteration (deferred-work.md off-by-one fix, ported from eval/lock.ts)
           continue; // retry the exclusive-create immediately, no need to sleep
         }
       } catch {
@@ -311,17 +339,26 @@ async function withLock<T>(lockPath: string, fn: () => T): Promise<T> {
         // holder likely just released it; fall through to the normal retry.
       }
 
-      if (attempt === LOCK_MAX_ATTEMPTS - 1) {
+      if (attempt === maxAttempts - 1) {
         throw new Error(`Timed out waiting for memory index lock: ${lockPath}`);
       }
-      await new Promise((resolve) => setTimeout(resolve, LOCK_RETRY_MS));
+      await new Promise((resolve) => setTimeout(resolve, retryMs));
     }
   }
   try {
     return fn();
   } finally {
     try {
-      fs.unlinkSync(lockPath);
+      // Fencing (deferred-work.md finding, ported from eval/lock.ts): only
+      // release if this call still owns the lock. If this call's own fn()
+      // ran long enough to cross LOCK_STALE_MS (or its holder pid looked
+      // dead to a racing caller), another caller may have already reclaimed
+      // the lock and written its own token in — an unconditional unlink here
+      // would delete THAT caller's live lock instead of this one's own,
+      // silently breaking mutual exclusion.
+      if (fs.readFileSync(lockPath, 'utf-8') === myToken) {
+        fs.unlinkSync(lockPath);
+      }
     } catch {
       // Already gone (or never created) — nothing to clean up.
     }
@@ -755,10 +792,47 @@ function renderFileNameFor(resolvedPath: string, originalFilename: string): stri
 // Bounds both worker init (which includes that first-time language-data
 // fetch) and the recognize() call itself in one combined budget — a stuck
 // fetch or a stalled OCR pass must not block save_document indefinitely.
+// Same accepted limitation already noted above for PDF_TIMEOUT_MS
+// (deferred-work.md, epic-2 retro finding): withTimeout races the call
+// against a timer without actually cancelling the underlying work if the
+// timer wins — tesseract.js's worker has no cancellation API to call into
+// (only terminate(), which the finally block below already calls on the
+// normal completion path, not on a timeout), so the worker keeps running
+// in the background until it settles on its own, unbounded by the timeout
+// the caller was told applies. A retry after a timeout can spawn a second
+// worker on top of the still-running first one; best achievable without a
+// real tesseract worker-lifecycle redesign, out of scope here.
 const OCR_TIMEOUT_MS = 60_000;
 // ---------------------------------------------------------------------------
 
-async function ocrPngText(pngPath: string, ocrOpts: { cacheDir: string }): Promise<string> {
+/**
+ * Per-cacheDir in-memory mutex (deferred-work.md finding, ocr-fallback item):
+ * this file never controls tesseract.js's own internal "check cache,
+ * download if missing" sequence for eng.traineddata/heb.traineddata
+ * directly — that happens inside createWorker() itself — so two concurrent
+ * first-ever `save_document` OCR calls against the same fresh (not-yet-
+ * populated) agent-group `.ocr-cache/` dir could otherwise both trigger a
+ * download of the same language file at once. A single-process in-memory
+ * lock keyed by cacheDir path is enough (no eval/lock.ts-style staleness-
+ * reclaim machinery needed): this all runs in one Bun process per
+ * container, so there's no cross-process holder to ever go stale. Chains
+ * each call after whatever's already queued for that same cacheDir, and
+ * always resolves (never rejects) so one call's failure can't permanently
+ * wedge later callers against the same directory.
+ */
+const ocrCacheDirLocks = new Map<string, Promise<unknown>>();
+
+function withOcrCacheDirLock<T>(cacheDir: string, fn: () => Promise<T>): Promise<T> {
+  const prior = ocrCacheDirLocks.get(cacheDir) ?? Promise.resolve();
+  const result = prior.then(fn, fn);
+  ocrCacheDirLocks.set(
+    cacheDir,
+    result.catch(() => undefined),
+  );
+  return result;
+}
+
+export async function ocrPngText(pngPath: string, ocrOpts: { cacheDir: string }): Promise<string> {
   const work = (async () => {
     const tesseractModule = await import('tesseract.js');
     const createWorker = tesseractModule.createWorker ?? tesseractModule.default?.createWorker;
@@ -783,7 +857,16 @@ async function ocrPngText(pngPath: string, ocrOpts: { cacheDir: string }): Promi
 
     fs.mkdirSync(ocrOpts.cacheDir, { recursive: true });
 
-    const worker = await createWorker('eng+heb', undefined, { workerPath, cachePath: ocrOpts.cacheDir });
+    // Locked around worker creation only (not the recognize() call below) —
+    // that's precisely where tesseract.js's own "check cache, download if
+    // missing" sequence runs. Once createWorker resolves for the first
+    // caller against a given cacheDir, the language data is fully present,
+    // so a second, already-queued caller's own createWorker call proceeds
+    // needing no download at all — concurrent recognize() calls against an
+    // already-populated cache are never serialized by this lock.
+    const worker = await withOcrCacheDirLock(ocrOpts.cacheDir, () =>
+      createWorker('eng+heb', undefined, { workerPath, cachePath: ocrOpts.cacheDir }),
+    );
     try {
       const { data } = await worker.recognize(pngPath);
       return (data.text ?? '').trim();
@@ -1868,6 +1951,38 @@ function treeIsWellFormed(nodes: XmlNode[]): boolean {
   return nodes.every((n) => n.close !== -1 && n.end !== -1 && treeIsWellFormed(n.children));
 }
 
+/**
+ * `parseOoxmlTree`'s tokenizer only recognizes the `w:` prefix (Word's own
+ * default, and what every real-world .docx this tool has been tested
+ * against uses). A document produced/re-saved by a tool that binds the
+ * WordprocessingML namespace to a *different* prefix has its tables (and
+ * everything else) silently invisible to the tokenizer — `tables.length`
+ * comes back 0 even though a `<otherprefix:tbl>` genuinely exists. Detected
+ * by reading the actual `xmlns:` declaration off the document root rather
+ * than guessing from tag shapes, so this only fires on a real prefix
+ * mismatch, never on a genuinely table-less document (which has no `xmlns:`
+ * mismatch to find). Full non-`w:` namespace support is out of scope (see
+ * deferred-work.md) — this exists only to make the resulting "no tables"
+ * failure legible instead of misleading.
+ */
+function detectNonWNamespacePrefix(xml: string): string | undefined {
+  const m = /xmlns:([A-Za-z0-9_]+)="http:\/\/schemas\.openxmlformats\.org\/wordprocessingml\/2006\/main"/.exec(xml);
+  if (!m) return undefined;
+  const prefix = m[1];
+  return prefix !== 'w' ? prefix : undefined;
+}
+
+/** Wraps a "no tables" fallback message with the more specific non-`w:`-namespace diagnosis when that's the actual cause, so the failure points at the real reason instead of reading as "this document genuinely has no tables." */
+function noTablesMessage(xml: string, fallback: string): string {
+  const prefix = detectNonWNamespacePrefix(xml);
+  if (!prefix) return fallback;
+  return (
+    `This document binds the Word XML namespace to the "${prefix}:" prefix instead of the standard "w:" prefix ` +
+    'this tool recognizes — table (and fill-in-the-blank line) detection only supports "w:"-prefixed documents, ' +
+    'so any tables in this file could not be found even though they may exist. Not supported.'
+  );
+}
+
 function collectDescendants(node: XmlNode, tag: OoxmlTag): XmlNode[] {
   const found: XmlNode[] = [];
   for (const child of node.children) {
@@ -2533,11 +2648,14 @@ function formatDocxLineCandidates(candidates: DocxLineCandidate[]): string {
 }
 
 /** Discovery response for a table-less docx (or one where the caller explicitly asked for line targeting). */
-function docxListLines(candidates: DocxLineCandidate[]): ReturnType<typeof ok> | ReturnType<typeof err> {
+function docxListLines(xml: string, candidates: DocxLineCandidate[]): ReturnType<typeof ok> | ReturnType<typeof err> {
   if (candidates.length === 0) {
     return err(
-      'This document has no tables to fill, and no fill-in-the-blank line (an underscore blank or a ' +
-        'trailing-colon label) was detected either.',
+      noTablesMessage(
+        xml,
+        'This document has no tables to fill, and no fill-in-the-blank line (an underscore blank or a ' +
+          'trailing-colon label) was detected either.',
+      ),
     );
   }
   return ok(
@@ -2556,10 +2674,11 @@ const TABLE_ROW_REQUIRED_MESSAGE = 'row is required for a .docx fill (1-indexed 
  * only ever surfacing the table prompt with the blank lines undiscoverable.
  */
 function docxDiscoveryResponse(
+  xml: string,
   tables: XmlNode[],
   candidates: DocxLineCandidate[],
 ): ReturnType<typeof ok> | ReturnType<typeof err> {
-  if (tables.length === 0) return docxListLines(candidates);
+  if (tables.length === 0) return docxListLines(xml, candidates);
   if (candidates.length === 0) return err(TABLE_ROW_REQUIRED_MESSAGE);
   return ok(
     `${TABLE_ROW_REQUIRED_MESSAGE} Or use "lineNumber" instead to fill one of the detected fill-in-the-blank ` +
@@ -2700,12 +2819,12 @@ async function fillDocx(
     // resolved (or errored) above but is otherwise unused here — this
     // response is identical whether or not one was passed, mirroring
     // fillPdf's own "no target given" branches.
-    return docxDiscoveryResponse(tables, findDocxLineCandidates(xml, roots));
+    return docxDiscoveryResponse(xml, tables, findDocxLineCandidates(xml, roots));
   }
 
   if (row === undefined) return err('row is required for a .docx fill (1-indexed row within the target table).');
   if (value === undefined && signaturePng === undefined) return err('value or signatureName is required.');
-  if (tables.length === 0) return err('This document has no tables to fill.');
+  if (tables.length === 0) return err(noTablesMessage(xml, 'This document has no tables to fill.'));
 
   let tableIndex: number;
   if (tableArg !== undefined) {
