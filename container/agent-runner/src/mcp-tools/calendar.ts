@@ -209,7 +209,8 @@ export const createCalendarEvent: McpToolDefinition = {
     description:
       'Create a real event on one of this group\'s configured Google Calendars (at minimum Uriel\'s own; an ' +
       'operator may add more, e.g. Devora\'s) — all reachable through one connected account, each other ' +
-      'calendar via sharing, not a separate connection.',
+      'calendar via sharing, not a separate connection. Runs a duplicate pre-check first (an extra read before ' +
+      'the write), so a successful call is two network round trips, not one.',
     inputSchema: {
       type: 'object' as const,
       properties: {
