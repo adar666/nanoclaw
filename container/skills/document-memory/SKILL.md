@@ -25,34 +25,43 @@ it.
    no waiting, no follow-up message to expect later.
 
 2. **Three possible outcomes:**
-   - **Saved.** The tool copied the file into memory, extracted its text
-     (for a scanned PDF, page 1 was rendered and OCR'd automatically —
-     English and Hebrew — in this same call — you don't need to read
-     anything yourself), and recorded it — you're done. Tell the user it's
-     saved and can be asked about later without resending it. **For a
-     scanned PDF, only page 1 is ever rendered/OCR'd** — for a multi-page
-     scanned PDF, later pages are not captured; if the document is more
-     than one page, say so rather than implying you saved the whole thing.
-   - **Scanned PDF, OCR found little to no readable text.** Rare — a
-     genuinely blank/unreadable page 1, or a page in a language other than
-     English/Hebrew. The tool renders page 1 to a PNG, tries OCR, and when
-     that comes back empty or near-empty tells you so instead of saving
-     anything yet — no memory entry exists at this point. Ask the user how
-     to proceed:
+   - **Saved.** The tool copied the file into memory, extracted its text,
+     and recorded it — you're done. Tell the user it's saved and can be
+     asked about later without resending it. **A multi-page PDF is fully
+     supported** — every page is read on its own: a page with a real text
+     layer is extracted directly, and a page with no text layer (scanned/
+     image-only) is rendered and OCR'd automatically (English and Hebrew) —
+     all in this same call, all pages included, you don't need to read
+     anything yourself. A mixed document (some pages real text, some
+     scanned) is handled transparently in one pass; the saved concept file
+     marks any OCR'd/transcribed page inline (`[Page N — OCR]` or
+     `[Page N — transcribed]`) so it's clear later which pages came from
+     the PDF's own text and which were reconstructed — you don't need to
+     mention that distinction yourself unless asked.
+   - **Scanned PDF, one page's OCR found little to no readable text.**
+     Rare — a genuinely blank/unreadable page, or a page in a language
+     other than English/Hebrew. The tool halts on that ONE page instead of
+     saving anything yet — no memory entry exists at this point, even if
+     every other page already read fine. Ask the user how to proceed:
      either **read the rendered image yourself** with your own Read tool
-     (you're multimodal — this is a fallback for this one case, not the
-     normal path) and call `save_document` again with the *same* `path`
-     argument plus an `extractedText` argument containing what you read, or
-     call `save_document` again with the same `path` and
-     `extractedText: ""` to save it with a placeholder note instead. Either
-     follow-up call completes the save.
+     (you're multimodal — this is a fallback for this one page, not the
+     normal path) and call `save_document` again with the _same_ `path`
+     argument plus an `extractedText` argument containing what you read
+     **for that one page only** (never re-describe the whole document —
+     other pages have already been captured and don't need to be resent),
+     or call `save_document` again with the same `path` and
+     `extractedText: ""` to save just that page with a placeholder note
+     instead. Either follow-up call completes the save — unless a LATER
+     page in the same document also turns out unreadable, in which case
+     the tool halts again on that page and needs one more round trip; keep
+     replying the same way, one page at a time, until it reports saved.
    - **Plain image, needs your own reading.** For a `.jpg`/`.jpeg`/`.png`
      upload, the tool always tells you it needs you to read it yourself
      instead of saving anything yet — no memory entry exists at this point.
      The uploaded file itself is already what to look at, no rendering
      needed. **Read it yourself** with your own Read tool (you're
      multimodal — this is not a separate OCR step, it's you looking at the
-     image), then call `save_document` again with the *same* `path`
+     image), then call `save_document` again with the _same_ `path`
      argument plus an `extractedText` argument containing what you read (a
      description, any readable text, numbers, a barcode, etc.). That second
      call completes the save.
@@ -84,7 +93,7 @@ it.
   only.
 - Don't claim a document is saved before the tool actually confirms it. A
   scanned PDF normally saves in its one and only call (OCR ran inline), but
-  when OCR comes back with little to no readable text that call is *not* a save — only the follow-up
+  when OCR comes back with little to no readable text that call is _not_ a save — only the follow-up
   call (with real `extractedText`, or `extractedText: ""` for the
   placeholder) is. Same for a plain image: its first call is never a save.
 
@@ -113,10 +122,10 @@ description (same matching either way).
   `query` to see everything) first, and ask the user to confirm.
 - **Either way, `fill_document_field` itself also resolves `document`** using
   the same matching: if it matches more than one saved document, the tool
-  returns a numbered candidate list *instead of* filling anything — relay
+  returns a numbered candidate list _instead of_ filling anything — relay
   that list to the user and re-call with the exact slug (the first column)
   once they pick. This is not an error; it's a normal turn in the
-  conversation. If nothing matches, that *is* an error — say so plainly
+  conversation. If nothing matches, that _is_ an error — say so plainly
   rather than guessing.
 
 ## Filling a `.docx` (or a saved legacy `.doc`)
@@ -147,7 +156,7 @@ argument you give — you never pick a mode explicitly:
 One call. Give `document`, `row` (1-indexed row within the table), and
 `value`. `table` (1-indexed) is only needed if the document has more than
 one table — with exactly one table it's inferred. `column` (1-indexed) is
-only needed to target something other than the row's *last* cell, which is
+only needed to target something other than the row's _last_ cell, which is
 the default (matches the common "label | value" row shape). **"Row 1" is
 literally the table's first row** — if the table has a header row, that
 counts as row 1; the first data row is row 2.
@@ -168,12 +177,12 @@ Two calls, mirroring the PDF text-layer flow below:
   `lineNumber`. If the document has no table, this returns a numbered list
   of detected fill-in-the-blank paragraphs (mirrors the PDF line list's
   shape). **If it also has a table, the response names both possibilities**
-  — the table-row prompt *and* the numbered blank-line list — so pick
+  — the table-row prompt _and_ the numbered blank-line list — so pick
   whichever mode actually matches what the user wants (`row` for the table,
   `lineNumber` for a blank-line paragraph).
 - Second call: `fill_document_field({ document, lineNumber, value })` —
   fills that line. Each detected blank is its own numbered candidate — a
-  paragraph with two blanks ("Name: ___ Date: ___") lists as two separate
+  paragraph with two blanks ("Name: **_ Date: _**") lists as two separate
   lines, each independently fillable. An underscore blank has its
   underscore run replaced with `value`; a trailing-colon label gets `value`
   appended right after it, on the same paragraph. Only that one paragraph
@@ -188,7 +197,7 @@ the tool declines clearly — don't guess a target; ask the user instead (the
 same "decline rather than guess" rule as everywhere else in this tool).
 
 **Known limitation:** if a paragraph's label and its blank happen to sit in
-the *same* underlying Word run (no formatting break between them — rare,
+the _same_ underlying Word run (no formatting break between them — rare,
 but possible for a short line typed all at once with no script/formatting
 change), filling it replaces the whole run, and the label is lost along
 with the blank. This mirrors the existing table-cell multi-run limitation
@@ -212,8 +221,10 @@ Three mechanisms, auto-detected — you never pick a mode explicitly:
      draws the value right after that line's existing content, on the same
      baseline. This never edits or reflows existing text, only adds new
      content in blank space.
-3. **Scanned/image-only PDF** (no text layer at all): two calls, mirroring
-   `save_document`'s scanned-PDF pattern.
+3. **Scanned/image-only PDF** (no text layer at all): two calls. Unlike
+   `save_document`'s own scanned-PDF handling (which reads every page),
+   this fill flow is page-1-only — it targets one specific spot on one
+   page, not the whole document's content.
    - First call: `fill_document_field({ document })` — renders page 1 (page
      1 only) and returns its path + pixel dimensions.
    - **Read that image yourself** and estimate the pixel position (x,y from
@@ -403,7 +414,7 @@ something the user didn't ask to touch.
    text under that same slug are overwritten with this call's content — the
    raw file's extension can change too (e.g. refreshing a saved `.doc` with
    a `.docx` fill output leaves it stored as `.docx` going forward). It's
-   the *same document* (same slug, same concept file), not a new one —
+   the _same document_ (same slug, same concept file), not a new one —
    `memory/index.md`'s existing one-line entry for it is left as-is. **The
    document's own name/description/heading stay exactly what they already
    were** — the new file's own filename (often something machine-generated
@@ -417,7 +428,7 @@ something the user didn't ask to touch.
    `pre-refresh snapshot` in place of a field description.
 5. **A later fill builds on the refreshed content, not the original.**
    Once refreshed, `fill_document_field`/`fill_document_field_batch` read
-   and edit the *refreshed* raw file — this is how a second edit compounds
+   and edit the _refreshed_ raw file — this is how a second edit compounds
    on top of a first one instead of silently discarding it.
 6. **If the refresh source itself needs the two-call OCR/image round trip**
    (e.g. the edited file you're refreshing with happens to be a scanned PDF
@@ -453,11 +464,11 @@ last edit" — for a document you've filled one or more times via
 `fill_document_field`/`fill_document_field_batch`, or refreshed via
 `save_document`'s `document` argument (see "Refreshing" above). There is no
 separate "restore"/"undo" tool: `list_document_versions` returns the
-still-on-disk output path of each past fill *and* each pre-refresh
+still-on-disk output path of each past fill _and_ each pre-refresh
 snapshot, and you resend the one the user wants with the existing
 `send_file` tool, exactly like after a fresh fill.
 
-**Important:** this only recalls a past *fill output* (or, after a
+**Important:** this only recalls a past _fill output_ (or, after a
 refresh, the pre-refresh raw file) — it never reverts the currently-stored
 document itself. Filling a document never touches the stored raw file or
 its extracted text — only an explicit `save_document` refresh does that,
@@ -547,7 +558,7 @@ alone, with no filename/slug hint, may not resolve on the first try.
      than guessing.
    - **One match** — resolved; move to step 3.
    - **Two or more matches** — a numbered candidate list (`slug —
-     filename (description)`). Relay it to the user and wait for them to
+filename (description)`). Relay it to the user and wait for them to
      pick before continuing. Once you have the slug, its concept file is
      at `documents/<slug>.md`, relative to `memory/` — the same
      convention `memory/index.md` uses; you don't need the tool to spell

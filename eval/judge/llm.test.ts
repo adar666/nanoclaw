@@ -17,7 +17,7 @@ vi.mock('../runner.js', () => ({
 import type { OutboundMessage } from '../../src/db/session-db.js';
 import type { ScenarioTurnResult, ScenarioTurnStatus } from '../runner.js';
 import { runScenarioTurn } from '../runner.js';
-import { judgeLlm } from './llm.js';
+import { JudgeLlmError, judgeLlm } from './llm.js';
 
 const TRANSCRIPT: OutboundMessage[] = [
   {
@@ -276,6 +276,30 @@ describe('judgeLlm', () => {
 
     await expect(judgeLlm(JUDGE_AGENT_GROUP, 'system:eval:judge-18', TRANSCRIPT, RUBRIC)).rejects.toBe(spawnError);
   });
+
+  it(
+    'throws a JudgeLlmError (not a plain Error) for its own documented business-logic failure modes, so a caller ' +
+      'can distinguish them from a genuine AD-4-style structural failure that merely propagated through ' +
+      '(deferred-work.md finding, spec-eval-2-3): incomplete turn and unparseable reply, but NOT a rejection that ' +
+      'genuinely came from runScenarioTurn itself',
+    async () => {
+      vi.mocked(runScenarioTurn).mockResolvedValueOnce(turnResult('timeout', []));
+      await expect(judgeLlm(JUDGE_AGENT_GROUP, 'system:eval:judge-22', TRANSCRIPT, RUBRIC)).rejects.toThrow(
+        JudgeLlmError,
+      );
+
+      vi.mocked(runScenarioTurn).mockResolvedValueOnce(turnResult('completed', [outboundRow('r1', 'no verdict here')]));
+      await expect(judgeLlm(JUDGE_AGENT_GROUP, 'system:eval:judge-23', TRANSCRIPT, RUBRIC)).rejects.toThrow(
+        JudgeLlmError,
+      );
+
+      const spawnError = new Error('runScenarioTurn: wakeContainer failed to spawn a container');
+      vi.mocked(runScenarioTurn).mockRejectedValueOnce(spawnError);
+      await expect(judgeLlm(JUDGE_AGENT_GROUP, 'system:eval:judge-24', TRANSCRIPT, RUBRIC)).rejects.not.toBeInstanceOf(
+        JudgeLlmError,
+      );
+    },
+  );
 
   it('works with opts omitted entirely, passing undefined through to runScenarioTurn', async () => {
     vi.mocked(runScenarioTurn).mockResolvedValue(

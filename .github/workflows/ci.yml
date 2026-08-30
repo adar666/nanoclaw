@@ -32,6 +32,9 @@ jobs:
       - name: Typecheck container
         run: pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit
 
+      - name: Typecheck eval
+        run: pnpm run typecheck:eval
+
       - name: Host tests
         run: pnpm exec vitest run
 
@@ -52,4 +55,14 @@ jobs:
 
       - name: Container tests
         working-directory: container/agent-runner
-        run: bun test
+        # --timeout above bun:test's 5000ms default: a handful of tests
+        # (real-timer async completion tests in poll-loop.test.ts, and
+        # documents.test.ts's oversized-file boundary test, which now writes
+        # real megabyte-scale fixtures) sit close enough to 5000ms on a dev
+        # machine that GitHub's shared ubuntu-latest runner — consistently
+        # slower, confirmed by 2 identical CI runs failing the exact same 5
+        # tests within a few hundred ms of the boundary, never locally —
+        # tips them over. Same class of fix as the LibreOffice install step
+        # above (this codebase's own established pattern: give CI honestly
+        # more time rather than chase a false regression).
+        run: bun test --timeout 20000

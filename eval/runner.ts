@@ -121,6 +121,22 @@ export async function runScenarioTurn(
 }
 
 /**
+ * `pollIntervalMs` ± this fraction, applied per-iteration — spreads out
+ * repeated fresh-handle opens against a file the container is concurrently
+ * writing to, rather than every poll landing at an identical cadence
+ * (deferred-work.md finding, spec-eval-1-4). Low-stakes for this module's
+ * actual traffic (one harness process polling its own single session), same
+ * "cheap to add, real value low" judgment call `eval/lock.ts`'s own retry
+ * jitter used.
+ */
+const POLL_JITTER_FRACTION = 0.2;
+
+function jitteredDelay(pollIntervalMs: number): number {
+  const jitterFactor = 1 + (Math.random() * 2 - 1) * POLL_JITTER_FRACTION; // [0.8, 1.2]
+  return Math.round(pollIntervalMs * jitterFactor);
+}
+
+/**
  * Poll `processing_ack` for `messageId` until it reaches a terminal status or
  * `timeoutMs` elapses. Opens and closes the outbound DB on every iteration —
  * required for cross-mount visibility of the container's writes (see the
@@ -131,6 +147,15 @@ export async function runScenarioTurn(
  * original version didn't) — a completion written during the final sleep,
  * right at the deadline, would otherwise be reported as `'timeout'` even
  * though the real answer was sitting there unread.
+ *
+ * `maxIterations` is a belt-and-suspenders cap, not the real timeout — the
+ * `Date.now() < deadline` check above is authoritative and this cap is sized
+ * generously above the worst-case iteration count that check could ever
+ * legitimately produce (accounting for jitter shrinking an individual delay
+ * to `1 - POLL_JITTER_FRACTION` of `pollIntervalMs`), so normal operation
+ * never gets close to it. It exists only to guarantee termination if the
+ * deadline check itself ever stops being reliable (e.g. a frozen/misbehaving
+ * clock) — deferred-work.md finding, spec-eval-1-4.
  */
 async function pollForTerminalStatus(
   agentGroupId: string,
@@ -140,6 +165,7 @@ async function pollForTerminalStatus(
   pollIntervalMs: number,
 ): Promise<'completed' | 'failed' | 'cancelled' | undefined> {
   const deadline = Date.now() + timeoutMs;
+  const maxIterations = Math.ceil(timeoutMs / (pollIntervalMs * (1 - POLL_JITTER_FRACTION))) + 10;
 
   const checkOnce = (): 'completed' | 'failed' | 'cancelled' | undefined => {
     const db = openOutboundDb(agentGroupId, sessionId);
@@ -155,10 +181,12 @@ async function pollForTerminalStatus(
     }
   };
 
-  while (Date.now() < deadline) {
+  let iterations = 0;
+  while (Date.now() < deadline && iterations < maxIterations) {
     const status = checkOnce();
     if (status) return status;
-    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+    iterations++;
+    await new Promise((resolve) => setTimeout(resolve, jitteredDelay(pollIntervalMs)));
   }
 
   return checkOnce();

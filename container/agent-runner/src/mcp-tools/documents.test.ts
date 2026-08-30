@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, mock } from 'bun:test';
 import { execFileSync } from 'child_process';
+import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -26,6 +27,9 @@ import {
   listDocumentVersionsImpl,
   listDocumentVersions,
   describePdfReadError,
+  withLock,
+  ocrPngText,
+  ensureOcrLangData,
 } from './documents.js';
 
 // ---------------------------------------------------------------------------
@@ -50,11 +54,37 @@ import {
 // ---------------------------------------------------------------------------
 
 let mockOcrResult: { text: string } | { error: string } = { text: '' };
-let lastCreateWorkerCall: { langs: unknown; oem: unknown; options: { workerPath?: string; cachePath?: string } } | undefined;
+let lastCreateWorkerCall:
+  | { langs: unknown; oem: unknown; options: { workerPath?: string; cachePath?: string } }
+  | undefined;
+
+// Concurrency instrumentation for the withOcrCacheDirLock regression test
+// below (deferred-work.md, ocr-fallback item) — `createWorkerDelayMs` lets a
+// test hold createWorker "in flight" long enough for a second concurrent
+// call to genuinely overlap if the lock didn't exist;
+// `maxConcurrentCreateWorkerCalls` records the real high-water mark. Both
+// reset to their neutral defaults in beforeEach below so they never leak
+// into an unrelated test.
+let createWorkerDelayMs = 0;
+let activeCreateWorkerCalls = 0;
+let maxConcurrentCreateWorkerCalls = 0;
+// Makes createWorker() itself throw (rather than the later recognize()
+// call) — used only to test that withOcrCacheDirLock's chain doesn't get
+// permanently wedged by a failing call.
+let createWorkerShouldThrow: string | undefined;
 
 mock.module('tesseract.js', () => ({
   createWorker: async (langs: unknown, oem: unknown, options: { workerPath?: string; cachePath?: string }) => {
     lastCreateWorkerCall = { langs, oem, options };
+    activeCreateWorkerCalls++;
+    maxConcurrentCreateWorkerCalls = Math.max(maxConcurrentCreateWorkerCalls, activeCreateWorkerCalls);
+    if (createWorkerDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, createWorkerDelayMs));
+    }
+    activeCreateWorkerCalls--;
+    if (createWorkerShouldThrow !== undefined) {
+      throw new Error(createWorkerShouldThrow);
+    }
     return {
       recognize: async () => {
         if ('error' in mockOcrResult) throw new Error(mockOcrResult.error);
@@ -207,6 +237,29 @@ function buildMinimalPdf(text: string | null): Buffer {
 }
 
 /**
+ * A PDF with one page per entry in `pages`: a string draws real text (a
+ * genuine text layer, via pdf-lib's own drawText/embedFont — the same
+ * pattern `buildTextPdfWithAcroForm` below already uses and already proven
+ * to extract cleanly via pdfjs-dist); `null` leaves the page completely
+ * blank — no content-stream text at all, so pdfjs-dist's getTextContent()
+ * legitimately returns nothing for it, the same "needs OCR" signal a real
+ * scanned page gives, without needing an actual embedded raster image for
+ * these tests to exercise save_document's render+OCR fallback per page
+ * (`buildMultiPageAcroFormPdf` further below already relies on this same
+ * blank-page-means-no-text-layer property for its own page 1).
+ */
+async function buildMultiPagePdf(pages: Array<string | null>): Promise<Buffer> {
+  const { PDFDocument, StandardFonts } = await import('pdf-lib');
+  const pdfDoc = await PDFDocument.create();
+  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  for (const text of pages) {
+    const page = pdfDoc.addPage([200, 200]);
+    if (text) page.drawText(text, { x: 20, y: 150, size: 14, font });
+  }
+  return Buffer.from(await pdfDoc.save());
+}
+
+/**
  * A white canvas with an optional solid-color ink rectangle — pngjs is
  * already this story's real dependency (production decode/encode both go
  * through it), so building the fixture with it is a real PNG, not a second
@@ -330,14 +383,32 @@ let tmpRoot: string;
 let baseDir: string;
 let inboxDir: string;
 
+// ensureOcrLangData (deferred-work.md, checksum-pin item, 2026-08-28) checks
+// `${cacheDir}/${lang}.traineddata` before ever touching the network — pre-
+// seeding both files with dummy content makes every test below hit that
+// already-cached short-circuit, exactly like a real install's second-and-
+// later OCR call would, with zero network dependency and no need to fake a
+// real checksum match. `ensureOcrLangData` itself is unit-tested directly,
+// separately, against a real fetch mock (see its own describe block).
+function seedOcrCache(cacheDir: string): void {
+  fs.mkdirSync(cacheDir, { recursive: true });
+  fs.writeFileSync(path.join(cacheDir, 'eng.traineddata'), 'fake-eng-traineddata');
+  fs.writeFileSync(path.join(cacheDir, 'heb.traineddata'), 'fake-heb-traineddata');
+}
+
 beforeEach(() => {
   tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'save-document-test-'));
   baseDir = path.join(tmpRoot, 'agent');
   inboxDir = path.join(tmpRoot, 'inbox', 'msg1');
   fs.mkdirSync(baseDir, { recursive: true });
   fs.mkdirSync(inboxDir, { recursive: true });
+  seedOcrCache(path.join(baseDir, '.ocr-cache'));
   mockOcrResult = { text: '' };
   lastCreateWorkerCall = undefined;
+  createWorkerDelayMs = 0;
+  activeCreateWorkerCalls = 0;
+  maxConcurrentCreateWorkerCalls = 0;
+  createWorkerShouldThrow = undefined;
 });
 
 afterEach(() => {
@@ -432,10 +503,12 @@ describe('save_document — happy path, PDF with text layer', () => {
 });
 
 describe('describePdfReadError', () => {
-  it('names a password-protected PDF distinctly, rather than surfacing pdfjs-dist\'s generic error text', () => {
+  it("names a password-protected PDF distinctly, rather than surfacing pdfjs-dist's generic error text", () => {
     const e = new Error('No password given');
     e.name = 'PasswordException';
-    expect(describePdfReadError(e)).toBe('this PDF is password-protected and cannot be read — please provide an unprotected copy');
+    expect(describePdfReadError(e)).toBe(
+      'this PDF is password-protected and cannot be read — please provide an unprotected copy',
+    );
   });
 
   it('falls through to the plain error message for any other error', () => {
@@ -587,7 +660,12 @@ describe('save_document — scanned PDF, OCR finds no readable text (Ask-First h
     expect(result.content[0].text).toContain('found little to no readable text');
     expect(result.content[0].text).toContain('save_document again');
     expect(result.content[0].text).toContain('extractedText: ""');
-    // Transparency: the response must disclose that only page 1 was captured.
+    // Transparency: a follow-up extractedText must be scoped to the one
+    // page being asked about (not "the whole document," now that
+    // save_document reads every page independently) — this single-page PDF
+    // happens to phrase that as "for page 1 only" too, but the meaning has
+    // changed from the old page-1-only-ever-captured caveat to "this reply
+    // answers page 1 specifically."
     expect(result.content[0].text).toContain('page 1 only');
     // The render path in the message must be derived from the injected
     // baseDir, not a hardcoded "/workspace/agent/" prefix (which would be
@@ -681,6 +759,154 @@ describe('save_document — scanned PDF, OCR finds no readable text (Ask-First h
     // follow-up flow that needs it — it must not be left orphaned.
     const renderDir = path.join(baseDir, '.document-renders');
     expect(fs.existsSync(renderDir) ? fs.readdirSync(renderDir).length : 0).toBe(0);
+  });
+});
+
+describe('save_document — multi-page PDF, mixed text/image-page handling', () => {
+  it('all-text-layer multi-page PDF: extracts every page directly via pdfjs-dist, in order, no rendering at all', async () => {
+    const filePath = writeInboxFile(
+      'report.pdf',
+      await buildMultiPagePdf(['Page one content.', 'Page two content.', 'Page three content.']),
+    );
+
+    const result = await saveDocumentImpl({ path: filePath }, opts());
+
+    expect(result.isError).toBeFalsy();
+    const concept = fs.readFileSync(path.join(baseDir, 'memory', 'documents', 'report.md'), 'utf-8');
+    const idx1 = concept.indexOf('Page one content.');
+    const idx2 = concept.indexOf('Page two content.');
+    const idx3 = concept.indexOf('Page three content.');
+    expect(idx1).toBeGreaterThan(-1);
+    expect(idx2).toBeGreaterThan(idx1);
+    expect(idx3).toBeGreaterThan(idx2);
+    // No page marker at all — every page came straight from its own text
+    // layer, none needed OCR/transcription.
+    expect(concept).not.toContain('— OCR');
+    expect(concept).not.toContain('— transcribed');
+    expect(fs.existsSync(path.join(baseDir, '.document-renders'))).toBe(false);
+  });
+
+  it('all-scanned multi-page PDF: renders and OCRs every page, concatenated in order with per-page markers', async () => {
+    mockOcrResult = { text: 'OCR text for this page.' };
+    const filePath = writeInboxFile('scan.pdf', await buildMultiPagePdf([null, null, null]));
+
+    const result = await saveDocumentImpl({ path: filePath }, opts());
+
+    expect(result.isError).toBeFalsy();
+    const concept = fs.readFileSync(path.join(baseDir, 'memory', 'documents', 'scan.md'), 'utf-8');
+    expect(concept).toContain('[Page 1 — OCR]');
+    expect(concept).toContain('[Page 2 — OCR]');
+    expect(concept).toContain('[Page 3 — OCR]');
+    // Every page's own render is cleaned up once the whole save succeeds.
+    const renderDir = path.join(baseDir, '.document-renders');
+    expect(fs.existsSync(renderDir) ? fs.readdirSync(renderDir).length : 0).toBe(0);
+  });
+
+  it('mixed PDF: routes each page independently — text pages get no marker, the scanned page does', async () => {
+    mockOcrResult = { text: 'OCR text for the scanned page.' };
+    const filePath = writeInboxFile(
+      'mixed.pdf',
+      await buildMultiPagePdf(['Real text on page one.', null, 'Real text on page three.']),
+    );
+
+    const result = await saveDocumentImpl({ path: filePath }, opts());
+
+    expect(result.isError).toBeFalsy();
+    const concept = fs.readFileSync(path.join(baseDir, 'memory', 'documents', 'mixed.md'), 'utf-8');
+    expect(concept).toContain('Real text on page one.');
+    expect(concept).toContain('[Page 2 — OCR]');
+    expect(concept).toContain('OCR text for the scanned page.');
+    expect(concept).toContain('Real text on page three.');
+    // Only page 2 needed a marker — pages 1 and 3 came straight from their
+    // own text layer and never touched render/OCR.
+    expect((concept.match(/— OCR\]/g) ?? []).length).toBe(1);
+    const renderDir = path.join(baseDir, '.document-renders');
+    expect(fs.existsSync(renderDir) ? fs.readdirSync(renderDir).length : 0).toBe(0);
+  });
+
+  it('a bad page halts the whole save even though other pages already have good content, and resumes on that exact page', async () => {
+    mockOcrResult = { text: '' };
+    const filePath = writeInboxFile(
+      'mixed-bad.pdf',
+      await buildMultiPagePdf(['Real text on page one.', null, 'Real text on page three.']),
+    );
+
+    const halt = await saveDocumentImpl({ path: filePath }, opts());
+    expect(halt.isError).toBeFalsy();
+    expect(halt.content[0].text).toContain('Page 2');
+    expect(halt.content[0].text).toContain('found little to no readable text');
+    expect(halt.content[0].text).toContain('page 2');
+    expect(fs.existsSync(path.join(baseDir, 'memory', 'documents', 'mixed-bad.md'))).toBe(false);
+    const renderDir = path.join(baseDir, '.document-renders');
+    expect(fs.readdirSync(renderDir).length).toBe(1); // only page 2's render survives the halt
+
+    const result = await saveDocumentImpl({ path: filePath, extractedText: 'What I read on page 2.' }, opts());
+
+    expect(result.isError).toBeFalsy();
+    const concept = fs.readFileSync(path.join(baseDir, 'memory', 'documents', 'mixed-bad.md'), 'utf-8');
+    expect(concept).toContain('Real text on page one.');
+    expect(concept).toContain('[Page 2 — transcribed]');
+    expect(concept).toContain('What I read on page 2.');
+    expect(concept).toContain('Real text on page three.');
+    expect(fs.readdirSync(renderDir).length).toBe(0);
+  });
+
+  it('extractedText: "" on a multi-page halt marks just that one page unreadable and keeps the rest of the document', async () => {
+    mockOcrResult = { text: '' };
+    const filePath = writeInboxFile('mixed-blank.pdf', await buildMultiPagePdf(['Real text on page one.', null]));
+
+    await saveDocumentImpl({ path: filePath }, opts());
+    const result = await saveDocumentImpl({ path: filePath, extractedText: '' }, opts());
+
+    expect(result.isError).toBeFalsy();
+    const concept = fs.readFileSync(path.join(baseDir, 'memory', 'documents', 'mixed-blank.md'), 'utf-8');
+    expect(concept).toContain('Real text on page one.');
+    expect(concept).toContain('[Page 2 — no readable text]');
+    // Deliberately NOT the whole-document '_(no text extracted)_' fallback
+    // — that's reserved for a genuinely single-page document (see the
+    // regression tests above); this document still has real content overall.
+    expect(concept).not.toContain('_(no text extracted)_');
+  });
+
+  it('two separate bad pages need two separate Ask-First round trips, one page resolved per call', async () => {
+    mockOcrResult = { text: '' };
+    const filePath = writeInboxFile('two-bad.pdf', await buildMultiPagePdf([null, 'Real text on page two.', null]));
+
+    const halt1 = await saveDocumentImpl({ path: filePath }, opts());
+    expect(halt1.isError).toBeFalsy();
+    expect(halt1.content[0].text).toContain('Page 1');
+    expect(fs.existsSync(path.join(baseDir, 'memory', 'documents', 'two-bad.md'))).toBe(false);
+
+    const halt2 = await saveDocumentImpl({ path: filePath, extractedText: 'What I read on page 1.' }, opts());
+    expect(halt2.isError).toBeFalsy();
+    // Page 2 (real text) was resolved silently in between — the second halt
+    // is on page 3, not page 2.
+    expect(halt2.content[0].text).toContain('Page 3');
+    expect(fs.existsSync(path.join(baseDir, 'memory', 'documents', 'two-bad.md'))).toBe(false);
+
+    const result = await saveDocumentImpl({ path: filePath, extractedText: 'What I read on page 3.' }, opts());
+
+    expect(result.isError).toBeFalsy();
+    const concept = fs.readFileSync(path.join(baseDir, 'memory', 'documents', 'two-bad.md'), 'utf-8');
+    expect(concept).toContain('[Page 1 — transcribed]');
+    expect(concept).toContain('What I read on page 1.');
+    expect(concept).toContain('Real text on page two.');
+    expect(concept).toContain('[Page 3 — transcribed]');
+    expect(concept).toContain('What I read on page 3.');
+    const renderDir = path.join(baseDir, '.document-renders');
+    expect(fs.readdirSync(renderDir).length).toBe(0);
+  });
+
+  it('rejects a PDF over the page-count cap with a clear error before doing any rendering/OCR work', async () => {
+    const manyPages: Array<string | null> = Array.from({ length: 301 }, () => null);
+    const filePath = writeInboxFile('huge.pdf', await buildMultiPagePdf(manyPages));
+
+    const result = await saveDocumentImpl({ path: filePath }, opts());
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('Could not read PDF');
+    expect(result.content[0].text).toContain('300-page limit');
+    expect(fs.existsSync(path.join(baseDir, '.document-renders'))).toBe(false);
   });
 });
 
@@ -1095,6 +1321,15 @@ function buildDocxWithRawTable(tableInnerXml: string): Buffer {
   return buildStoredZip([{ name: 'word/document.xml', data: Buffer.from(xml, 'utf-8') }]);
 }
 
+/** Same shape as buildDocxWithRawTable, but binds the WordprocessingML namespace to a non-"w:" prefix — simulates a document authored/re-saved by a tool that made a different (but still spec-legal) prefix choice, which parseOoxmlTree's "w:"-only tokenizer cannot see. */
+function buildDocxWithRawTableNonWPrefix(tableInnerXml: string, prefix = 'ns0'): Buffer {
+  const xml =
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' +
+    `<${prefix}:document xmlns:${prefix}="http://schemas.openxmlformats.org/wordprocessingml/2006/main">` +
+    `<${prefix}:body><${prefix}:tbl><${prefix}:tblPr/>${tableInnerXml.replace(/w:/g, `${prefix}:`)}</${prefix}:tbl></${prefix}:body></${prefix}:document>`;
+  return buildStoredZip([{ name: 'word/document.xml', data: Buffer.from(xml, 'utf-8') }]);
+}
+
 async function readDocxXml(buf: Buffer): Promise<string> {
   const JSZip = (await import('jszip')).default;
   const zip = await JSZip.loadAsync(buf);
@@ -1184,17 +1419,17 @@ function buildDocxWithSingleQuotedParts(tables: string[][][]): Buffer {
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' +
     '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">' +
     `<w:body>${body}<w:p><w:r><w:drawing>` +
-    "<wp:inline xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\">" +
+    '<wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">' +
     "<wp:docPr id='7' name='Picture 7'/>" +
     '</wp:inline></w:drawing></w:r></w:p></w:body></w:document>';
   const relsXml =
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' +
-    "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" +
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
     "<Relationship Id='rId5' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/image' " +
     "Target='media/image5.png'/></Relationships>";
   const contentTypesXml =
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' +
-    "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">" +
+    '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">' +
     "<Default Extension='png' ContentType='image/png'/></Types>";
   const existingImage = buildSignaturePng({ width: 10, height: 10, ink: { x: 0, y: 0, w: 5, h: 5 } });
   return buildStoredZip([
@@ -1318,7 +1553,9 @@ function buildMultilineTextPdf(lines: string[]): Buffer {
   const page =
     '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] ' +
     '/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>';
-  const streamContent = lines.map((text, i) => `BT /F1 14 Tf 20 ${160 - i * 20} Td (${escapePdfString(text)}) Tj ET`).join('\n');
+  const streamContent = lines
+    .map((text, i) => `BT /F1 14 Tf 20 ${160 - i * 20} Td (${escapePdfString(text)}) Tj ET`)
+    .join('\n');
   const font = '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>';
 
   const parts: string[] = ['%PDF-1.4\n'];
@@ -1398,7 +1635,7 @@ describe('save_document — refresh, unambiguous match', () => {
   });
 });
 
-describe('save_document — document omitted, unchanged today\'s behavior', () => {
+describe("save_document — document omitted, unchanged today's behavior", () => {
   it('still creates a new, separately-slugged document even when a same-named one already exists', async () => {
     await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocx(['First'])) }, opts());
     fs.mkdirSync(path.join(inboxDir, 'msg2'), { recursive: true });
@@ -1483,7 +1720,17 @@ describe('save_document — refresh, pre-refresh raw file is snapshotted into fi
 describe('save_document — refresh, a second fill afterward compounds on the refreshed content', () => {
   it('fill_document_field operates on the refreshed document, not the pre-refresh original', async () => {
     await saveDocumentImpl(
-      { path: writeInboxFile('report.docx', buildDocxWithTables([[['Name:', 'orig1'], ['Date:', 'orig2']]])) },
+      {
+        path: writeInboxFile(
+          'report.docx',
+          buildDocxWithTables([
+            [
+              ['Name:', 'orig1'],
+              ['Date:', 'orig2'],
+            ],
+          ]),
+        ),
+      },
       opts(),
     );
 
@@ -1508,7 +1755,7 @@ describe('save_document — refresh, a second fill afterward compounds on the re
 });
 
 describe('save_document — refresh, source file type differs from the original', () => {
-  it('changes the raw file\'s extension, updates the raw-file frontmatter pointer, and snapshots the old-extension file', async () => {
+  it("changes the raw file's extension, updates the raw-file frontmatter pointer, and snapshots the old-extension file", async () => {
     const originalPdfBytes = buildMinimalPdf('Original PDF text');
     await saveDocumentImpl({ path: writeInboxFile('report.pdf', originalPdfBytes) }, opts());
     expect(fs.existsSync(path.join(baseDir, 'memory', 'documents', 'files', 'report.pdf'))).toBe(true);
@@ -1595,8 +1842,8 @@ describe('save_document — refresh, rollback on partial failure inside the crit
   });
 });
 
-describe('save_document — refresh preserves the original document\'s source-filename/description/heading', () => {
-  it('does not overwrite them with the refresh source\'s own (often machine-generated) filename', async () => {
+describe("save_document — refresh preserves the original document's source-filename/description/heading", () => {
+  it("does not overwrite them with the refresh source's own (often machine-generated) filename", async () => {
     await saveDocumentImpl({ path: writeInboxFile('Quarterly Report.docx', buildDocx(['Original content'])) }, opts());
 
     fs.mkdirSync(path.join(inboxDir, 'msg2'), { recursive: true });
@@ -1862,7 +2109,7 @@ describe('fill_document_field — document resolution', () => {
 // ---------------------------------------------------------------------------
 
 describe('fill_document_field — docx happy path', () => {
-  it('fills the row\'s last cell by default, leaving everything else byte-identical', async () => {
+  it("fills the row's last cell by default, leaving everything else byte-identical", async () => {
     const original = buildDocxWithTables([
       [
         ['a1', 'b1'],
@@ -2096,7 +2343,7 @@ describe('fill_document_field — docx text-line, underscore run fragmented acro
 });
 
 describe('fill_document_field — docx text-line, trailing-colon blank (no underscores)', () => {
-  it('inserts a new run right after the paragraph\'s last existing run', async () => {
+  it("inserts a new run right after the paragraph's last existing run", async () => {
     const original = buildDocxRawBody([bodyParagraphXml('תאריך:'), bodyParagraphXml('Untouched paragraph.')]);
     const filePath = writeInboxFile('intake.docx', original);
     await saveDocumentImpl({ path: filePath }, opts());
@@ -2210,10 +2457,7 @@ describe('fill_document_field — docx, column given without row/table', () => {
     const filePath = writeInboxFile('intake.docx', buildDocx(['שם: ___________']));
     await saveDocumentImpl({ path: filePath }, opts());
 
-    const result = await fillDocumentFieldImpl(
-      { document: 'intake', column: 2, lineNumber: 1, value: 'X' },
-      opts(),
-    );
+    const result = await fillDocumentFieldImpl({ document: 'intake', column: 2, lineNumber: 1, value: 'X' }, opts());
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain('column');
     expect(result.content[0].text).toContain('row');
@@ -2253,10 +2497,7 @@ describe('fill_document_field — docx text-line, two blanks in one paragraph', 
 
 describe('fill_document_field — docx text-line, purely decorative underscore divider', () => {
   it('is never offered as a fill target (no label text once underscores are stripped)', async () => {
-    const filePath = writeInboxFile(
-      'intake.docx',
-      buildDocx(['_____________________________', 'שם: ___________']),
-    );
+    const filePath = writeInboxFile('intake.docx', buildDocx(['_____________________________', 'שם: ___________']));
     await saveDocumentImpl({ path: filePath }, opts());
 
     const result = await fillDocumentFieldImpl({ document: 'intake' }, opts());
@@ -2601,13 +2842,12 @@ async function getPageContentsText(page: any): Promise<string> {
   const { PDFArray, PDFRawStream, decodePDFRawStream } = await import('pdf-lib');
   const contents = page.node.Contents();
   if (!contents) return '';
-  const streams = contents instanceof PDFArray
-    ? // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (Array.from({ length: contents.size() }, (_, i) => contents.lookup(i, PDFRawStream)) as any[])
-    : [contents];
-  return streams
-    .map((s) => Buffer.from(decodePDFRawStream(s).decode()).toString('latin1'))
-    .join('\n');
+  const streams =
+    contents instanceof PDFArray
+      ? // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (Array.from({ length: contents.size() }, (_, i) => contents.lookup(i, PDFRawStream)) as any[])
+      : [contents];
+  return streams.map((s) => Buffer.from(decodePDFRawStream(s).decode()).toString('latin1')).join('\n');
 }
 
 function extractCmMatrices(text: string): number[][] {
@@ -2740,17 +2980,157 @@ describe('fill_document_field — wrong-file-type arguments', () => {
   });
 });
 
-// --- 5. Merged-cell (gridSpan) detect-and-decline ---------------------------
+// --- 5. Merged-cell (gridSpan) visual-column targeting -----------------------
+//
+// gridSpanRowXml(): cell 1 has gridSpan=2 (occupies visual columns 1-2,
+// text "merged"), cell 2 is ordinary (visual column 3, text "c3"). Raw
+// <w:tc> count is 2; total visual width is 3.
 
-describe('fill_document_field — docx, merged cell (gridSpan)', () => {
-  it('declines cleanly instead of miscounting the visual column', async () => {
+function threeGridSpanCellsRowXml(): string {
+  return (
+    '<w:tr>' +
+    '<w:tc><w:tcPr><w:gridSpan w:val="2"/></w:tcPr><w:p><w:r><w:t xml:space="preserve">a</w:t></w:r></w:p></w:tc>' +
+    '<w:tc><w:tcPr><w:gridSpan w:val="2"/></w:tcPr><w:p><w:r><w:t xml:space="preserve">b</w:t></w:r></w:p></w:tc>' +
+    '<w:tc><w:p><w:r><w:t xml:space="preserve">c</w:t></w:r></w:p></w:tc>' +
+    '</w:tr>'
+  );
+}
+
+function malformedGridSpanRowXml(gridSpanVal: string): string {
+  return (
+    '<w:tr>' +
+    `<w:tc><w:tcPr><w:gridSpan w:val="${gridSpanVal}"/></w:tcPr>` +
+    '<w:p><w:r><w:t xml:space="preserve">first</w:t></w:r></w:p></w:tc>' +
+    '<w:tc><w:p><w:r><w:t xml:space="preserve">second</w:t></w:r></w:p></w:tc>' +
+    '</w:tr>'
+  );
+}
+
+describe('fill_document_field — docx, merged cell (gridSpan) visual-column targeting', () => {
+  it('targets the merged cell when the requested column falls inside its span', async () => {
     const filePath = writeInboxFile('report.docx', buildDocxWithRawTable(gridSpanRowXml()));
     await saveDocumentImpl({ path: filePath }, opts());
 
     const result = await fillDocumentFieldImpl({ document: 'report', row: 1, column: 2, value: 'X' }, opts());
+    expect(result.isError).toBeFalsy();
+
+    const outPath = extractOutPath(result.content[0].text);
+    const newXml = await readDocxXml(fs.readFileSync(outPath));
+    const text = docxXmlToText(newXml);
+    expect(text).toContain('X');
+    expect(text).not.toContain('merged');
+    expect(text).toContain('c3'); // the ordinary cell after the span is untouched
+  });
+
+  it('targets the ordinary cell after a merged span when the requested column falls there', async () => {
+    const filePath = writeInboxFile('report.docx', buildDocxWithRawTable(gridSpanRowXml()));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, column: 3, value: 'X' }, opts());
+    expect(result.isError).toBeFalsy();
+
+    const outPath = extractOutPath(result.content[0].text);
+    const newXml = await readDocxXml(fs.readFileSync(outPath));
+    const text = docxXmlToText(newXml);
+    expect(text).toContain('X');
+    expect(text).not.toContain('c3');
+    expect(text).toContain('merged'); // the merged cell is untouched
+  });
+
+  it("errors in visual-column terms, not raw <w:tc> count, when the column is beyond the row's visual width", async () => {
+    const filePath = writeInboxFile('report.docx', buildDocxWithRawTable(gridSpanRowXml()));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    // Raw <w:tc> count is 2; total visual width is 3 (span-2 + span-1).
+    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, column: 4, value: 'X' }, opts());
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain('merged cell');
+    expect(result.content[0].text).toContain('3 visual column(s)');
+    expect(result.content[0].text).not.toContain('2 cell(s)');
     expect(fs.existsSync(path.join(baseDir, '.document-fills'))).toBe(false);
+  });
+
+  it('resolves correctly across multiple gridSpan cells in one row', async () => {
+    const filePath = writeInboxFile('report.docx', buildDocxWithRawTable(threeGridSpanCellsRowXml()));
+    await saveDocumentImpl({ path: filePath }, opts());
+    // Visual layout: cell "a" spans cols 1-2, cell "b" spans cols 3-4, cell "c" is col 5.
+
+    const resultA = await fillDocumentFieldImpl({ document: 'report', row: 1, column: 1, value: 'X' }, opts());
+    expect(docxXmlToText(await readDocxXml(fs.readFileSync(extractOutPath(resultA.content[0].text))))).toBe('X\nb\nc');
+
+    const resultB = await fillDocumentFieldImpl({ document: 'report', row: 1, column: 4, value: 'X' }, opts());
+    expect(docxXmlToText(await readDocxXml(fs.readFileSync(extractOutPath(resultB.content[0].text))))).toBe('a\nX\nc');
+
+    const resultC = await fillDocumentFieldImpl({ document: 'report', row: 1, column: 5, value: 'X' }, opts());
+    expect(docxXmlToText(await readDocxXml(fs.readFileSync(extractOutPath(resultC.content[0].text))))).toBe('a\nb\nX');
+  });
+
+  it('treats a malformed/unparseable gridSpan value defensively as span 1 rather than crashing', async () => {
+    const filePath = writeInboxFile('report.docx', buildDocxWithRawTable(malformedGridSpanRowXml('not-a-number')));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    // Treated as span 1 -> visual layout is just [first, second], column 2 hits "second".
+    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, column: 2, value: 'X' }, opts());
+    expect(result.isError).toBeFalsy();
+    const text = docxXmlToText(await readDocxXml(fs.readFileSync(extractOutPath(result.content[0].text))));
+    expect(text).toBe('first\nX');
+  });
+
+  it('treats a zero gridSpan value defensively as span 1', async () => {
+    const filePath = writeInboxFile('report.docx', buildDocxWithRawTable(malformedGridSpanRowXml('0')));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, column: 1, value: 'X' }, opts());
+    expect(result.isError).toBeFalsy();
+    const text = docxXmlToText(await readDocxXml(fs.readFileSync(extractOutPath(result.content[0].text))));
+    expect(text).toBe('X\nsecond');
+  });
+
+  it('leaves an unmerged row unaffected (regression safety)', async () => {
+    // No gridSpan anywhere in this row — visual columns == raw <w:tc> position,
+    // exactly as before merged-cell support existed.
+    const filePath = writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1', 'c1']]]));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, column: 2, value: 'X' }, opts());
+    expect(result.isError).toBeFalsy();
+    const text = docxXmlToText(await readDocxXml(fs.readFileSync(extractOutPath(result.content[0].text))));
+    expect(text).toBe('a1\nX\nc1');
+  });
+});
+
+// --- 5b. Non-"w:"-prefixed namespace binding --------------------------------
+
+describe('fill_document_field — docx, non-"w:" OOXML namespace prefix', () => {
+  it('names the real cause instead of the generic "no tables" message, on the row-targeting path', async () => {
+    const filePath = writeInboxFile('report.docx', buildDocxWithRawTableNonWPrefix(rowXml(['Name', ''])));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, value: 'X' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('ns0:');
+    expect(result.content[0].text).toContain('"w:"');
+    // Not the plain, misleading "genuinely no tables" message.
+    expect(result.content[0].text).not.toBe('This document has no tables to fill.');
+  });
+
+  it('names the real cause instead of the generic "no tables" message, on the bare-discovery path', async () => {
+    const filePath = writeInboxFile('report.docx', buildDocxWithRawTableNonWPrefix(rowXml(['Name', ''])));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'report' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('ns0:');
+    expect(result.content[0].text).toContain('"w:"');
+  });
+
+  it('still reports the plain "no tables" message for a genuinely table-less, standard-"w:" document', async () => {
+    const filePath = writeInboxFile('report.docx', buildDocx(['Just a plain paragraph, no table here.']));
+    await saveDocumentImpl({ path: filePath }, opts());
+
+    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, value: 'X' }, opts());
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('This document has no tables to fill.');
+    expect(result.content[0].text).not.toContain('prefix');
   });
 });
 
@@ -3016,6 +3396,46 @@ describe.skipIf(!SOFFICE_AVAILABLE)('save_document / fill_document_field — .do
     }
   });
 
+  // Simulates a genuine JS-level throw landing between "scratch dir claimed"
+  // (convertDocToDocx has already run real LibreOffice and produced a valid
+  // converted .docx in the scratch dir) and fillDoc's `finally` cleanup
+  // running — the gap deferred-work.md flagged: only the happy path and
+  // synchronous-failure paths (soffice missing, malformed input, etc. — all
+  // of which return an err() *before* any throw) were previously covered.
+  // Forced here by pre-creating `.document-fills` as a plain file instead of
+  // a directory, so writeFillOutput's own fs.mkdirSync (called only after a
+  // real, successful conversion) throws EEXIST uncaught — a realistic
+  // disk/permission-shaped failure, not a contrived one. A real out-of-process
+  // crash (OOM, host restart) can't be simulated in-process at all; os.tmpdir()
+  // placement (see fillDoc's own comment) is what bounds *that* case's blast
+  // radius, not this test.
+  it('still cleans up the scratch dir via finally when a throw happens after a real conversion succeeds', async () => {
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'doc-fixture-'));
+    try {
+      const docBytes = buildDocViaSoffice(work, ['Name: ___________']);
+      const filePath = writeInboxFile('intake.doc', docBytes);
+      await saveDocumentImpl({ path: filePath }, opts());
+
+      // Blocks writeFillOutput's fs.mkdirSync(dir, { recursive: true }) with
+      // an uncaught EEXIST — this only fires *after* convertDocToDocx has
+      // already succeeded and fillDocx has already parsed/edited the real
+      // converted .docx, i.e. strictly between scratch-dir-claim and finally.
+      fs.writeFileSync(path.join(baseDir, '.document-fills'), 'blocking file, not a directory');
+
+      const before = conversionScratchLeftoverCount();
+      const result = await fillDocumentFieldImpl({ document: 'intake', lineNumber: 1, value: 'Ada Lovelace' }, opts());
+
+      // fillDocumentFieldImpl's own outer try/catch converts the throw into
+      // an err() result rather than propagating it — the thing under test
+      // here is that the scratch dir doesn't leak despite the throw, not the
+      // exact shape of the resulting error.
+      expect(result.isError).toBe(true);
+      expect(conversionScratchLeftoverCount()).toBe(before);
+    } finally {
+      fs.rmSync(work, { recursive: true, force: true });
+    }
+  });
+
   it('reuses the real (unmodified) fillDocx table dispatch after conversion — no table present, so it declines with the same "no tables" error', async () => {
     const work = fs.mkdtempSync(path.join(os.tmpdir(), 'doc-fixture-'));
     try {
@@ -3133,9 +3553,7 @@ describe('save_signature — happy path', () => {
     const result = await saveSignatureImpl({ path: filePath, name: 'threshold-test' }, opts());
     expect(result.isError).toBeFalsy();
 
-    const decoded = PNG.sync.read(
-      fs.readFileSync(path.join(baseDir, 'memory', 'signatures', 'threshold-test.png')),
-    );
+    const decoded = PNG.sync.read(fs.readFileSync(path.join(baseDir, 'memory', 'signatures', 'threshold-test.png')));
     // Bounding box crops out the now-transparent near-white pixel at x=0,
     // leaving just the two surviving pixels (the borderline-dark one and ink).
     expect(decoded.width).toBe(2);
@@ -3273,9 +3691,7 @@ describe('save_signature — name collision', () => {
     expect(r2.content[0].text).toContain('uriel-2');
 
     // Original untouched, second written alongside it under the suffixed name.
-    expect(fs.readFileSync(path.join(baseDir, 'memory', 'signatures', 'uriel.png')).equals(originalBytes)).toBe(
-      true,
-    );
+    expect(fs.readFileSync(path.join(baseDir, 'memory', 'signatures', 'uriel.png')).equals(originalBytes)).toBe(true);
     expect(fs.existsSync(path.join(baseDir, 'memory', 'signatures', 'uriel-2.png'))).toBe(true);
   });
 
@@ -3408,7 +3824,7 @@ describe('save_signature — sequential same-group saves (not a genuine race)', 
 });
 
 describe('save_signature — EEXIST retry path (writeSignaturePng), genuinely forced', () => {
-  it('recovers from a real EEXIST on the wx write (not just uniqueName\'s up-front check) and completes on retry', async () => {
+  it("recovers from a real EEXIST on the wx write (not just uniqueName's up-front check) and completes on retry", async () => {
     const signaturesDir = path.join(baseDir, 'memory', 'signatures');
     fs.mkdirSync(signaturesDir, { recursive: true });
     // Base name already taken, so uniqueName's first legitimate candidate is "uriel-2".
@@ -3487,7 +3903,10 @@ describe('fill_document_field — PDF, signature stamped into AcroForm field', (
     // 2:1 aspect ratio source image.
     writeSavedSignature('uriel', buildSignaturePng({ width: 100, height: 50, ink: { x: 10, y: 10, w: 80, h: 30 } }));
 
-    const result = await fillDocumentFieldImpl({ document: 'form', fieldName: 'Signature', signatureName: 'uriel' }, opts());
+    const result = await fillDocumentFieldImpl(
+      { document: 'form', fieldName: 'Signature', signatureName: 'uriel' },
+      opts(),
+    );
     expect(result.isError).toBeFalsy();
     expect(result.content[0].text).toContain('field text left unset');
 
@@ -3529,7 +3948,7 @@ describe('fill_document_field — PDF, signature stamped into AcroForm field', (
     expect(draw.height).toBeLessThanOrEqual(rect.height + 0.01);
   });
 
-  it('draws text beside the image, at the image\'s own bottom, when value is also given', async () => {
+  it("draws text beside the image, at the image's own bottom, when value is also given", async () => {
     const pdfBytes = await buildAcroFormPdf('Signature');
     const filePath = writeInboxFile('form.pdf', pdfBytes);
     await saveDocumentImpl({ path: filePath }, opts());
@@ -3654,7 +4073,10 @@ describe('fill_document_field — PDF, AcroForm signature stamp against a non-te
     await saveDocumentImpl({ path: filePath, extractedText: 'A form with a checkbox.' }, opts());
     writeSavedSignature('uriel', buildSignaturePng({ width: 40, height: 20, ink: { x: 5, y: 5, w: 20, h: 10 } }));
 
-    const result = await fillDocumentFieldImpl({ document: 'form', fieldName: 'Agree', signatureName: 'uriel' }, opts());
+    const result = await fillDocumentFieldImpl(
+      { document: 'form', fieldName: 'Agree', signatureName: 'uriel' },
+      opts(),
+    );
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain('Agree');
     expect(result.content[0].text).toContain("isn't a fillable text field");
@@ -3664,8 +4086,14 @@ describe('fill_document_field — PDF, AcroForm signature stamp against a non-te
   it('declines cleanly for a text field with more than one widget', async () => {
     const pdfBytes = await buildAcroFormPdfWithTwoWidgets('Signature');
     const filePath = writeInboxFile('form.pdf', pdfBytes);
+    // Both pages carry only a form-field widget, no drawn text — each needs
+    // OCR under save_document's per-page routing. A non-empty mock OCR
+    // result lets both resolve without an Ask-First halt, so a single call
+    // (unlike the old page-1-only flow's fixed two-call pattern) completes
+    // the save; this test is about fill_document_field's own widget-count
+    // check downstream, not save_document's extraction path.
+    mockOcrResult = { text: 'A form with a two-widget field.' };
     await saveDocumentImpl({ path: filePath }, opts());
-    await saveDocumentImpl({ path: filePath, extractedText: 'A form with a two-widget field.' }, opts());
     writeSavedSignature('uriel', buildSignaturePng({ width: 40, height: 20, ink: { x: 5, y: 5, w: 20, h: 10 } }));
 
     const result = await fillDocumentFieldImpl(
@@ -3683,8 +4111,14 @@ describe('fill_document_field — PDF, AcroForm signature stamp, multi-page widg
   it('stamps on the page the widget is actually on (page 2), via the /P fast path', async () => {
     const pdfBytes = await buildMultiPageAcroFormPdf('Signature');
     const filePath = writeInboxFile('form.pdf', pdfBytes);
+    // Neither page has drawn text (page 1 is deliberately blank; page 2's
+    // form-field widget draws nothing to the content stream either) — both
+    // need OCR under save_document's per-page routing. A non-empty mock OCR
+    // result resolves both without an Ask-First halt, so one call completes
+    // the save; this test is about fill_document_field's own widget->page
+    // resolution downstream, not save_document's extraction path.
+    mockOcrResult = { text: 'A two-page form, field on page 2.' };
     await saveDocumentImpl({ path: filePath }, opts());
-    await saveDocumentImpl({ path: filePath, extractedText: 'A two-page form, field on page 2.' }, opts());
     writeSavedSignature('uriel', buildSignaturePng({ width: 100, height: 50, ink: { x: 10, y: 10, w: 80, h: 30 } }));
 
     const result = await fillDocumentFieldImpl(
@@ -3710,8 +4144,11 @@ describe('fill_document_field — PDF, AcroForm signature stamp, multi-page widg
   it('stamps on the correct page via the /Annots-scan fallback when /P is stripped', async () => {
     const pdfBytes = await buildMultiPageAcroFormPdf('Signature', { stripP: true });
     const filePath = writeInboxFile('form.pdf', pdfBytes);
+    // See the sibling /P-fast-path test above — neither page has drawn
+    // text, so both need OCR; a non-empty mock result resolves both in one
+    // save_document call.
+    mockOcrResult = { text: 'A two-page form, field on page 2, /P stripped.' };
     await saveDocumentImpl({ path: filePath }, opts());
-    await saveDocumentImpl({ path: filePath, extractedText: 'A two-page form, field on page 2, /P stripped.' }, opts());
     writeSavedSignature('uriel', buildSignaturePng({ width: 100, height: 50, ink: { x: 10, y: 10, w: 80, h: 30 } }));
 
     const result = await fillDocumentFieldImpl(
@@ -3760,8 +4197,10 @@ describe('fill_document_field — PDF, AcroForm signature stamp, malformed /Anno
 
     const pdfBytes = Buffer.from(await pdfDoc.save());
     const filePath = writeInboxFile('form.pdf', pdfBytes);
+    // Neither page has drawn text — both need OCR under save_document's
+    // per-page routing; a non-empty mock result resolves both in one call.
+    mockOcrResult = { text: 'A two-page form with a malformed Annots entry.' };
     await saveDocumentImpl({ path: filePath }, opts());
-    await saveDocumentImpl({ path: filePath, extractedText: 'A two-page form with a malformed Annots entry.' }, opts());
     writeSavedSignature('uriel', buildSignaturePng({ width: 100, height: 50, ink: { x: 10, y: 10, w: 80, h: 30 } }));
 
     const result = await fillDocumentFieldImpl(
@@ -3821,7 +4260,10 @@ describe('fill_document_field — PDF scanned pixel, signature stamp', () => {
     // page — less than SIGNATURE_MAX_HEIGHT_PT (45), which the off-page
     // bounding-box check (rightly) declines. pixelY=140 -> pdfY=130, 70pt
     // of headroom, comfortably fits.
-    const result = await fillDocumentFieldImpl({ document: 'scan', pixelX: 40, pixelY: 140, signatureName: 'uriel' }, opts());
+    const result = await fillDocumentFieldImpl(
+      { document: 'scan', pixelX: 40, pixelY: 140, signatureName: 'uriel' },
+      opts(),
+    );
     expect(result.isError).toBeFalsy();
 
     const outPath = extractOutPath(result.content[0].text);
@@ -3928,7 +4370,10 @@ describe('fill_document_field — .docx signature stamping, table cell target', 
     await saveDocumentImpl({ path: filePath }, opts());
     writeSavedSignature('uriel', buildSignaturePng({ width: 100, height: 50, ink: { x: 10, y: 10, w: 80, h: 30 } }));
 
-    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, column: 2, signatureName: 'uriel' }, opts());
+    const result = await fillDocumentFieldImpl(
+      { document: 'report', row: 1, column: 2, signatureName: 'uriel' },
+      opts(),
+    );
     expect(result.isError).toBeFalsy();
     expect(result.content[0].text).toContain('New file at ');
     expect(result.content[0].text).toContain('table 1, row 1, column 2');
@@ -3945,9 +4390,8 @@ describe('fill_document_field — .docx signature stamping, table cell target', 
     expect(docxXmlToText(docXml)).toContain('John Doe');
 
     const relsXml = await zip.file('word/_rels/document.xml.rels')!.async('string');
-    const relMatch = /<Relationship Id="rId(\d+)" Type="[^"]*\/relationships\/image" Target="media\/(image\d+\.png)"\/>/.exec(
-      relsXml,
-    );
+    const relMatch =
+      /<Relationship Id="rId(\d+)" Type="[^"]*\/relationships\/image" Target="media\/(image\d+\.png)"\/>/.exec(relsXml);
     expect(relMatch).not.toBeNull();
     const [, relId, mediaTarget] = relMatch!;
     expect(docXml).toContain(`r:embed="rId${relId}"`);
@@ -4076,7 +4520,10 @@ describe('fill_document_field — .docx signature stamping, target cell already 
     await saveDocumentImpl({ path: filePath }, opts());
     writeSavedSignature('uriel', buildSignaturePng({ width: 100, height: 50, ink: { x: 10, y: 10, w: 80, h: 30 } }));
 
-    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, column: 2, signatureName: 'uriel' }, opts());
+    const result = await fillDocumentFieldImpl(
+      { document: 'report', row: 1, column: 2, signatureName: 'uriel' },
+      opts(),
+    );
     expect(result.isError).toBeFalsy();
 
     const outPath = extractOutPath(result.content[0].text);
@@ -4175,14 +4622,45 @@ describe('fill_document_field — .docx signature stamping, degenerate signature
 });
 
 describe('fill_document_field — .docx signature stamping, existing decline conditions still apply', () => {
-  it('declines a gridSpan row exactly as it would for a plain value fill, before any image branch is reached', async () => {
+  it('stamps into the correct visual column of a gridSpan row, the same resolution the value-fill path uses', async () => {
     const filePath = writeInboxFile('report.docx', buildDocxWithRawTable(gridSpanRowXml()));
     await saveDocumentImpl({ path: filePath }, opts());
     writeSavedSignature('uriel', buildSignaturePng({ width: 40, height: 20, ink: { x: 5, y: 5, w: 20, h: 10 } }));
 
-    const result = await fillDocumentFieldImpl({ document: 'report', row: 1, signatureName: 'uriel' }, opts());
+    // column 2 falls inside the gridSpan=2 "merged" cell (visual cols 1-2).
+    const result = await fillDocumentFieldImpl(
+      { document: 'report', row: 1, column: 2, signatureName: 'uriel' },
+      opts(),
+    );
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('table 1, row 1, column 2');
+
+    const outPath = extractOutPath(result.content[0].text);
+    const zip = await loadDocxZip(fs.readFileSync(outPath));
+    const docXml = await zip.file('word/document.xml')!.async('string');
+    expect(docXml).toContain('<w:drawing>');
+    // Existing cell text is untouched — an inserted run, never a replacement.
+    expect(docxXmlToText(docXml)).toContain('merged');
+    expect(docxXmlToText(docXml)).toContain('c3');
+  });
+
+  it('still declines a gridSpan row when the target cell contains a nested table', async () => {
+    const rowXml =
+      '<w:tr>' +
+      '<w:tc><w:tcPr><w:gridSpan w:val="2"/></w:tcPr><w:p><w:r><w:t xml:space="preserve">a</w:t></w:r></w:p></w:tc>' +
+      `<w:tc>${tableXml([['nested-a', 'nested-b']])}</w:tc>` +
+      '</w:tr>';
+    const filePath = writeInboxFile('report.docx', buildDocxWithRawTable(rowXml));
+    await saveDocumentImpl({ path: filePath }, opts());
+    writeSavedSignature('uriel', buildSignaturePng({ width: 40, height: 20, ink: { x: 5, y: 5, w: 20, h: 10 } }));
+
+    // column 3 resolves to the second <w:tc>, which contains a nested table.
+    const result = await fillDocumentFieldImpl(
+      { document: 'report', row: 1, column: 3, signatureName: 'uriel' },
+      opts(),
+    );
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain('gridSpan');
+    expect(result.content[0].text).toContain('nested table');
     expect(fs.existsSync(path.join(baseDir, '.document-fills'))).toBe(false);
   });
 
@@ -4215,29 +4693,35 @@ describe('fill_document_field — .docx signature stamping, stored canonical cop
   });
 });
 
-describe.skipIf(!SOFFICE_AVAILABLE)('fill_document_field — .doc signature stamping (via the unmodified conversion delegation)', () => {
-  it('stamps the signature into the converted .docx and discloses the .doc-origin note', async () => {
-    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'doc-signature-test-'));
-    try {
-      const docBuf = buildDocViaSoffice(work, ['Name: ______']);
-      const filePath = writeInboxFile('form.doc', docBuf);
-      await saveDocumentImpl({ path: filePath }, opts());
-      writeSavedSignature('uriel', buildSignaturePng({ width: 100, height: 50, ink: { x: 10, y: 10, w: 80, h: 30 } }));
+describe.skipIf(!SOFFICE_AVAILABLE)(
+  'fill_document_field — .doc signature stamping (via the unmodified conversion delegation)',
+  () => {
+    it('stamps the signature into the converted .docx and discloses the .doc-origin note', async () => {
+      const work = fs.mkdtempSync(path.join(os.tmpdir(), 'doc-signature-test-'));
+      try {
+        const docBuf = buildDocViaSoffice(work, ['Name: ______']);
+        const filePath = writeInboxFile('form.doc', docBuf);
+        await saveDocumentImpl({ path: filePath }, opts());
+        writeSavedSignature(
+          'uriel',
+          buildSignaturePng({ width: 100, height: 50, ink: { x: 10, y: 10, w: 80, h: 30 } }),
+        );
 
-      const result = await fillDocumentFieldImpl({ document: 'form', lineNumber: 1, signatureName: 'uriel' }, opts());
-      expect(result.isError).toBeFalsy();
-      expect(result.content[0].text).toContain('legacy .doc file');
-      expect(result.content[0].text).toContain('.docx, not a');
+        const result = await fillDocumentFieldImpl({ document: 'form', lineNumber: 1, signatureName: 'uriel' }, opts());
+        expect(result.isError).toBeFalsy();
+        expect(result.content[0].text).toContain('legacy .doc file');
+        expect(result.content[0].text).toContain('.docx, not a');
 
-      const outPath = extractOutPath(result.content[0].text);
-      expect(outPath.endsWith('.docx')).toBe(true);
-      const newXml = await readDocxXml(fs.readFileSync(outPath));
-      expect(newXml).toContain('<w:drawing>');
-    } finally {
-      fs.rmSync(work, { recursive: true, force: true });
-    }
-  });
-});
+        const outPath = extractOutPath(result.content[0].text);
+        expect(outPath.endsWith('.docx')).toBe(true);
+        const newXml = await readDocxXml(fs.readFileSync(outPath));
+        expect(newXml).toContain('<w:drawing>');
+      } finally {
+        fs.rmSync(work, { recursive: true, force: true });
+      }
+    });
+  },
+);
 
 describe('fill_document_field — PDF, no target given, signatureName present', () => {
   it('returns the identical discovery response the text-only path already returns', async () => {
@@ -4350,7 +4834,10 @@ describe('fill_document_field_batch — mixed success/failure across the batch',
   it('fills the existing document, names the missing one as a per-item failure, no batch abort', async () => {
     await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
 
-    const result = await fillDocumentFieldBatchImpl({ documents: ['report', 'missing-doc'], row: 1, value: 'X' }, opts());
+    const result = await fillDocumentFieldBatchImpl(
+      { documents: ['report', 'missing-doc'], row: 1, value: 'X' },
+      opts(),
+    );
     expect(result.isError).toBeFalsy();
     const text = result.content[0].text;
     expect(text).toContain('1/2 succeeded');
@@ -4406,7 +4893,7 @@ describe('fill_document_field_batch — neither or both of documents/matchQuery 
   });
 });
 
-describe('fill_document_field_batch — targeting args do not apply to one document\'s file type', () => {
+describe("fill_document_field_batch — targeting args do not apply to one document's file type", () => {
   it('reports that document as a per-item failure with the existing validation error text; others unaffected', async () => {
     await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
 
@@ -4471,10 +4958,7 @@ describe('fill_document_field_batch — signatureName is not supported', () => {
     await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
     writeSavedSignature('uriel', buildSignaturePng({ width: 20, height: 10, ink: { x: 2, y: 2, w: 10, h: 5 } }));
 
-    const result = await fillDocumentFieldBatchImpl(
-      { documents: ['report'], row: 1, signatureName: 'uriel' },
-      opts(),
-    );
+    const result = await fillDocumentFieldBatchImpl({ documents: ['report'], row: 1, signatureName: 'uriel' }, opts());
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain('signatureName is not supported by fill_document_field_batch');
     expect(fs.existsSync(path.join(baseDir, '.document-fills'))).toBe(false);
@@ -4493,7 +4977,10 @@ describe('fill_document_field_batch — duplicate documents[] entries resolving 
   });
 
   it('also dedupes when two different query strings resolve to the same document', async () => {
-    await saveDocumentImpl({ path: writeInboxFile('quarterly-report.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
+    await saveDocumentImpl(
+      { path: writeInboxFile('quarterly-report.docx', buildDocxWithTables([[['a1', 'b1']]])) },
+      opts(),
+    );
 
     const result = await fillDocumentFieldBatchImpl(
       { documents: ['quarterly-report', 'report'], row: 1, value: 'X' },
@@ -4561,7 +5048,10 @@ describe('fill_document_field_batch — resolveBatchTargets input-shape validati
 
 describe('fill_document_field_batch — every documents[] entry fails to resolve', () => {
   it('is a soft 0/N report, not a whole-call error', async () => {
-    const result = await fillDocumentFieldBatchImpl({ documents: ['missing-a', 'missing-b'], row: 1, value: 'X' }, opts());
+    const result = await fillDocumentFieldBatchImpl(
+      { documents: ['missing-a', 'missing-b'], row: 1, value: 'X' },
+      opts(),
+    );
     expect(result.isError).toBeFalsy();
     const text = result.content[0].text;
     expect(text).toContain('0/2 succeeded');
@@ -4758,7 +5248,10 @@ describe('list_document_versions — a batch fill completes', () => {
     await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
     await saveDocumentImpl({ path: writeInboxFile('letter.docx', buildDocxWithTables([[['c1', 'd1']]])) }, opts());
 
-    const batchResult = await fillDocumentFieldBatchImpl({ documents: ['report', 'letter'], row: 1, value: 'X' }, opts());
+    const batchResult = await fillDocumentFieldBatchImpl(
+      { documents: ['report', 'letter'], row: 1, value: 'X' },
+      opts(),
+    );
     expect(batchResult.isError).toBeFalsy();
     expect(batchResult.content[0].text).toContain('2/2 succeeded');
 
@@ -4786,7 +5279,12 @@ describe('list_document_versions — a discovery/prompt call or per-item batch f
 
   it('a discovery/prompt response within a batch call records nothing for that document', async () => {
     await saveDocumentImpl(
-      { path: writeInboxFile('mixed.docx', buildDocxRawBody([tableXml([['a1', 'b1']]), bodyParagraphXml('שם: ___________')])) },
+      {
+        path: writeInboxFile(
+          'mixed.docx',
+          buildDocxRawBody([tableXml([['a1', 'b1']]), bodyParagraphXml('שם: ___________')]),
+        ),
+      },
       opts(),
     );
 
@@ -4968,5 +5466,315 @@ describe('save_document — refresh racing a concurrent fill of the same documen
     const readRefreshed = filledText.includes('refreshed-a');
     expect(readOriginal || readRefreshed).toBe(true);
     expect(readOriginal && readRefreshed).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// withLock — off-by-one + fencing regressions (deferred-work.md, eval-1-3
+// item)
+//
+// eval/lock.ts's own reimplementation of this exact algorithm found (and
+// fixed) two real correctness bugs, later ported back here. Both are
+// exercised directly against this file's own `withLock`, using the
+// test-only `testOpts` override (retryMs/maxAttempts/staleMs) so the
+// retry-exhaustion and stale-reclaim-on-the-last-attempt paths run
+// deterministically instead of needing a real multi-second wait. Test
+// shapes are inspired by `eval/lock.test.ts`'s own withLock suite, adapted
+// to bun:test and to this file's two independent reclaim paths (dead-pid,
+// then mtime-staleness fallback).
+// ---------------------------------------------------------------------------
+
+describe('withLock — off-by-one and fencing regressions', () => {
+  it('acquires immediately, writes its own pid, runs fn, and removes the lock file afterward', async () => {
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'withlock-test-'));
+    const lockPath = path.join(work, '.test.lock');
+    try {
+      let ran = false;
+      const result = await withLock(lockPath, () => {
+        ran = true;
+        expect(fs.existsSync(lockPath)).toBe(true);
+        expect(fs.readFileSync(lockPath, 'utf-8')).toBe(String(process.pid));
+        return 'ok';
+      });
+
+      expect(ran).toBe(true);
+      expect(result).toBe('ok');
+      expect(fs.existsSync(lockPath)).toBe(false);
+    } finally {
+      fs.rmSync(work, { recursive: true, force: true });
+    }
+  });
+
+  it('still reclaims a dead-pid lock when the reclaim happens on the very last retry attempt (off-by-one regression, pid-liveness path)', async () => {
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'withlock-test-'));
+    const lockPath = path.join(work, '.test.lock');
+    try {
+      // A pid essentially guaranteed not to be alive in this sandbox — the
+      // dead-pid check fires immediately, no mtime backdating/waiting needed.
+      const deadPid = 2 ** 30;
+      fs.writeFileSync(lockPath, String(deadPid), { flag: 'wx' });
+
+      // maxAttempts: 1 — the dead-pid reclaim fires on the loop's one and
+      // only iteration. The pre-fix version's bare `continue` here still
+      // runs the for-loop's own increment, so `attempt` reaches
+      // maxAttempts and the loop exits WITHOUT ever retrying the
+      // exclusive-create — fn() would then run holding no lock at all.
+      let ran = false;
+      const result = await withLock(
+        lockPath,
+        () => {
+          ran = true;
+          expect(fs.existsSync(lockPath)).toBe(true);
+          expect(fs.readFileSync(lockPath, 'utf-8')).toBe(String(process.pid));
+          return 'reclaimed-on-last-attempt';
+        },
+        { retryMs: 2, maxAttempts: 1, staleMs: 30_000 },
+      );
+
+      expect(ran).toBe(true);
+      expect(result).toBe('reclaimed-on-last-attempt');
+      expect(fs.existsSync(lockPath)).toBe(false);
+    } finally {
+      fs.rmSync(work, { recursive: true, force: true });
+    }
+  });
+
+  it('still reclaims a stale (non-pid) lock when the reclaim happens on the very last retry attempt (off-by-one regression, mtime path)', async () => {
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'withlock-test-'));
+    const lockPath = path.join(work, '.test.lock');
+    try {
+      // Non-numeric content (falls through the dead-pid check entirely) plus
+      // a backdated mtime — exercises the second, mtime-based reclaim path.
+      fs.writeFileSync(lockPath, 'not-a-pid', { flag: 'wx' });
+      const old = new Date(Date.now() - 60_000);
+      fs.utimesSync(lockPath, old, old);
+
+      let ran = false;
+      const result = await withLock(
+        lockPath,
+        () => {
+          ran = true;
+          expect(fs.existsSync(lockPath)).toBe(true);
+          expect(fs.readFileSync(lockPath, 'utf-8')).toBe(String(process.pid));
+          return 'reclaimed-on-last-attempt';
+        },
+        { retryMs: 2, maxAttempts: 1, staleMs: 1_000 },
+      );
+
+      expect(ran).toBe(true);
+      expect(result).toBe('reclaimed-on-last-attempt');
+      expect(fs.existsSync(lockPath)).toBe(false);
+    } finally {
+      fs.rmSync(work, { recursive: true, force: true });
+    }
+  });
+
+  it("does not delete a different holder's lock on release (fencing regression)", async () => {
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'withlock-test-'));
+    const lockPath = path.join(work, '.test.lock');
+    try {
+      // Simulates the real failure mode: this call's fn() outlives staleMs,
+      // another process (a different pid/token) reclaims the lock as
+      // abandoned and writes its own token in — all *while our fn() is
+      // still running*. When our fn() finally returns, the pre-fix
+      // version's unconditional unlink would delete that other, still-live
+      // holder's lock. The fix only unlinks if the file still holds the
+      // exact token this call itself wrote.
+      const otherHoldersToken = 'a-different-process-reclaimed-this';
+
+      await withLock(lockPath, () => {
+        expect(fs.readFileSync(lockPath, 'utf-8')).toBe(String(process.pid));
+        fs.writeFileSync(lockPath, otherHoldersToken);
+      });
+
+      expect(fs.existsSync(lockPath)).toBe(true);
+      expect(fs.readFileSync(lockPath, 'utf-8')).toBe(otherHoldersToken);
+    } finally {
+      fs.rmSync(work, { recursive: true, force: true });
+    }
+  });
+
+  it('throws, naming lockPath, after exhausting the retry budget against a live (fresh) lock', async () => {
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'withlock-test-'));
+    const lockPath = path.join(work, '.test.lock');
+    try {
+      fs.writeFileSync(lockPath, String(process.pid), { flag: 'wx' });
+
+      let threw: unknown;
+      try {
+        await withLock(lockPath, () => 'should not run', { retryMs: 2, maxAttempts: 3, staleMs: 30_000 });
+      } catch (e) {
+        threw = e;
+      }
+
+      expect(threw).toBeInstanceOf(Error);
+      expect((threw as Error).message).toContain(lockPath);
+      // Our own live lock is untouched — only a failed acquire attempt's
+      // own bookkeeping should ever be cleaned up, never a real live holder.
+      expect(fs.existsSync(lockPath)).toBe(true);
+      expect(fs.readFileSync(lockPath, 'utf-8')).toBe(String(process.pid));
+    } finally {
+      fs.rmSync(work, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ocrPngText — per-cacheDir download-race lock (deferred-work.md,
+// ocr-fallback item)
+//
+// Two concurrent first-ever OCR calls against the same fresh (not-yet-
+// populated) `.ocr-cache/` dir could otherwise both trigger createWorker's
+// own internal eng.traineddata/heb.traineddata download at once. Verified
+// here without a real network call: the mocked createWorker (module-level
+// mock above) holds "in flight" for `createWorkerDelayMs` and records the
+// real concurrent high-water mark via `maxConcurrentCreateWorkerCalls` — if
+// the lock weren't there, two calls started together would both be in
+// flight at once and that mark would read 2.
+// ---------------------------------------------------------------------------
+
+describe('ocrPngText — concurrent calls against the same cacheDir', () => {
+  it('never runs two createWorker calls concurrently against the same cacheDir', async () => {
+    const cacheDir = path.join(baseDir, '.ocr-cache');
+    createWorkerDelayMs = 20;
+    mockOcrResult = { text: 'ocr text' };
+
+    const [a, b] = await Promise.all([
+      ocrPngText('/fake/page-a.png', { cacheDir }),
+      ocrPngText('/fake/page-b.png', { cacheDir }),
+    ]);
+
+    expect(maxConcurrentCreateWorkerCalls).toBe(1);
+    expect(a).toBe('ocr text');
+    expect(b).toBe('ocr text');
+  });
+
+  it('does not serialize createWorker calls against two different cacheDirs', async () => {
+    createWorkerDelayMs = 20;
+    mockOcrResult = { text: 'ocr text' };
+    const cacheDirA = path.join(baseDir, 'group-a', '.ocr-cache');
+    const cacheDirB = path.join(baseDir, 'group-b', '.ocr-cache');
+    seedOcrCache(cacheDirA);
+    seedOcrCache(cacheDirB);
+
+    const [a, b] = await Promise.all([
+      ocrPngText('/fake/page-a.png', { cacheDir: cacheDirA }),
+      ocrPngText('/fake/page-b.png', { cacheDir: cacheDirB }),
+    ]);
+
+    // Different agent groups' cache dirs are independent locks — no reason
+    // for one group's OCR call to wait on an unrelated group's.
+    expect(maxConcurrentCreateWorkerCalls).toBe(2);
+    expect(a).toBe('ocr text');
+    expect(b).toBe('ocr text');
+  });
+
+  it("one call's createWorker failure never wedges a later call against the same cacheDir", async () => {
+    const cacheDir = path.join(baseDir, '.ocr-cache');
+    createWorkerShouldThrow = 'simulated createWorker failure (e.g. a failed language-data download)';
+
+    await expect(ocrPngText('/fake/page-a.png', { cacheDir })).rejects.toThrow(createWorkerShouldThrow);
+
+    createWorkerShouldThrow = undefined;
+    mockOcrResult = { text: 'recovered' };
+    const result = await ocrPngText('/fake/page-b.png', { cacheDir });
+    expect(result).toBe('recovered');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ensureOcrLangData — checksum-pinned OCR language data (deferred-work.md,
+// ocr-fallback item, resolved 2026-08-28). Never hits the real network or
+// real tesseract.js CDN hashes — a self-contained fake lang + matching
+// hashes, built fresh per test, exercises the same fetch→verify→write logic
+// the real 'eng'/'heb' entries go through.
+// ---------------------------------------------------------------------------
+
+describe('ensureOcrLangData — checksum-pinned OCR language data', () => {
+  function fakeHashes(decompressed: Buffer): Record<string, { gz: string; decompressed: string }> {
+    const gz = zlib.gzipSync(decompressed);
+    return {
+      testlang: {
+        gz: crypto.createHash('sha256').update(gz).digest('hex'),
+        decompressed: crypto.createHash('sha256').update(decompressed).digest('hex'),
+      },
+    };
+  }
+
+  it('fetches, verifies, and writes the file when not yet cached', async () => {
+    const cacheDir = path.join(baseDir, 'fresh-ocr-cache');
+    const content = Buffer.from('real language data contents');
+    const gz = zlib.gzipSync(content);
+    const hashes = fakeHashes(content);
+    const fetchFn = mock(async () => new Response(gz, { status: 200 }));
+
+    await ensureOcrLangData(cacheDir, 'testlang', fetchFn as unknown as typeof fetch, hashes);
+
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+    const written = fs.readFileSync(path.join(cacheDir, 'testlang.traineddata'));
+    expect(written.equals(content)).toBe(true);
+  });
+
+  it('is a no-op (never calls fetch) when the file already exists', async () => {
+    const cacheDir = path.join(baseDir, 'existing-ocr-cache');
+    fs.mkdirSync(cacheDir, { recursive: true });
+    fs.writeFileSync(path.join(cacheDir, 'testlang.traineddata'), 'already here');
+    const fetchFn = mock(async () => new Response(Buffer.from('should never be used'), { status: 200 }));
+
+    await ensureOcrLangData(cacheDir, 'testlang', fetchFn as unknown as typeof fetch, fakeHashes(Buffer.from('x')));
+
+    expect(fetchFn).not.toHaveBeenCalled();
+    expect(fs.readFileSync(path.join(cacheDir, 'testlang.traineddata'), 'utf8')).toBe('already here');
+  });
+
+  it('rejects a download whose gz bytes do not match the pinned hash', async () => {
+    const cacheDir = path.join(baseDir, 'tampered-gz-cache');
+    const pinnedContent = Buffer.from('the real expected content');
+    const hashes = fakeHashes(pinnedContent);
+    // Server returns something else entirely — a compromised/corrupted CDN.
+    const tamperedGz = zlib.gzipSync(Buffer.from('tampered content'));
+    const fetchFn = mock(async () => new Response(tamperedGz, { status: 200 }));
+
+    await expect(ensureOcrLangData(cacheDir, 'testlang', fetchFn as unknown as typeof fetch, hashes)).rejects.toThrow(
+      /integrity check failed/,
+    );
+    expect(fs.existsSync(path.join(cacheDir, 'testlang.traineddata'))).toBe(false);
+  });
+
+  it('rejects when the decompressed content does not match the pinned hash (gz hash matches, decompressed does not)', async () => {
+    const cacheDir = path.join(baseDir, 'tampered-decompressed-cache');
+    const content = Buffer.from('actual content');
+    const gz = zlib.gzipSync(content);
+    const hashes = {
+      testlang: {
+        gz: crypto.createHash('sha256').update(gz).digest('hex'), // correct
+        decompressed: '0'.repeat(64), // deliberately wrong
+      },
+    };
+    const fetchFn = mock(async () => new Response(gz, { status: 200 }));
+
+    await expect(ensureOcrLangData(cacheDir, 'testlang', fetchFn as unknown as typeof fetch, hashes)).rejects.toThrow(
+      /integrity check failed/,
+    );
+    expect(fs.existsSync(path.join(cacheDir, 'testlang.traineddata'))).toBe(false);
+  });
+
+  it('refuses to fetch a language with no pinned checksum', async () => {
+    const cacheDir = path.join(baseDir, 'unpinned-lang-cache');
+    const fetchFn = mock(async () => new Response(Buffer.from('x'), { status: 200 }));
+
+    await expect(ensureOcrLangData(cacheDir, 'unpinned', fetchFn as unknown as typeof fetch, {})).rejects.toThrow(
+      /no pinned checksum/,
+    );
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it('surfaces a non-2xx response as a clear error, not a generic parse failure', async () => {
+    const cacheDir = path.join(baseDir, 'http-error-cache');
+    const fetchFn = mock(async () => new Response('not found', { status: 404 }));
+
+    await expect(
+      ensureOcrLangData(cacheDir, 'testlang', fetchFn as unknown as typeof fetch, fakeHashes(Buffer.from('x'))),
+    ).rejects.toThrow(/HTTP 404/);
   });
 });

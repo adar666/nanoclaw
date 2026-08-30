@@ -41,7 +41,18 @@ export function getTaskSeriesId(): string | null {
  */
 const EVAL_THREAD_PREFIX = 'system:eval';
 
-/** True iff this is an isolated eval-harness session (no attached chat). */
+/**
+ * True iff this is an isolated eval-harness session (no attached chat).
+ *
+ * The single canonical "is this an eval run" check for this whole process —
+ * `index.ts` calls it directly to pick `SessionMode` for the system prompt,
+ * and `formatter.ts`'s `extractRouting()` calls it for `RoutingContext.evalRun`
+ * (the dispatch/auto-log bypass signal) instead of re-deriving its own
+ * message-kind-based answer. Consolidated here (deferred-work.md finding,
+ * spec-eval-session-output-capture.md) specifically because this function's
+ * signal — the session's own thread id, set once by `eval/session.ts`'s
+ * `resolveEvalSession` — can't drift the way a per-message `kind` tag could.
+ */
 export function isEvalThread(): boolean {
   const threadId = getSessionRouting().thread_id;
   return threadId === EVAL_THREAD_PREFIX || (threadId?.startsWith(`${EVAL_THREAD_PREFIX}:`) ?? false);

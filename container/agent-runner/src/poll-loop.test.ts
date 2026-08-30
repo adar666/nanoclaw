@@ -4,7 +4,7 @@ import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from '
 import { getPendingMessages, markCompleted } from './db/messages-in.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { formatMessages, extractRouting } from './formatter.js';
-import { isCorruptionError, processQuery } from './poll-loop.js';
+import { formatMessagesWithCommands, isCorruptionError, processQuery } from './poll-loop.js';
 import { markToolDelivery } from './db/session-state.js';
 import { MockProvider } from './providers/mock.js';
 import type { AgentQuery, ProviderEvent } from './providers/types.js';
@@ -93,6 +93,35 @@ describe('formatter', () => {
     const prompt = formatMessages(messages);
     expect(prompt).toContain('A&lt;B');
     expect(prompt).toContain('x &gt; y &amp;&amp; z');
+  });
+});
+
+describe('formatMessagesWithCommands — eval excluded from native slash-command passthrough', () => {
+  // deferred-work.md finding (spec-eval-session-output-capture.md): this
+  // native-slash-command passthrough branch, and the /clear + /upload-trace
+  // checks in the main poll loop just above it, must all agree with
+  // formatter.ts's own isCommandEligible() on which kinds get command
+  // treatment — 'chat'/'chat-sdk' only, deliberately not 'eval'.
+  it('formats an eval-kind message with command-shaped text as normal XML, not raw passthrough', () => {
+    insertMessage('e1', 'eval', { sender: 'Judge', text: '/some-unknown-command args' });
+    const prompt = formatMessagesWithCommands(getPendingMessages(), true);
+    // Normal XML rendering wraps it in a <message> block — raw passthrough
+    // would have emitted the bare command text with no wrapping at all.
+    expect(prompt).toContain('<message');
+    expect(prompt).toContain('sender="Judge"');
+  });
+
+  it('passes the equivalent chat-kind message through raw when nativeSlashCommands is true', () => {
+    insertMessage('m1', 'chat', { sender: 'Alice', text: '/some-unknown-command args' });
+    const prompt = formatMessagesWithCommands(getPendingMessages(), true);
+    expect(prompt).not.toContain('<message');
+    expect(prompt).toContain('/some-unknown-command args');
+  });
+
+  it('formats the eval-kind message as normal XML even when nativeSlashCommands is false (both kinds unaffected)', () => {
+    insertMessage('e1', 'eval', { sender: 'Judge', text: '/some-unknown-command args' });
+    const prompt = formatMessagesWithCommands(getPendingMessages(), false);
+    expect(prompt).toContain('<message');
   });
 });
 
@@ -221,7 +250,13 @@ describe('origin metadata (from= attribute)', () => {
       .run(name, name, channelType, platformId);
   }
 
-  function insertWithRouting(id: string, kind: string, content: object, channelType: string | null, platformId: string | null): void {
+  function insertWithRouting(
+    id: string,
+    kind: string,
+    content: object,
+    channelType: string | null,
+    platformId: string | null,
+  ): void {
     getInboundDb()
       .prepare(
         `INSERT INTO messages_in (id, kind, timestamp, status, platform_id, channel_type, content)
@@ -503,9 +538,9 @@ const TASK_ROUTING = {
 
 function taskLogRows(): Array<{ text: string }> {
   return (
-    getOutboundDb()
-      .prepare("SELECT content FROM messages_out WHERE kind = 'task_log' ORDER BY seq")
-      .all() as Array<{ content: string }>
+    getOutboundDb().prepare("SELECT content FROM messages_out WHERE kind = 'task_log' ORDER BY seq").all() as Array<{
+      content: string;
+    }>
   ).map((r) => JSON.parse(r.content) as { text: string });
 }
 
@@ -537,8 +572,17 @@ describe('task-run turn wiring (real processQuery)', () => {
 
       // A SECOND task run lands while the query is open — the follow-up poller
       // pushes it and must reset the per-turn correction state.
+      //
+      // 15000ms (not the framework's own default 5000ms — this is a real
+      // wall-clock poll of a real background mechanism, unrelated to bun:test's
+      // own per-test timeout): CI found real, reproducible here (2 consecutive
+      // GitHub Actions runs, this exact test, ~50-100ms past a bare 5000ms
+      // budget both times, never on a local dev machine) — a shared CI runner
+      // under load can genuinely take longer than 5s for the follow-up poller
+      // to notice the new row and push it. Same pattern repeats at every other
+      // `Date.now() + 15000` deadline in this file, all for the same reason.
       insertMessage('t2', 'task', { prompt: 'fire two' });
-      const deadline = Date.now() + 5000;
+      const deadline = Date.now() + 15000;
       while (!pushes.some((p) => p.includes('fire two')) && Date.now() < deadline) {
         await new Promise((r) => setTimeout(r, 50));
       }
@@ -590,9 +634,9 @@ const EVAL_ROUTING = {
 
 function evalLogRows(): Array<{ text: string }> {
   return (
-    getOutboundDb()
-      .prepare("SELECT content FROM messages_out WHERE kind = 'eval_log' ORDER BY seq")
-      .all() as Array<{ content: string }>
+    getOutboundDb().prepare("SELECT content FROM messages_out WHERE kind = 'eval_log' ORDER BY seq").all() as Array<{
+      content: string;
+    }>
   ).map((r) => JSON.parse(r.content) as { text: string });
 }
 
@@ -611,7 +655,7 @@ describe('eval-run turn wiring (real processQuery)', () => {
 
     const logs = evalLogRows();
     expect(logs).toHaveLength(1);
-    expect(logs[0].text).toContain("No event exists tomorrow.");
+    expect(logs[0].text).toContain('No event exists tomorrow.');
     // Nothing was delivered as chat, and no re-wrap nudge was pushed.
     expect(getUndeliveredMessages().filter((m) => m.kind === 'chat')).toHaveLength(0);
   });
@@ -725,7 +769,7 @@ describe('follow-up completion timing (crash-recovery correctness)', () => {
       // A follow-up arrives while the query stays open — e.g. the
       // background transcription-complete job writing a new inbound row.
       insertMessage('m2', 'chat', { sender: 'System', text: 'follow-up content' });
-      const deadline = Date.now() + 5000;
+      const deadline = Date.now() + 15000;
       while (!pushes.some((p) => p.includes('follow-up content')) && Date.now() < deadline) {
         await new Promise((r) => setTimeout(r, 50));
       }
@@ -761,7 +805,7 @@ describe('follow-up completion timing (crash-recovery correctness)', () => {
       yield { type: 'result', text: 'turn 1 done' };
 
       insertMessage('m2', 'chat', { sender: 'System', text: 'follow-up content' });
-      const pushDeadline = Date.now() + 5000;
+      const pushDeadline = Date.now() + 15000;
       while (!pushes.some((p) => p.includes('follow-up content')) && Date.now() < pushDeadline) {
         await new Promise((r) => setTimeout(r, 50));
       }
@@ -769,7 +813,7 @@ describe('follow-up completion timing (crash-recovery correctness)', () => {
       // abort() fires (e.g. a slash command landed) before the model's
       // result for the follow-up is ever yielded — a real provider would
       // drop it here too (see providers/claude.ts's `if (aborted) return`).
-      const abortDeadline = Date.now() + 5000;
+      const abortDeadline = Date.now() + 15000;
       while (!aborted && Date.now() < abortDeadline) {
         await new Promise((r) => setTimeout(r, 50));
       }
@@ -791,7 +835,7 @@ describe('follow-up completion timing (crash-recovery correctness)', () => {
 
     // Simulate the follow-up poller detecting a slash command and aborting
     // the stream mid-turn, once the follow-up has actually been pushed.
-    const deadline = Date.now() + 5000;
+    const deadline = Date.now() + 15000;
     while (!pushes.some((p) => p.includes('follow-up content')) && Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 50));
     }
@@ -811,7 +855,7 @@ describe('follow-up completion timing (crash-recovery correctness)', () => {
       yield { type: 'result', text: 'turn 1 done' };
 
       insertMessage('m2', 'chat', { sender: 'System', text: 'follow-up content' });
-      const deadline = Date.now() + 5000;
+      const deadline = Date.now() + 15000;
       while (!pushes.some((p) => p.includes('follow-up content')) && Date.now() < deadline) {
         await new Promise((r) => setTimeout(r, 50));
       }

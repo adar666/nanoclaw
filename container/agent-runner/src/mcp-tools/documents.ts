@@ -7,20 +7,28 @@
  * All work runs synchronously in-container, in the same MCP tool call
  * (no host round-trip — this needs no external API/credential):
  *
- *   - `.pdf` with a text layer: `pdfjs-dist` extracts the text directly.
- *   - `.pdf` with no text layer (scanned/image-only): `@hyzyla/pdfium`
- *     renders page 1 (page 1 only — later pages are not captured) to a PNG,
- *     and `tesseract.js` OCRs that PNG in-process (English and Hebrew) — a
- *     single deterministic call, not a round trip through the agent's own
+ *   - `.pdf`: every page is read on its own — `pdfjs-dist` first tries that
+ *     page's own text layer; a page with no usable text (scanned/
+ *     image-only) falls back to `@hyzyla/pdfium` rendering just that page
+ *     to a PNG, OCR'd in-process by `tesseract.js` (English and Hebrew) —
+ *     mixed documents (some pages real text, some scanned) are handled
+ *     transparently in one pass, with an inline `[Page N — OCR]` marker
+ *     ahead of any OCR'd page's text so a later reader can tell which pages
+ *     were transcribed vs. directly extracted. This is a single
+ *     deterministic call per page, not a round trip through the agent's own
  *     multimodal turn (spec 2-1, which deliberately reverses this file's
  *     earlier "never a tool-embedded OCR call" stance — see SPEC.md's
- *     amended constraint and spec-2-1's Spec Change Log). If OCR comes back
- *     empty/near-empty (a genuinely blank or unreadable page, or a page in
- *     neither supported language), the tool halts instead of writing a
- *     blank concept file: it asks the agent to either read the
- *     still-present render itself and call back with `extractedText` (the
- *     old vision-fallback path, now only reached on this one edge case), or
- *     call back with `extractedText: ""` to accept today's placeholder.
+ *     amended constraint and spec-2-1's Spec Change Log). If a page's OCR
+ *     comes back empty/near-empty (a genuinely blank or unreadable page, or
+ *     a page in neither supported language), the tool halts on THAT page
+ *     instead of writing a blank/guessed placeholder for it: it asks the
+ *     agent to either read the still-present render itself and call back
+ *     with `extractedText` (scoped to that one page — the old vision-
+ *     fallback path, now only reached on this one edge case), or call back
+ *     with `extractedText: ""` to accept a placeholder for that page only.
+ *     Earlier pages already resolved (real text or successful OCR) are never
+ *     re-asked about — see the design note above `extractPdfPageTexts` for
+ *     how a halt-and-resume cycle finds its way back to the same page.
  *   - `.docx`: text is pulled out of `word/document.xml` (body paragraphs
  *     only — headers, footers, footnotes, and text boxes are not read) by
  *     shelling out to the `unzip` CLI (already in the base image for other
@@ -268,10 +276,36 @@ function isPidAlive(pid: number): boolean {
   }
 }
 
-async function withLock<T>(lockPath: string, fn: () => T): Promise<T> {
-  for (let attempt = 0; attempt < LOCK_MAX_ATTEMPTS; attempt++) {
+/**
+ * Test-only overrides for the retry/attempt/staleness constants below —
+ * every real call site omits this and gets the production defaults
+ * unchanged. Exists so a regression test can exercise the retry-exhaustion
+ * and stale-reclaim-on-the-last-attempt paths deterministically (maxAttempts:
+ * 1-2, a short retryMs) instead of needing a real ~2s/30s wait, mirroring why
+ * eval/lock.ts's own reimplementation of this algorithm takes the same shape
+ * of `opts`.
+ */
+interface WithLockTestOpts {
+  retryMs?: number;
+  maxAttempts?: number;
+  staleMs?: number;
+}
+
+export async function withLock<T>(lockPath: string, fn: () => T, testOpts?: WithLockTestOpts): Promise<T> {
+  const retryMs = testOpts?.retryMs ?? LOCK_RETRY_MS;
+  const maxAttempts = testOpts?.maxAttempts ?? LOCK_MAX_ATTEMPTS;
+  const staleMs = testOpts?.staleMs ?? LOCK_STALE_MS;
+
+  // This call's own fencing token (see the finally block below) — written as
+  // the lock file's content at acquire time, checked again at release. Plain
+  // process.pid (not a per-call uuid) is deliberate: it doubles as the value
+  // the dead-pid liveness check below reads back, exactly mirroring
+  // eval/lock.ts's own reimplementation of this same algorithm.
+  const myToken = String(process.pid);
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
     try {
-      fs.writeFileSync(lockPath, String(process.pid), { flag: 'wx' });
+      fs.writeFileSync(lockPath, myToken, { flag: 'wx' });
       break;
     } catch (e) {
       if (errnoCode(e) !== 'EEXIST') throw e;
@@ -293,6 +327,7 @@ async function withLock<T>(lockPath: string, fn: () => T): Promise<T> {
         if (Number.isInteger(heldByPid) && heldByPid > 0 && !isPidAlive(heldByPid)) {
           fs.unlinkSync(lockPath);
           log(`withLock: reclaimed a lock held by dead pid ${heldByPid}: ${lockPath}`);
+          attempt--; // guarantee a genuine re-acquire attempt, even on the last iteration (deferred-work.md off-by-one fix, ported from eval/lock.ts)
           continue; // retry the exclusive-create immediately, no need to sleep
         }
       } catch {
@@ -302,8 +337,9 @@ async function withLock<T>(lockPath: string, fn: () => T): Promise<T> {
 
       try {
         const st = fs.statSync(lockPath);
-        if (Date.now() - st.mtimeMs > LOCK_STALE_MS) {
+        if (Date.now() - st.mtimeMs > staleMs) {
           fs.unlinkSync(lockPath);
+          attempt--; // guarantee a genuine re-acquire attempt, even on the last iteration (deferred-work.md off-by-one fix, ported from eval/lock.ts)
           continue; // retry the exclusive-create immediately, no need to sleep
         }
       } catch {
@@ -311,17 +347,26 @@ async function withLock<T>(lockPath: string, fn: () => T): Promise<T> {
         // holder likely just released it; fall through to the normal retry.
       }
 
-      if (attempt === LOCK_MAX_ATTEMPTS - 1) {
+      if (attempt === maxAttempts - 1) {
         throw new Error(`Timed out waiting for memory index lock: ${lockPath}`);
       }
-      await new Promise((resolve) => setTimeout(resolve, LOCK_RETRY_MS));
+      await new Promise((resolve) => setTimeout(resolve, retryMs));
     }
   }
   try {
     return fn();
   } finally {
     try {
-      fs.unlinkSync(lockPath);
+      // Fencing (deferred-work.md finding, ported from eval/lock.ts): only
+      // release if this call still owns the lock. If this call's own fn()
+      // ran long enough to cross LOCK_STALE_MS (or its holder pid looked
+      // dead to a racing caller), another caller may have already reclaimed
+      // the lock and written its own token in — an unconditional unlink here
+      // would delete THAT caller's live lock instead of this one's own,
+      // silently breaking mutual exclusion.
+      if (fs.readFileSync(lockPath, 'utf-8') === myToken) {
+        fs.unlinkSync(lockPath);
+      }
     } catch {
       // Already gone (or never created) — nothing to clean up.
     }
@@ -405,7 +450,12 @@ function escapeMarkdown(s: string): string {
 // ---------------------------------------------------------------------------
 
 function decodeXmlEntities(s: string): string {
-  return s.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, '&');
+  return s
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&');
 }
 
 export function docxXmlToText(xml: string): string {
@@ -507,6 +557,22 @@ async function extractDocText(filePath: string): Promise<string> {
 // the background until it settles on its own; best achievable without one.
 const PDF_TIMEOUT_MS = 30_000;
 
+// Sanity bound for save_document's per-page pipeline (deferred-work.md's
+// "is a page-count cap needed" question) — PDF_TIMEOUT_MS (render) and
+// OCR_TIMEOUT_MS (OCR) already bound each individual page's own worst case,
+// but nothing bounds the TOTAL wall-clock time as page count grows: a
+// pathological adversarial input (e.g. a 10,000-page scanned PDF) could
+// still make save_document run for a genuinely unreasonable duration even
+// though each single page is individually well-behaved. A real household
+// document — a contract, a tax return, an insurance policy, even a scanned
+// book chapter — essentially never exceeds a few hundred pages, so this cap
+// is generous headroom for every real case while still turning the
+// pathological one into a fast, clear error instead of a many-hour hang.
+// Applied uniformly (not just to scanned pages) for simplicity — the rare
+// legitimate case of an all-text PDF longer than this can still be split by
+// the user; that tradeoff is deliberate, not an oversight.
+const MAX_PDF_PAGES_FOR_SAVE = 300;
+
 async function extractPdfText(filePath: string): Promise<string> {
   const { getDocument } = await import('pdfjs-dist/legacy/build/pdf.mjs');
   const data = new Uint8Array(fs.readFileSync(filePath));
@@ -523,6 +589,75 @@ async function extractPdfText(filePath: string): Promise<string> {
       page.cleanup();
     }
     return pageTexts.join('\n\n').trim();
+  } finally {
+    await loadingTask.destroy();
+  }
+}
+
+/**
+ * Per-page counterpart to `extractPdfText` above — same pdfjs-dist
+ * per-page loop (`pdfExtractLinesAllPages`'s iteration pattern), but returns
+ * each page's own text separately instead of concatenating the whole
+ * document into one string. `save_document`'s multi-page flow needs this:
+ * `extractPdfText`'s whole-document view can't tell "page 3 has no text"
+ * apart from "the whole document has no text," which is exactly the
+ * distinction mixed text/image-page handling depends on. `fillPdf`'s own
+ * text-layer-or-not branch point is a document-wide decision and keeps
+ * using `extractPdfText` unchanged — this is a separate function rather
+ * than a shared refactor so that call site's behavior is untouched.
+ *
+ * Multi-page Ask-First design note (read this before touching the halt
+ * logic in `saveDocumentImpl`'s PDF branch): a halted call and its
+ * follow-up are two separate, otherwise-stateless MCP tool calls — nothing
+ * persists "which page were we asking about" between them except the
+ * deterministic inputs (the same `path`, hence the same raw PDF bytes) and
+ * the deterministic per-page render filename (see `renderFileNameFor`).
+ * `saveDocumentImpl` exploits that: on every call it re-derives page
+ * routing from scratch, in page order, and applies a caller-supplied
+ * `extractedText` to the FIRST page it finds that needs OCR and comes back
+ * near-empty. Because routing is fully deterministic (same bytes, same OCR
+ * engine, same order), that first near-empty page is always the same page
+ * that halted last time — no explicit page-number argument needed. If a
+ * LATER page also turns out near-empty in the same call, save_document
+ * halts again on that one; a document with several genuinely bad pages
+ * therefore needs several round trips, one page at a time, never a single
+ * call answering more than one page. This trades a few extra round trips
+ * (rare in practice — most scanned documents are either all fine or have
+ * at most one truly blank/unreadable page) for a message contract that
+ * never needs to grow beyond a single string, and for zero new persisted
+ * state anywhere in this stateless-between-calls tool.
+ *
+ * A real cost of "re-derive from scratch every call": on a follow-up call,
+ * every page BEFORE the one being answered is re-processed too — a text
+ * layer page is re-extracted (cheap), but a page that succeeded via OCR on
+ * an earlier call is OCR'd again here (not cheap). Deliberately not cached
+ * — this file has no cross-call state store to put such a cache in, and
+ * for realistic household-scale documents (a handful of pages, rarely more
+ * than one bad page) the extra OCR passes are a small, bounded cost, not a
+ * correctness risk.
+ */
+async function extractPdfPageTexts(filePath: string): Promise<string[]> {
+  const { getDocument } = await import('pdfjs-dist/legacy/build/pdf.mjs');
+  const data = new Uint8Array(fs.readFileSync(filePath));
+  const loadingTask = getDocument({ data, verbosity: 0 });
+  try {
+    const doc = await loadingTask.promise;
+    if (doc.numPages > MAX_PDF_PAGES_FOR_SAVE) {
+      throw new Error(
+        `PDF has ${doc.numPages} pages, over the ${MAX_PDF_PAGES_FOR_SAVE}-page limit save_document supports in ` +
+          'one call — split it into smaller files and save those separately.',
+      );
+    }
+    const pageTexts: string[] = [];
+    for (let i = 1; i <= doc.numPages; i++) {
+      const page = await doc.getPage(i);
+      const content = await page.getTextContent();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const pageText = content.items.map((item: any) => ('str' in item ? item.str : '')).join(' ');
+      pageTexts.push(pageText.trim());
+      page.cleanup();
+    }
+    return pageTexts;
   } finally {
     await loadingTask.destroy();
   }
@@ -662,15 +797,49 @@ function sweepOldFiles(dir: string, maxAgeMs: number): void {
   }
 }
 
-async function renderFirstPageToPng(filePath: string, outPath: string): Promise<{ width: number; height: number }> {
+/**
+ * Pulls the `n`-th (0-based) item out of a `Generator` and stops iterating
+ * — `document.pages()` below yields one native page handle at a time (each
+ * a real @hyzyla/pdfium resource), so this avoids realizing every page up
+ * to `n` into an array (`[...gen]`) just to discard all but one; genuinely
+ * matters for a multi-page save_document call, which calls this once per
+ * image-only page and would otherwise redo O(numPages) work per page,
+ * O(numPages^2) over the whole document.
+ */
+function nthFromGenerator<T>(gen: Generator<T>, n: number): T | undefined {
+  let i = 0;
+  for (const item of gen) {
+    if (i === n) return item;
+    i++;
+  }
+  return undefined;
+}
+
+/**
+ * Renders one page (`pageIndex`, 0-based — defaults to page 1, the only
+ * page `pdfRenderForOverlay`'s single-page overlay flow ever needs) to a
+ * PNG via @hyzyla/pdfium. `document.pages()` returns a `Generator`, not an
+ * array (confirmed against `@hyzyla/pdfium`'s own `.d.ts` — indexing it
+ * directly, e.g. `document.pages()[pageIndex]`, silently returns `undefined`
+ * for every index since a Generator has no numeric properties); `pages()`
+ * still nominally hands the caller every page in the document, but
+ * `save_document`'s multi-page flow only ever wants one of them per call —
+ * see `nthFromGenerator` above. Every existing call site that doesn't pass
+ * `pageIndex` keeps rendering page 1, unchanged.
+ */
+async function renderFirstPageToPng(
+  filePath: string,
+  outPath: string,
+  pageIndex = 0,
+): Promise<{ width: number; height: number }> {
   const { PDFiumLibrary } = await import('@hyzyla/pdfium');
   const buf = fs.readFileSync(filePath);
   const library = await PDFiumLibrary.init();
   try {
     const document = await library.loadDocument(buf);
     try {
-      const [page] = document.pages();
-      if (!page) throw new Error('PDF has no pages');
+      const page = nthFromGenerator(document.pages(), pageIndex);
+      if (!page) throw new Error(`PDF has no page at index ${pageIndex}`);
       let dims = { width: 0, height: 0 };
       const image = await page.render({
         scale: RENDER_SCALE,
@@ -691,16 +860,86 @@ async function renderFirstPageToPng(filePath: string, outPath: string): Promise<
 }
 
 /**
- * Deterministic render filename for a given source file — so a follow-up
- * `save_document` call (same `path`, now with `extractedText`) can compute
- * the identical path and delete it on success, instead of leaving it behind
- * (a random/timestamped name would make that lookup impossible).
+ * Deterministic render filename for a given source file and 1-based page
+ * number — so a follow-up `save_document` call (same `path`, now with
+ * `extractedText`) can compute the identical path and delete it on success,
+ * instead of leaving it behind (a random/timestamped name would make that
+ * lookup impossible). `pageNumber` defaults to 1 — every pre-multi-page call
+ * site (and every single-page document) gets the exact same `-p1.png`
+ * suffix as before this function grew a page number at all.
  */
-function renderFileNameFor(resolvedPath: string, originalFilename: string): string {
-  const hash = crc32(Buffer.from(resolvedPath, 'utf-8'))
-    .toString(16)
-    .padStart(8, '0');
-  return `${slugify(originalFilename)}-${hash}-p1.png`;
+function renderFileNameFor(resolvedPath: string, originalFilename: string, pageNumber = 1): string {
+  const hash = crc32(Buffer.from(resolvedPath, 'utf-8')).toString(16).padStart(8, '0');
+  return `${slugify(originalFilename)}-${hash}-p${pageNumber}.png`;
+}
+
+/**
+ * Cross-call memory for a multi-page save_document's Ask-First answers —
+ * ONLY needed once a document has had more than one page halt-and-resume in
+ * its lifetime (see the multi-page Ask-First design note above
+ * extractPdfPageTexts). Every call re-derives page routing from scratch, so
+ * a page resolved via `extractedText` on an EARLIER halted call would
+ * otherwise be indistinguishable, on a LATER call, from a page that has
+ * simply never been asked about yet — both look identical (no text layer,
+ * OCR still comes back near-empty, since nothing about the source PDF or
+ * the OCR mock/engine changed between calls). Without this file, a second
+ * bad page's follow-up call would silently re-consume `extractedText` for
+ * the FIRST bad page all over again instead of the new one being answered.
+ * This sidecar closes that gap: every page resolved via `extractedText` is
+ * persisted here immediately, so a later call can skip straight to using
+ * the stored answer for that page — no render, no OCR, no risk of
+ * re-asking about (or silently overwriting the answer to) a page that's
+ * already been answered. Lives in the same `.document-renders/` directory
+ * as the per-page render PNGs, deliberately: `sweepOldFiles`'s existing
+ * mtime-based sweep already reclaims anything in that directory regardless
+ * of filename, so an abandoned sidecar (no follow-up ever arrived) needs no
+ * extra cleanup path of its own. Deleted alongside the render PNGs once the
+ * whole save actually succeeds (see the final cleanup block in
+ * `saveDocumentImpl`) — a completed save has nothing left to resume.
+ */
+function pdfResolvedPagesSidecarPath(renderDir: string, resolvedPath: string, originalFilename: string): string {
+  const hash = crc32(Buffer.from(resolvedPath, 'utf-8')).toString(16).padStart(8, '0');
+  return path.join(renderDir, `${slugify(originalFilename)}-${hash}-resolved.json`);
+}
+
+/** Best-effort load — a missing, unreadable, or corrupt sidecar is treated as "nothing resolved yet," never a hard failure (this is a resumability aid, not durable storage). */
+function loadResolvedPages(sidecarPath: string): Map<number, string> {
+  const result = new Map<number, string>();
+  let raw: string;
+  try {
+    raw = fs.readFileSync(sidecarPath, 'utf-8');
+  } catch {
+    return result;
+  }
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object') {
+      for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+        const pageNum = Number(key);
+        if (Number.isInteger(pageNum) && typeof value === 'string') result.set(pageNum, value);
+      }
+    }
+  } catch {
+    // Corrupt sidecar — treat as empty rather than failing the whole save;
+    // the page(s) it would have covered will simply be asked about again.
+  }
+  return result;
+}
+
+/** Read-modify-write: merges one newly-resolved page into whatever the sidecar already holds. Best-effort — a write failure here degrades to "this page may be asked about again on a later call," never a save_document failure. */
+function persistResolvedPage(sidecarPath: string, pageNum: number, text: string): void {
+  try {
+    const existing = loadResolvedPages(sidecarPath);
+    existing.set(pageNum, text);
+    const obj: Record<string, string> = {};
+    for (const [k, v] of existing) obj[String(k)] = v;
+    fs.mkdirSync(path.dirname(sidecarPath), { recursive: true });
+    fs.writeFileSync(sidecarPath, JSON.stringify(obj));
+  } catch (e) {
+    log(
+      `save_document: could not persist resolved-page sidecar at ${sidecarPath} (non-fatal): ${e instanceof Error ? e.message : String(e)}`,
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -751,14 +990,158 @@ function renderFileNameFor(resolvedPath: string, originalFilename: string): stri
 // (matches the spec's no-Dockerfile-change constraint, which is about the
 // *code* dependency, not this data fetch), but worth knowing if OCR ever
 // fails specifically on a fresh cacheDir with no network reachable.
+// Checksum-pinned (deferred-work.md finding, resolved 2026-08-28): see
+// `ensureOcrLangData` below — the file is fetched and SHA-256-verified by
+// this tool itself, before tesseract.js's own loadLanguage step ever runs,
+// so a compromised/corrupted CDN response is rejected instead of silently
+// loaded. Deliberately not bundled into the image (operator decision) — the
+// "not present until first use" shape is unchanged, only the integrity
+// guarantee on that first fetch is new.
 //
 // Bounds both worker init (which includes that first-time language-data
 // fetch) and the recognize() call itself in one combined budget — a stuck
 // fetch or a stalled OCR pass must not block save_document indefinitely.
+// Same accepted limitation already noted above for PDF_TIMEOUT_MS
+// (deferred-work.md, epic-2 retro finding): withTimeout races the call
+// against a timer without actually cancelling the underlying work if the
+// timer wins — tesseract.js's worker has no cancellation API to call into
+// (only terminate(), which the finally block below already calls on the
+// normal completion path, not on a timeout), so the worker keeps running
+// in the background until it settles on its own, unbounded by the timeout
+// the caller was told applies. A retry after a timeout can spawn a second
+// worker on top of the still-running first one; best achievable without a
+// real tesseract worker-lifecycle redesign, out of scope here.
 const OCR_TIMEOUT_MS = 60_000;
 // ---------------------------------------------------------------------------
 
-async function ocrPngText(pngPath: string, ocrOpts: { cacheDir: string }): Promise<string> {
+/**
+ * Per-cacheDir in-memory mutex (deferred-work.md finding, ocr-fallback item):
+ * this file never controls tesseract.js's own internal "check cache,
+ * download if missing" sequence for eng.traineddata/heb.traineddata
+ * directly — that happens inside createWorker() itself — so two concurrent
+ * first-ever `save_document` OCR calls against the same fresh (not-yet-
+ * populated) agent-group `.ocr-cache/` dir could otherwise both trigger a
+ * download of the same language file at once. A single-process in-memory
+ * lock keyed by cacheDir path is enough (no eval/lock.ts-style staleness-
+ * reclaim machinery needed): this all runs in one Bun process per
+ * container, so there's no cross-process holder to ever go stale. Chains
+ * each call after whatever's already queued for that same cacheDir, and
+ * always resolves (never rejects) so one call's failure can't permanently
+ * wedge later callers against the same directory.
+ */
+const ocrCacheDirLocks = new Map<string, Promise<unknown>>();
+
+function withOcrCacheDirLock<T>(cacheDir: string, fn: () => Promise<T>): Promise<T> {
+  const prior = ocrCacheDirLocks.get(cacheDir) ?? Promise.resolve();
+  const result = prior.then(fn, fn);
+  ocrCacheDirLocks.set(
+    cacheDir,
+    result.catch(() => undefined),
+  );
+  return result;
+}
+
+/**
+ * Checksum-pinned OCR language data (deferred-work.md finding, ocr-fallback
+ * item, 2026-08-28): `tesseract.js`'s own `loadLanguage` step would otherwise
+ * fetch `eng.traineddata`/`heb.traineddata` from `cdn.jsdelivr.net` with no
+ * integrity check at all — a compromised CDN or a MITM on that first-ever
+ * download could hand tesseract.js an arbitrary binary to load. This
+ * pre-populates `${cacheDir}/${lang}.traineddata` ourselves, verified against
+ * a pinned SHA-256 of both the downloaded `.gz` and its decompressed
+ * contents, before `createWorker` ever runs — `loadLanguage`'s own cache
+ * check (reads `${cachePath}/${lang}.traineddata` first, before touching the
+ * network at all) then finds the file already present and never fetches
+ * anything itself. Deliberately NOT bundling the files into the image
+ * (operator decision, 2026-08-28): that would add a permanent, unconditional
+ * image-size cost for every install; a checksum-pinned CDN fetch keeps the
+ * "not present until first OCR use" shape while closing the supply-chain
+ * gap.
+ *
+ * Version pinned to `4.0.0`, matching tesseract.js's own default `langPath`
+ * (see `loadLanguage` in its `worker-script/index.js`) — a version bump
+ * upstream would need these hashes re-pinned deliberately, not silently
+ * trusted.
+ */
+const OCR_LANG_DATA_VERSION = '4.0.0';
+
+/** SHA-256 of the `.gz` as served, and of its decompressed `.traineddata` contents — both checked. */
+export const OCR_LANG_DATA_HASHES: Record<string, { gz: string; decompressed: string }> = {
+  eng: {
+    gz: 'ed350f3752f81ee8f38769edc14d92d997dababe23b565c59879372cc46a2468',
+    decompressed: 'daa0c97d651c19fba3b25e81317cd697e9908c8208090c94c3905381c23fc047',
+  },
+  heb: {
+    gz: 'd18b4db5beccd16b41cfc7f38b53f6bf614d256696560444dc78753fbab54f1e',
+    decompressed: '7da6ea6b7a2620ec8e8b41de2967a13d429635a56657a0b30b622501a573d3e1',
+  },
+};
+
+function sha256Hex(data: Buffer): string {
+  return crypto.createHash('sha256').update(data).digest('hex');
+}
+
+/**
+ * Ensure `${cacheDir}/${lang}.traineddata` exists and is checksum-verified.
+ * No-op if already present (an existing cache entry is trusted as-is — this
+ * only pins the download, not a standing integrity re-check on every OCR
+ * call). Exported for direct testing; the fetch fn is injectable so tests
+ * never hit the real network.
+ */
+export async function ensureOcrLangData(
+  cacheDir: string,
+  lang: string,
+  fetchFn: typeof fetch = fetch,
+  hashes: Record<string, { gz: string; decompressed: string }> = OCR_LANG_DATA_HASHES,
+): Promise<void> {
+  const targetPath = path.join(cacheDir, `${lang}.traineddata`);
+  if (fs.existsSync(targetPath)) return;
+
+  const pinned = hashes[lang];
+  if (!pinned) {
+    throw new Error(`ensureOcrLangData: no pinned checksum for OCR language "${lang}" — refusing to fetch unpinned.`);
+  }
+
+  const url = `https://cdn.jsdelivr.net/npm/@tesseract.js-data/${lang}/${OCR_LANG_DATA_VERSION}/${lang}.traineddata.gz`;
+  let gz: Buffer;
+  try {
+    const response = await fetchFn(url, { signal: AbortSignal.timeout(60_000) });
+    if (!response.ok) {
+      throw new Error(`OCR language data fetch for "${lang}" returned HTTP ${response.status} from ${url}`);
+    }
+    gz = Buffer.from(await response.arrayBuffer());
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`OCR language data fetch for "${lang}" failed: ${msg}`);
+  }
+
+  const gzHash = sha256Hex(gz);
+  if (gzHash !== pinned.gz) {
+    throw new Error(
+      `OCR language data integrity check failed for "${lang}": expected gz sha256 ${pinned.gz}, got ${gzHash} — ` +
+        'refusing to use this download (possible CDN compromise or corruption).',
+    );
+  }
+
+  const decompressed = zlib.gunzipSync(gz);
+  const decompressedHash = sha256Hex(decompressed);
+  if (decompressedHash !== pinned.decompressed) {
+    throw new Error(
+      `OCR language data integrity check failed for "${lang}": expected decompressed sha256 ` +
+        `${pinned.decompressed}, got ${decompressedHash} — refusing to use this download.`,
+    );
+  }
+
+  fs.mkdirSync(cacheDir, { recursive: true });
+  // Write-then-rename: a crash/interruption mid-write must never leave a
+  // partial file at the real target path for loadLanguage's own cache check
+  // to find and (wrongly) trust on the next call.
+  const tmpPath = `${targetPath}.tmp-${process.pid}-${Date.now()}`;
+  fs.writeFileSync(tmpPath, decompressed);
+  fs.renameSync(tmpPath, targetPath);
+}
+
+export async function ocrPngText(pngPath: string, ocrOpts: { cacheDir: string }): Promise<string> {
   const work = (async () => {
     const tesseractModule = await import('tesseract.js');
     const createWorker = tesseractModule.createWorker ?? tesseractModule.default?.createWorker;
@@ -767,7 +1150,17 @@ async function ocrPngText(pngPath: string, ocrOpts: { cacheDir: string }): Promi
     }
 
     const moduleDir = path.dirname(fileURLToPath(import.meta.url));
-    const workerPath = path.join(moduleDir, '..', '..', 'node_modules', 'tesseract.js', 'src', 'worker-script', 'node', 'index.js');
+    const workerPath = path.join(
+      moduleDir,
+      '..',
+      '..',
+      'node_modules',
+      'tesseract.js',
+      'src',
+      'worker-script',
+      'node',
+      'index.js',
+    );
 
     // Fail fast and specifically (spec-2 retro item 8) — without this check,
     // an unexpected node_modules layout (this path is anchored relative to
@@ -783,7 +1176,18 @@ async function ocrPngText(pngPath: string, ocrOpts: { cacheDir: string }): Promi
 
     fs.mkdirSync(ocrOpts.cacheDir, { recursive: true });
 
-    const worker = await createWorker('eng+heb', undefined, { workerPath, cachePath: ocrOpts.cacheDir });
+    // Locked around worker creation only (not the recognize() call below) —
+    // that's precisely where tesseract.js's own "check cache, download if
+    // missing" sequence runs. Once createWorker resolves for the first
+    // caller against a given cacheDir, the language data is fully present,
+    // so a second, already-queued caller's own createWorker call proceeds
+    // needing no download at all — concurrent recognize() calls against an
+    // already-populated cache are never serialized by this lock.
+    const worker = await withOcrCacheDirLock(ocrOpts.cacheDir, async () => {
+      await ensureOcrLangData(ocrOpts.cacheDir, 'eng');
+      await ensureOcrLangData(ocrOpts.cacheDir, 'heb');
+      return createWorker('eng+heb', undefined, { workerPath, cachePath: ocrOpts.cacheDir });
+    });
     try {
       const { data } = await worker.recognize(pngPath);
       return (data.text ?? '').trim();
@@ -967,7 +1371,7 @@ export async function saveDocumentImpl(
       if (resolution.meta.ambiguousExtensions) {
         return err(
           `Multiple files found for document "${resolution.meta.slug}" (${resolution.meta.ambiguousExtensions.join(', ')}) — ` +
-            'this shouldn\'t normally happen. Check memory/documents/files/ for this slug manually before retrying.',
+            "this shouldn't normally happen. Check memory/documents/files/ for this slug manually before retrying.",
         );
       }
       refreshTarget = resolution.meta;
@@ -985,84 +1389,210 @@ export async function saveDocumentImpl(
 
     let bodyText: string;
     let extractionNote = '';
-    let renderPathToCleanup: string | undefined;
+    // Populated only on the success path — mirrors the pre-multi-page
+    // single `renderPathToCleanup`, generalized to one entry per page that
+    // actually got rendered+OCR'd (or resolved via a follow-up
+    // extractedText) this call. Deliberately NOT deleted if this function
+    // returns early (an Ask-First halt, or an error below) — same
+    // retry-safety guarantee as before: a halted/failed call leaves its
+    // render(s) in place for a follow-up or a retry to find at the same
+    // deterministic path, only cleaned up once the whole save actually
+    // succeeds (see the single cleanup block near the end of this function).
+    const renderPathsToCleanup: string[] = [];
 
     if (ext === 'pdf') {
-      let pdfText: string;
+      let pageTexts: string[];
       try {
-        pdfText = await withTimeout(extractPdfText(resolvedPath), PDF_TIMEOUT_MS, 'PDF text extraction');
+        pageTexts = await withTimeout(extractPdfPageTexts(resolvedPath), PDF_TIMEOUT_MS, 'PDF text extraction');
       } catch (e) {
         return err(`Could not read PDF: ${describePdfReadError(e)}`);
       }
-
-      if (hasTextLayer(pdfText)) {
-        bodyText = pdfText;
-      } else {
-        const renderDir = path.join(opts.baseDir, '.document-renders');
-        sweepOldFiles(renderDir, ABANDONED_RENDER_MAX_AGE_MS);
-        const renderPath = path.join(renderDir, renderFileNameFor(resolvedPath, originalFilename));
-
-        if (extractedText === undefined) {
-          // First call for this path (or a retry after an earlier halt below
-          // — renderFileNameFor is deterministic, so this re-renders the
-          // same file in place rather than accumulating a new PNG per
-          // retry). Render page 1, then OCR it directly: this collapses
-          // what used to be a two-call agent-vision round trip into a
-          // single deterministic call for the common case (spec-2-1).
-          let dims: { width: number; height: number };
-          try {
-            dims = await withTimeout(renderFirstPageToPng(resolvedPath, renderPath), PDF_TIMEOUT_MS, 'PDF page render');
-          } catch (e) {
-            return err(`Could not render scanned PDF page: ${e instanceof Error ? e.message : String(e)}`);
-          }
-
-          let ocrText: string;
-          try {
-            const ocrCacheDir = path.join(opts.baseDir, '.ocr-cache');
-            ocrText = await ocrPngText(renderPath, { cacheDir: ocrCacheDir });
-          } catch (e) {
-            // Unlike the near-empty halt below, there's no follow-up flow
-            // that needs this render — a genuine OCR engine failure (as
-            // opposed to a successful-but-empty OCR) has nothing for a
-            // vision-fallback follow-up to read differently, so clean up
-            // now rather than leaving it orphaned in .document-renders.
-            try {
-              fs.unlinkSync(renderPath);
-            } catch {
-              // best effort
-            }
-            return err(`Could not OCR scanned PDF page: ${e instanceof Error ? e.message : String(e)}`);
-          }
-
-          if (isNearEmptyOcrText(ocrText)) {
-            // Ask-First (spec-2-1): a genuinely blank/unreadable page, or an
-            // OCR result too short to be real content (a stray character
-            // from noise is not "readable text") — do NOT delete the
-            // render, since the vision-fallback choice below needs it
-            // still on disk to read.
-            return ok(
-              'This PDF has no extractable text layer (scanned/image-only), and OCR on page 1 (page 1 only — ' +
-                `later pages are not captured), ${dims.width}x${dims.height}px, at ${renderPath} found little ` +
-                'to no readable text — the page may be genuinely blank or unreadable. Ask the user how to ' +
-                'proceed: either read that rendered image yourself and call save_document again with the same path ' +
-                `("${filePath}") and an "extractedText" argument containing what you read, or call ` +
-                'save_document again with the same path and extractedText: "" to save it with a placeholder ' +
-                'note instead of blank/guessed text.' +
-                refreshRetryNote,
-            );
-          }
-
-          bodyText = ocrText;
-          renderPathToCleanup = renderPath;
-        } else {
-          // Follow-up call after the Ask-First halt above: the agent either
-          // read the still-present render itself (real text) or is
-          // confirming the placeholder (extractedText === ""). Either way,
-          // the render has served its purpose and is cleaned up below.
-          bodyText = extractedText;
-          renderPathToCleanup = renderPath;
-        }
+      if (pageTexts.length === 0) {
+        return err('Could not read PDF: PDF has no pages.');
       }
+
+      // Per-page routing (mixed text/image-page handling): a page with a
+      // real text layer never touches render/OCR at all; a page without one
+      // does, entirely independently of how every other page in the same
+      // document was routed. `isMultiPage` gates the `[Page N — ...]`
+      // markers below — a genuinely single-page PDF (this tool's original,
+      // still overwhelmingly common case) keeps producing bare body text
+      // with no marker at all, byte-identical to this tool's behavior
+      // before multi-page support existed; a "page 1 of 1" marker would be
+      // pure noise there. A document with more than one page gets markers
+      // on every OCR'd/transcribed/placeholder page, so a human or agent
+      // reading the saved concept file later can tell which pages came from
+      // the PDF's own text layer and which were reconstructed.
+      const isMultiPage = pageTexts.length > 1;
+
+      const renderDir = path.join(opts.baseDir, '.document-renders');
+      const sidecarPath = pdfResolvedPagesSidecarPath(renderDir, resolvedPath, originalFilename);
+      const pageBodies: string[] = [];
+      let sweptRenderDir = false;
+      // extractedText, if given, answers only the FIRST near-empty-OCR page
+      // reached on this call that ISN'T already resolved via the sidecar
+      // below — see the design note above extractPdfPageTexts for why
+      // that's always the same page a previous halt asked about, with no
+      // explicit page-number argument needed.
+      let extractedTextConsumed = false;
+      // Loaded lazily (only if this document turns out to actually have a
+      // page needing OCR at all) and only once per call — see
+      // pdfResolvedPagesSidecarPath's own doc comment for why this exists.
+      let resolvedPages: Map<number, string> | undefined;
+
+      for (let i = 0; i < pageTexts.length; i++) {
+        const pageNum = i + 1;
+        const pageText = pageTexts[i];
+
+        if (hasTextLayer(pageText)) {
+          pageBodies.push(pageText);
+          continue;
+        }
+
+        // No text layer on this page — render + OCR it, independently of
+        // every other page's own routing.
+        if (!sweptRenderDir) {
+          sweepOldFiles(renderDir, ABANDONED_RENDER_MAX_AGE_MS);
+          sweptRenderDir = true;
+        }
+        const renderPath = path.join(renderDir, renderFileNameFor(resolvedPath, originalFilename, pageNum));
+        if (!resolvedPages) resolvedPages = loadResolvedPages(sidecarPath);
+
+        const alreadyResolved = resolvedPages.get(pageNum);
+        if (alreadyResolved !== undefined) {
+          // Answered on an EARLIER halted call, not this one (see
+          // pdfResolvedPagesSidecarPath's doc comment) — use that answer
+          // outright, no render/OCR attempt at all. A leftover render for
+          // this exact page (from the call that originally halted on it)
+          // may still be sitting on disk; clean it up defensively now that
+          // it's genuinely no longer needed for anything.
+          pageBodies.push(alreadyResolved);
+          try {
+            fs.unlinkSync(renderPath);
+          } catch {
+            // best effort — may never have existed, or was already cleaned up
+          }
+          continue;
+        }
+
+        if (extractedText !== undefined && !extractedTextConsumed) {
+          // Resumes a previous Ask-First halt on this exact page (see the
+          // design note above extractPdfPageTexts) — trusts the given
+          // text/placeholder outright rather than re-attempting OCR,
+          // mirroring the pre-multi-page follow-up's own trust model.
+          // Persisted to the sidecar immediately (not deferred) — cheap,
+          // and it's the only way a LATER halt in this same call (or an
+          // unrelated render/OCR error on a later page) doesn't lose this
+          // answer for the next call to pick up. The render this page's
+          // earlier halt kept around is no longer needed for anything once
+          // this text is captured, whether or not the rest of this call
+          // eventually succeeds — deleted immediately, not deferred.
+          extractedTextConsumed = true;
+          const trimmed = extractedText.trim();
+          const formatted = !isMultiPage
+            ? extractedText
+            : trimmed
+              ? `[Page ${pageNum} — transcribed]\n${extractedText}`
+              : `[Page ${pageNum} — no readable text]`;
+          pageBodies.push(formatted);
+          if (isMultiPage) persistResolvedPage(sidecarPath, pageNum, formatted);
+          try {
+            fs.unlinkSync(renderPath);
+          } catch {
+            // best effort
+          }
+          continue;
+        }
+
+        // First encounter with this page (or a retry after an earlier halt
+        // on a LATER page — renderFileNameFor is deterministic per page, so
+        // this re-renders the same file in place rather than accumulating a
+        // new PNG per retry). Render, then OCR it directly: this collapses
+        // what used to be a two-call agent-vision round trip into a single
+        // deterministic call for the common case (spec-2-1), now per page.
+        let dims: { width: number; height: number };
+        try {
+          dims = await withTimeout(
+            renderFirstPageToPng(resolvedPath, renderPath, i),
+            PDF_TIMEOUT_MS,
+            'PDF page render',
+          );
+        } catch (e) {
+          return err(`Could not render scanned PDF page ${pageNum}: ${e instanceof Error ? e.message : String(e)}`);
+        }
+
+        let ocrText: string;
+        try {
+          const ocrCacheDir = path.join(opts.baseDir, '.ocr-cache');
+          ocrText = await ocrPngText(renderPath, { cacheDir: ocrCacheDir });
+        } catch (e) {
+          // Unlike the near-empty halt below, there's no follow-up flow
+          // that needs this render — a genuine OCR engine failure (as
+          // opposed to a successful-but-empty OCR) has nothing for a
+          // vision-fallback follow-up to read differently, so clean up
+          // now rather than leaving it orphaned in .document-renders.
+          try {
+            fs.unlinkSync(renderPath);
+          } catch {
+            // best effort
+          }
+          return err(`Could not OCR scanned PDF page ${pageNum}: ${e instanceof Error ? e.message : String(e)}`);
+        }
+
+        if (isNearEmptyOcrText(ocrText)) {
+          // Ask-First (spec-2-1, extended per page): a genuinely blank/
+          // unreadable page, or an OCR result too short to be real content
+          // (a stray character from noise is not "readable text") — halt
+          // HERE and do not process any further pages this call. Do NOT
+          // delete the render, since the vision-fallback choice below needs
+          // it still on disk to read.
+          //
+          // Deliberate choice (deferred-work.md's "mixed text/image-page
+          // handling" framing left this open): one bad page ALWAYS halts —
+          // even in a document where every other page already has good
+          // content — rather than silently marking that one page
+          // "unreadable" and proceeding with the rest. Two reasons: (1) "no
+          // readable text" isn't necessarily "genuinely blank" — it can be
+          // OCR failing on a real but awkwardly-scanned page (skewed, low
+          // contrast) that a human/vision read could still recover, so
+          // silently giving up here would lose real, recoverable content;
+          // (2) a uniform rule ("every failing page gets a chance at a real
+          // answer, no exceptions") is a simpler, more predictable contract
+          // for the agent than a conditional one keyed on how many other
+          // pages already succeeded. The cost is more Ask-First round trips
+          // for a document with several bad pages, one page resolved per
+          // call (see the design note above extractPdfPageTexts) — accepted
+          // as rare in practice: most scanned documents are either all fine
+          // or have at most one truly blank/unreadable page.
+          const pageCountNote = isMultiPage
+            ? ` This PDF has ${pageTexts.length} pages; page ${pageNum} is the one that needs a reply — any ` +
+              'other pages have already been read successfully and do not need to be resent. If a later page ' +
+              'also turns out unreadable, save_document will ask again for that one page once this one is resolved.'
+            : '';
+          return ok(
+            `This PDF has ${pageTexts.length} page(s). Page ${pageNum} has no extractable text layer ` +
+              `(scanned/image-only), and OCR on it, ${dims.width}x${dims.height}px, at ${renderPath} found ` +
+              'little to no readable text — the page may be genuinely blank or unreadable. Ask the user how to ' +
+              'proceed: either read that rendered image yourself and call save_document again with the same path ' +
+              `("${filePath}") and an "extractedText" argument containing what you read for page ${pageNum} ` +
+              'only, or call save_document again with the same path and extractedText: "" to save that page ' +
+              `with a placeholder note instead of blank/guessed text.${pageCountNote}` +
+              refreshRetryNote,
+          );
+        }
+
+        pageBodies.push(isMultiPage ? `[Page ${pageNum} — OCR]\n${ocrText}` : ocrText);
+        renderPathsToCleanup.push(renderPath);
+      }
+
+      // A completed save has nothing left to resume — the sidecar (if this
+      // document ever needed one at all) is reclaimed the same way as the
+      // per-page renders, on the same successful-save-only cleanup path
+      // below. Pushing it unconditionally is safe: cleaning up a sidecar
+      // that was never created is just a harmless no-op unlink failure.
+      if (isMultiPage) renderPathsToCleanup.push(sidecarPath);
+
+      bodyText = pageBodies.join('\n\n');
     } else if (IMAGE_EXTENSIONS.has(ext)) {
       // No rendering step — the uploaded file already IS the image to look
       // at. Always a two-call vision-read pattern (unlike a scanned PDF,
@@ -1145,7 +1675,7 @@ export async function saveDocumentImpl(
         if (recheck.meta.ambiguousExtensions) {
           throw new Error(
             `Multiple files found for document "${recheck.meta.slug}" (${recheck.meta.ambiguousExtensions.join(', ')}) — ` +
-              'this shouldn\'t normally happen. Check memory/documents/files/ for this slug manually before retrying.',
+              "this shouldn't normally happen. Check memory/documents/files/ for this slug manually before retrying.",
           );
         }
         const meta = recheck.meta;
@@ -1277,7 +1807,13 @@ export async function saveDocumentImpl(
           fs.copyFileSync(resolvedPath, rawDestPath, fs.constants.COPYFILE_EXCL);
           rawWritten = true;
 
-          const { conceptBody, savedDate, description } = buildConceptBody(originalFilename, slug, ext, bodyText, extractionNote);
+          const { conceptBody, savedDate, description } = buildConceptBody(
+            originalFilename,
+            slug,
+            ext,
+            bodyText,
+            extractionNote,
+          );
           fs.writeFileSync(conceptPath, conceptBody, { flag: 'wx' });
           conceptWritten = true;
 
@@ -1291,7 +1827,12 @@ export async function saveDocumentImpl(
           );
 
           log(`save_document: saved "${originalFilename}" as "${slug}"`);
-          return { kind: 'fresh', response: ok(`Saved "${originalFilename}" to memory as "${slug}". Recorded in memory/documents/${slug}.md.`) };
+          return {
+            kind: 'fresh',
+            response: ok(
+              `Saved "${originalFilename}" to memory as "${slug}". Recorded in memory/documents/${slug}.md.`,
+            ),
+          };
         } catch (e) {
           // Partial failure — a raw copy or concept file already landed with
           // no complete, consistent entry to show for it. Roll back whatever
@@ -1351,12 +1892,13 @@ export async function saveDocumentImpl(
       response = lockResult.response;
     }
 
-    if (renderPathToCleanup) {
+    for (const renderPath of renderPathsToCleanup) {
       try {
-        fs.unlinkSync(renderPathToCleanup);
+        fs.unlinkSync(renderPath);
       } catch {
-        // Best effort — an abandoned first-call render (no follow-up ever
-        // arrived) is not cleaned up here; see deferred-work.md.
+        // Best effort — an abandoned render (no follow-up ever arrived for
+        // that page) is not cleaned up here; sweepOldFiles reclaims it
+        // opportunistically on a later scanned-PDF render instead.
       }
     }
 
@@ -1868,6 +2410,38 @@ function treeIsWellFormed(nodes: XmlNode[]): boolean {
   return nodes.every((n) => n.close !== -1 && n.end !== -1 && treeIsWellFormed(n.children));
 }
 
+/**
+ * `parseOoxmlTree`'s tokenizer only recognizes the `w:` prefix (Word's own
+ * default, and what every real-world .docx this tool has been tested
+ * against uses). A document produced/re-saved by a tool that binds the
+ * WordprocessingML namespace to a *different* prefix has its tables (and
+ * everything else) silently invisible to the tokenizer — `tables.length`
+ * comes back 0 even though a `<otherprefix:tbl>` genuinely exists. Detected
+ * by reading the actual `xmlns:` declaration off the document root rather
+ * than guessing from tag shapes, so this only fires on a real prefix
+ * mismatch, never on a genuinely table-less document (which has no `xmlns:`
+ * mismatch to find). Full non-`w:` namespace support is out of scope (see
+ * deferred-work.md) — this exists only to make the resulting "no tables"
+ * failure legible instead of misleading.
+ */
+function detectNonWNamespacePrefix(xml: string): string | undefined {
+  const m = /xmlns:([A-Za-z0-9_]+)="http:\/\/schemas\.openxmlformats\.org\/wordprocessingml\/2006\/main"/.exec(xml);
+  if (!m) return undefined;
+  const prefix = m[1];
+  return prefix !== 'w' ? prefix : undefined;
+}
+
+/** Wraps a "no tables" fallback message with the more specific non-`w:`-namespace diagnosis when that's the actual cause, so the failure points at the real reason instead of reading as "this document genuinely has no tables." */
+function noTablesMessage(xml: string, fallback: string): string {
+  const prefix = detectNonWNamespacePrefix(xml);
+  if (!prefix) return fallback;
+  return (
+    `This document binds the Word XML namespace to the "${prefix}:" prefix instead of the standard "w:" prefix ` +
+    'this tool recognizes — table (and fill-in-the-blank line) detection only supports "w:"-prefixed documents, ' +
+    'so any tables in this file could not be found even though they may exist. Not supported.'
+  );
+}
+
 function collectDescendants(node: XmlNode, tag: OoxmlTag): XmlNode[] {
   const found: XmlNode[] = [];
   for (const child of node.children) {
@@ -1875,6 +2449,68 @@ function collectDescendants(node: XmlNode, tag: OoxmlTag): XmlNode[] {
     found.push(...collectDescendants(child, tag));
   }
   return found;
+}
+
+// ---------------------------------------------------------------------------
+// Merged-cell (w:gridSpan) visual-column resolution.
+//
+// A <w:tc>'s <w:tcPr> (its cell properties, e.g. <w:gridSpan w:val="N"/>)
+// isn't one of OOXML_TAGS, so parseOoxmlTree never gives it its own node —
+// it's opaque content living between the cell's opening tag and its first
+// *tracked* child (a paragraph, or a nested table). That's exactly the
+// region cellGridSpan searches: real OOXML always places tcPr first, before
+// any w:p/w:tbl content, so slicing up to the first tracked child's start
+// both finds the cell's own gridSpan and — just as important — stops before
+// a nested table's cells could contribute a gridSpan of their own into this
+// cell's span count.
+// ---------------------------------------------------------------------------
+
+/**
+ * A cell's merged-cell width in grid columns. Absent <w:gridSpan> means an
+ * ordinary unmerged cell (span 1). A malformed/unparseable w:val (missing,
+ * non-numeric, zero, or negative) is treated defensively as span 1 with a
+ * warning log, rather than throwing or silently corrupting the row's whole
+ * visual-column layout for every cell after it — the row's actual decline
+ * guards (nested table, row/table not found) already cover the genuinely
+ * unsafe cases; a bad gridSpan value on its own is "best-effort visual
+ * width," not a reason to refuse the whole row.
+ */
+function cellGridSpan(xml: string, cell: XmlNode): number {
+  const propsEnd = cell.children[0]?.start ?? cell.close;
+  const propsRegion = xml.slice(cell.openEnd, propsEnd);
+  const m = /<w:gridSpan\b[^>]*\bw:val="(-?\d+)"/.exec(propsRegion);
+  if (!m) return 1;
+  const span = Number(m[1]);
+  if (!Number.isInteger(span) || span < 1) {
+    log(`fill_document_field: malformed w:gridSpan value "${m[1]}" — treating cell as span 1`);
+    return 1;
+  }
+  return span;
+}
+
+interface VisualCell {
+  cell: XmlNode;
+  startCol: number; // 1-indexed, inclusive
+  endCol: number; // 1-indexed, inclusive
+}
+
+/**
+ * Walks a row's <w:tc> cells left to right, accumulating the visual-column
+ * range each occupies (a span-1 cell occupies exactly one visual column; a
+ * gridSpan=N cell occupies N consecutive ones). This is what lets a
+ * requested "column" be resolved unambiguously even when earlier cells in
+ * the row are merged: the Nth visual column always falls inside exactly one
+ * cell's range, by construction.
+ */
+function computeVisualColumns(xml: string, cells: XmlNode[]): VisualCell[] {
+  const out: VisualCell[] = [];
+  let col = 1;
+  for (const cell of cells) {
+    const span = cellGridSpan(xml, cell);
+    out.push({ cell, startCol: col, endCol: col + span - 1 });
+    col += span;
+  }
+  return out;
 }
 
 // stripControlChars first: `value` is untrusted (model-controlled), same as the filenames
@@ -1970,7 +2606,8 @@ const CONTENT_TYPES_NS = 'http://schemas.openxmlformats.org/package/2006/content
 // anything the source actually had, since these fallbacks are only ever used
 // when the part was entirely absent.
 const DEFAULT_RELS_XML =
-  '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + `<Relationships xmlns="${RELATIONSHIPS_XML_NS}"></Relationships>`;
+  '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' +
+  `<Relationships xmlns="${RELATIONSHIPS_XML_NS}"></Relationships>`;
 const DEFAULT_CONTENT_TYPES_XML =
   '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + `<Types xmlns="${CONTENT_TYPES_NS}"></Types>`;
 
@@ -2192,7 +2829,12 @@ async function prepareSignatureStamp(
 }
 
 /** Writes all three new/updated zip parts together, alongside the (already-spliced) new document.xml — never a partial subset. */
-function applySignatureZipParts(zip: JSZipType, newDocumentXml: string, signaturePng: Buffer, parts: SignatureStampParts): void {
+function applySignatureZipParts(
+  zip: JSZipType,
+  newDocumentXml: string,
+  signaturePng: Buffer,
+  parts: SignatureStampParts,
+): void {
   zip.file('word/document.xml', newDocumentXml);
   zip.file(`word/media/image${parts.mediaNumber}.png`, signaturePng);
   zip.file('word/_rels/document.xml.rels', parts.relsXml);
@@ -2338,7 +2980,9 @@ function readFillHistory(baseDir: string, slug: string): FillHistoryEntry[] {
       );
     });
     if (validRaw.length < parsed.length) {
-      log(`fill history for "${slug}" had ${parsed.length - validRaw.length} malformed entr(y/ies) — dropped, keeping the rest`);
+      log(
+        `fill history for "${slug}" had ${parsed.length - validRaw.length} malformed entr(y/ies) — dropped, keeping the rest`,
+      );
     }
     return validRaw.map((candidate) => ({
       timestamp: candidate.timestamp as string,
@@ -2347,7 +2991,9 @@ function readFillHistory(baseDir: string, slug: string): FillHistoryEntry[] {
       kind: candidate.kind === 'pre-refresh-snapshot' ? 'pre-refresh-snapshot' : 'fill',
     }));
   } catch (e) {
-    log(`fill history for "${slug}" is not valid JSON — ignoring corrupted index, treating as empty: ${e instanceof Error ? e.message : String(e)}`);
+    log(
+      `fill history for "${slug}" is not valid JSON — ignoring corrupted index, treating as empty: ${e instanceof Error ? e.message : String(e)}`,
+    );
     return [];
   }
 }
@@ -2384,7 +3030,10 @@ async function recordFillHistory(baseDir: string, slug: string, entry: FillHisto
     const existing = readFillHistory(baseDir, slug);
     const updated = [...existing, entry].slice(-FILL_HISTORY_CAP);
     const finalPath = fillHistoryPath(baseDir, slug);
-    const tmpPath = path.join(dir, `.${slug}.json.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+    const tmpPath = path.join(
+      dir,
+      `.${slug}.json.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    );
     fs.writeFileSync(tmpPath, JSON.stringify(updated, null, 2));
     fs.renameSync(tmpPath, finalPath);
   });
@@ -2533,11 +3182,14 @@ function formatDocxLineCandidates(candidates: DocxLineCandidate[]): string {
 }
 
 /** Discovery response for a table-less docx (or one where the caller explicitly asked for line targeting). */
-function docxListLines(candidates: DocxLineCandidate[]): ReturnType<typeof ok> | ReturnType<typeof err> {
+function docxListLines(xml: string, candidates: DocxLineCandidate[]): ReturnType<typeof ok> | ReturnType<typeof err> {
   if (candidates.length === 0) {
     return err(
-      'This document has no tables to fill, and no fill-in-the-blank line (an underscore blank or a ' +
-        'trailing-colon label) was detected either.',
+      noTablesMessage(
+        xml,
+        'This document has no tables to fill, and no fill-in-the-blank line (an underscore blank or a ' +
+          'trailing-colon label) was detected either.',
+      ),
     );
   }
   return ok(
@@ -2556,10 +3208,11 @@ const TABLE_ROW_REQUIRED_MESSAGE = 'row is required for a .docx fill (1-indexed 
  * only ever surfacing the table prompt with the blank lines undiscoverable.
  */
 function docxDiscoveryResponse(
+  xml: string,
   tables: XmlNode[],
   candidates: DocxLineCandidate[],
 ): ReturnType<typeof ok> | ReturnType<typeof err> {
-  if (tables.length === 0) return docxListLines(candidates);
+  if (tables.length === 0) return docxListLines(xml, candidates);
   if (candidates.length === 0) return err(TABLE_ROW_REQUIRED_MESSAGE);
   return ok(
     `${TABLE_ROW_REQUIRED_MESSAGE} Or use "lineNumber" instead to fill one of the detected fill-in-the-blank ` +
@@ -2663,9 +3316,7 @@ async function fillDocx(
   // priority, dropping lineNumber with no acknowledgment — an explicit
   // error is safer than a silent resolution.
   if (usesTablePath && lineNumberArg !== undefined) {
-    return err(
-      'Pass either "row"/"table" for the table-fill path or "lineNumber" for the text-line path, not both.',
-    );
+    return err('Pass either "row"/"table" for the table-fill path or "lineNumber" for the text-line path, not both.');
   }
   // column only means something for table-row targeting — without row/table
   // it used to be silently ignored.
@@ -2700,12 +3351,12 @@ async function fillDocx(
     // resolved (or errored) above but is otherwise unused here — this
     // response is identical whether or not one was passed, mirroring
     // fillPdf's own "no target given" branches.
-    return docxDiscoveryResponse(tables, findDocxLineCandidates(xml, roots));
+    return docxDiscoveryResponse(xml, tables, findDocxLineCandidates(xml, roots));
   }
 
   if (row === undefined) return err('row is required for a .docx fill (1-indexed row within the target table).');
   if (value === undefined && signaturePng === undefined) return err('value or signatureName is required.');
-  if (tables.length === 0) return err('This document has no tables to fill.');
+  if (tables.length === 0) return err(noTablesMessage(xml, 'This document has no tables to fill.'));
 
   let tableIndex: number;
   if (tableArg !== undefined) {
@@ -2722,23 +3373,36 @@ async function fillDocx(
   const targetRow = rows[row - 1];
   if (!targetRow) return err(`Row ${row} not found in table ${tableIndex} — it has ${rows.length} row(s).`);
 
-  // gridSpan (a merged cell) makes direct-<w:tc>-position counting unreliable
-  // for the *visual* column the user means — decline rather than silently
-  // filling the wrong one. Full merged-cell-aware targeting is out of scope
-  // (see deferred-work.md); this is detect-and-decline only.
-  if (/<w:gridSpan\b/.test(xml.slice(targetRow.start, targetRow.end))) {
-    return err(
-      `Row ${row} of table ${tableIndex} contains a merged cell (gridSpan) — column-by-position targeting isn't ` +
-        'reliable here, declining to edit it.',
-    );
-  }
-
   const cells = targetRow.children.filter((n) => n.tag === 'tc');
   if (cells.length === 0) return err(`Row ${row} in table ${tableIndex} has no cells.`);
-  const cellIndex = columnArg !== undefined ? columnArg : cells.length; // default: last cell (label|value shape)
-  const targetCell = cells[cellIndex - 1];
-  if (!targetCell) {
-    return err(`Column ${cellIndex} not found in row ${row} of table ${tableIndex} — it has ${cells.length} cell(s).`);
+
+  // Merged-cell (gridSpan) aware targeting: resolve the requested "column"
+  // (still 1-indexed, still meaning "the Nth visual column") against each
+  // cell's actual visual-column range rather than raw <w:tc> position. A
+  // gridSpan=N cell occupies N consecutive visual columns, so a request that
+  // lands inside one resolves to that single cell unambiguously — there's
+  // nothing left to decline here on gridSpan alone.
+  const visualCells = computeVisualColumns(xml, cells);
+  const totalVisualWidth = visualCells[visualCells.length - 1].endCol;
+
+  let targetCell: XmlNode;
+  let cellIndex: number; // reported to the caller — the resolved visual column
+  if (columnArg !== undefined) {
+    const match = visualCells.find((vc) => columnArg >= vc.startCol && columnArg <= vc.endCol);
+    if (!match) {
+      return err(
+        `Column ${columnArg} not found in row ${row} of table ${tableIndex} — this row has ${totalVisualWidth} ` +
+          'visual column(s).',
+      );
+    }
+    targetCell = match.cell;
+    cellIndex = columnArg;
+  } else {
+    // No column given: default to the last cell (label|value shape) — same
+    // raw-last-<w:tc> default as before gridSpan support existed. Reported
+    // as that cell's own starting visual column.
+    targetCell = cells[cells.length - 1];
+    cellIndex = visualCells[visualCells.length - 1].startCol;
   }
 
   if (nodeContainsTag(targetCell, 'tbl')) {
@@ -3197,7 +3861,9 @@ async function pdfFillAcroForm(
   try {
     textField = form.getTextField(fieldName);
   } catch (e) {
-    return err(`Field "${fieldName}" exists but isn't a fillable text field: ${e instanceof Error ? e.message : String(e)}`);
+    return err(
+      `Field "${fieldName}" exists but isn't a fillable text field: ${e instanceof Error ? e.message : String(e)}`,
+    );
   }
 
   if (signaturePng !== undefined) {
@@ -3448,7 +4114,12 @@ function tailOf(buf: unknown): string {
  * truth for the flag set, so a future flag change can't silently drift the
  * production invocation and the test fixture's invocation apart.
  */
-export function sofficeConvertArgs(inputPath: string, targetFormat: string, outDir: string, profileDir: string): string[] {
+export function sofficeConvertArgs(
+  inputPath: string,
+  targetFormat: string,
+  outDir: string,
+  profileDir: string,
+): string[] {
   return [
     '--headless',
     '--norestore',
@@ -3581,53 +4252,64 @@ function presentArgNames(args: Record<string, unknown>, keys: readonly string[])
   return keys.filter((k) => args[k] !== undefined);
 }
 
+// ---------------------------------------------------------------------------
+// fillOneDocument (spec-2 retro item — deferred-work.md) is split into three
+// steps composed by a thin orchestrator, matching the retro's own suggested
+// shape: resolveAndSnapshot (validation, arg gating, lock + snapshot-copy),
+// dispatchFill (pure dispatch to fillDocx/fillDoc/fillPdf + result-text
+// parsing), and recordCompletedFill (fill-history recording, logging,
+// temp-file cleanup). Pure structural split — no behavior change; every
+// error message, lock/snapshot/cleanup ordering, and history-recording
+// condition below is copied verbatim from the pre-split function.
+// ---------------------------------------------------------------------------
+
+type ResolveAndSnapshotResult = { ok: true; snapshotRawPath: string } | { ok: false; result: ReturnType<typeof err> };
+
 /**
- * Per-document fill body, shared by fill_document_field (single call, Story
- * 1.2 onward) and fill_document_field_batch (spec 2-2) — takes an
- * already-resolved DocumentMeta and `filesDir`, applies the exact same
- * file-type auto-detection, DOCX_ONLY_ARGS/PDF_ONLY_ARGS validation, and
- * fillDocx/fillDoc/fillPdf dispatch fill_document_field has always used.
- * Document *resolution* (turning a free-text query into a DocumentMeta,
- * including the ambiguous/not-found handshake) is deliberately the caller's
- * job, not this helper's — fill_document_field and the batch tool resolve
- * differently (resolveDocument's single-match-only contract vs. the batch
- * tool's per-entry/matchQuery resolution), so folding resolution in here
- * would force one shape onto both.
+ * Validation, per-file-type arg gating, per-slug lock acquisition, and
+ * snapshot-copy creation — the part of fillOneDocument that must happen
+ * before any dispatch. Returns the snapshot path dispatchFill should read
+ * from, or an already-final response (a validation/lock/snapshot failure)
+ * for the orchestrator to return unchanged.
  */
-async function fillOneDocument(
+async function resolveAndSnapshot(
   meta: DocumentMeta,
   filesDir: string,
   args: Record<string, unknown>,
   opts: FillOpts,
-  // Only affects the log line's prefix (so a batch-triggered fill is
-  // distinguishable from a single-call fill in nanoclaw.log) — never
-  // affects behavior. Defaults to the single-call tool's own name since
-  // that's this function's original, still-primary caller.
-  callerLabel: string = 'fill_document_field',
-): Promise<ReturnType<typeof ok> | ReturnType<typeof err>> {
+): Promise<ResolveAndSnapshotResult> {
   if (meta.ambiguousExtensions) {
-    return err(
-      `Multiple files found for document "${meta.slug}" (${meta.ambiguousExtensions.join(', ')}) — this ` +
-        'shouldn\'t normally happen. Check memory/documents/files/ for this slug manually before retrying.',
-    );
+    return {
+      ok: false,
+      result: err(
+        `Multiple files found for document "${meta.slug}" (${meta.ambiguousExtensions.join(', ')}) — this ` +
+          "shouldn't normally happen. Check memory/documents/files/ for this slug manually before retrying.",
+      ),
+    };
   }
 
   if (IMAGE_EXTENSIONS.has(meta.ext)) {
-    return err(
-      `"${meta.slug}" is a saved image (.${meta.ext}) — fill_document_field only fills/stamps a .docx, .doc, ` +
-        'or .pdf document. There is no field/target to fill on a plain image.',
-    );
+    return {
+      ok: false,
+      result: err(
+        `"${meta.slug}" is a saved image (.${meta.ext}) — fill_document_field only fills/stamps a .docx, .doc, ` +
+          'or .pdf document. There is no field/target to fill on a plain image.',
+      ),
+    };
   }
 
   if (meta.ext === 'pdf') {
     const wrongArgs = presentArgNames(args, DOCX_ONLY_ARGS);
     if (wrongArgs.length > 0) {
-      return err(`These arguments don't apply to a .pdf document: ${wrongArgs.join(', ')}.`);
+      return { ok: false, result: err(`These arguments don't apply to a .pdf document: ${wrongArgs.join(', ')}.`) };
     }
   } else {
     const wrongArgs = presentArgNames(args, PDF_ONLY_ARGS);
     if (wrongArgs.length > 0) {
-      return err(`These arguments don't apply to a .${meta.ext} document: ${wrongArgs.join(', ')}.`);
+      return {
+        ok: false,
+        result: err(`These arguments don't apply to a .${meta.ext} document: ${wrongArgs.join(', ')}.`),
+      };
     }
   }
 
@@ -3648,9 +4330,8 @@ async function fillOneDocument(
   // it's now a per-slug lock, a concurrent fill/refresh of a *different*
   // document never waits on it at all.
   const lockPath = rawFileLockPath(opts.baseDir, meta.slug);
-  let snapshotRawPath: string;
   try {
-    snapshotRawPath = await withLock(lockPath, () => {
+    const snapshotRawPath = await withLock(lockPath, () => {
       if (!fs.existsSync(rawPath)) {
         throw new Error(`Saved raw file for "${meta.slug}" is missing.`);
       }
@@ -3672,28 +4353,79 @@ async function fillOneDocument(
       fs.copyFileSync(rawPath, tmp);
       return tmp;
     });
+    return { ok: true, snapshotRawPath };
   } catch (e) {
-    return err(e instanceof Error ? e.message : String(e));
+    return { ok: false, result: err(e instanceof Error ? e.message : String(e)) };
   }
+}
 
+interface DispatchFillResult {
+  result: ReturnType<typeof ok> | ReturnType<typeof err>;
+  resultText: string;
+  isCompletedFill: boolean;
+}
+
+/**
+ * Pure dispatch to fillDocx/fillDoc/fillPdf (by `meta.ext`) plus result-text
+ * parsing to infer whether the call represents a completed fill (the
+ * FILL_SUCCESS_MARKER signal) versus a discovery/prompt/error response. No
+ * I/O side effects beyond the fill call itself — no history recording, no
+ * logging, no cleanup.
+ */
+async function dispatchFill(
+  snapshotRawPath: string,
+  meta: DocumentMeta,
+  args: Record<string, unknown>,
+  opts: FillOpts,
+): Promise<DispatchFillResult> {
+  const result =
+    meta.ext === 'docx'
+      ? await fillDocx(snapshotRawPath, meta, args, opts)
+      : meta.ext === 'doc'
+        ? await fillDoc(snapshotRawPath, meta, args, opts)
+        : await fillPdf(snapshotRawPath, meta, args, opts);
+
+  // History recording (spec 2-3) — the single choke point covering both
+  // fill_document_field and fill_document_field_batch, since both callers
+  // funnel through fillOneDocument. Gated on the exact same
+  // FILL_SUCCESS_MARKER signal the batch tool already uses to distinguish
+  // a completed fill from a discovery/prompt response — a discovery call
+  // or a per-item batch failure never reaches recordCompletedFill's
+  // history-write branch.
+  const resultText = typeof result.content[0]?.text === 'string' ? result.content[0].text : '';
+  const isCompletedFill = !('isError' in result && result.isError) && resultText.includes(FILL_SUCCESS_MARKER);
+  return { result, resultText, isCompletedFill };
+}
+
+/** Best-effort removal of a fill's snapshot read-copy under `.fill-tmp/` — never surfaced to the user. */
+function cleanupSnapshot(snapshotRawPath: string): void {
   try {
-    const result =
-      meta.ext === 'docx'
-        ? await fillDocx(snapshotRawPath, meta, args, opts)
-        : meta.ext === 'doc'
-          ? await fillDoc(snapshotRawPath, meta, args, opts)
-          : await fillPdf(snapshotRawPath, meta, args, opts);
+    fs.unlinkSync(snapshotRawPath);
+  } catch {
+    // Best effort — a leftover temp read-copy under .fill-tmp/ is
+    // harmless and never surfaced to the user.
+  }
+}
 
-    // History recording (spec 2-3) — the single choke point covering both
-    // fill_document_field and fill_document_field_batch, since both callers
-    // funnel through fillOneDocument. Gated on the exact same
-    // FILL_SUCCESS_MARKER signal the batch tool already uses to distinguish
-    // a completed fill from a discovery/prompt response — a discovery call
-    // or a per-item batch failure never reaches this point.
-    const resultText = typeof result.content[0]?.text === 'string' ? result.content[0].text : '';
-    const isCompletedFill = !('isError' in result && result.isError) && resultText.includes(FILL_SUCCESS_MARKER);
-    if (isCompletedFill) {
-      const outputPath = extractFillOutputPath(resultText);
+/**
+ * Records fill history (spec 2-3) for a completed fill, logs the outcome,
+ * and cleans up the snapshot read-copy — always, regardless of whether
+ * history recording succeeded. Called once dispatchFill has produced a
+ * result; callers that see dispatchFill itself throw must clean up the
+ * snapshot themselves (see fillOneDocument below) since this function never
+ * runs in that case.
+ */
+async function recordCompletedFill(
+  meta: DocumentMeta,
+  args: Record<string, unknown>,
+  opts: FillOpts,
+  callerLabel: string,
+  snapshotRawPath: string,
+  dispatch: DispatchFillResult,
+): Promise<ReturnType<typeof ok> | ReturnType<typeof err>> {
+  try {
+    if (dispatch.isCompletedFill) {
+      const outputPath = extractFillOutputPath(dispatch.resultText);
       if (outputPath) {
         try {
           await recordFillHistory(opts.baseDir, meta.slug, {
@@ -3714,20 +4446,64 @@ async function fillOneDocument(
         // extractFillOutputPath parses — but a future copy change to that
         // text could silently break extraction. Log it rather than letting a
         // completed fill silently get no history entry with zero trace.
-        log(`fill history: completed fill for ${meta.slug} matched FILL_SUCCESS_MARKER but no output path could be extracted from the result text`);
+        log(
+          `fill history: completed fill for ${meta.slug} matched FILL_SUCCESS_MARKER but no output path could be extracted from the result text`,
+        );
       }
     }
 
-    log(`${callerLabel}: ${meta.slug} (${meta.ext}) -> ${'isError' in result && result.isError ? 'error' : 'ok'}`);
-    return result;
+    log(
+      `${callerLabel}: ${meta.slug} (${meta.ext}) -> ${'isError' in dispatch.result && dispatch.result.isError ? 'error' : 'ok'}`,
+    );
+    return dispatch.result;
   } finally {
-    try {
-      fs.unlinkSync(snapshotRawPath);
-    } catch {
-      // Best effort — a leftover temp read-copy under .fill-tmp/ is
-      // harmless and never surfaced to the user.
-    }
+    cleanupSnapshot(snapshotRawPath);
   }
+}
+
+/**
+ * Per-document fill body, shared by fill_document_field (single call, Story
+ * 1.2 onward) and fill_document_field_batch (spec 2-2) — takes an
+ * already-resolved DocumentMeta and `filesDir`, applies the exact same
+ * file-type auto-detection, DOCX_ONLY_ARGS/PDF_ONLY_ARGS validation, and
+ * fillDocx/fillDoc/fillPdf dispatch fill_document_field has always used.
+ * Document *resolution* (turning a free-text query into a DocumentMeta,
+ * including the ambiguous/not-found handshake) is deliberately the caller's
+ * job, not this helper's — fill_document_field and the batch tool resolve
+ * differently (resolveDocument's single-match-only contract vs. the batch
+ * tool's per-entry/matchQuery resolution), so folding resolution in here
+ * would force one shape onto both.
+ *
+ * A thin orchestrator over resolveAndSnapshot / dispatchFill /
+ * recordCompletedFill (see those functions above) — composes the three in
+ * order, preserving the pre-split function's exact snapshot-cleanup timing:
+ * the snapshot is removed exactly once, whether dispatchFill returns
+ * normally (recordCompletedFill's own finally) or throws (the catch below).
+ */
+async function fillOneDocument(
+  meta: DocumentMeta,
+  filesDir: string,
+  args: Record<string, unknown>,
+  opts: FillOpts,
+  // Only affects the log line's prefix (so a batch-triggered fill is
+  // distinguishable from a single-call fill in nanoclaw.log) — never
+  // affects behavior. Defaults to the single-call tool's own name since
+  // that's this function's original, still-primary caller.
+  callerLabel: string = 'fill_document_field',
+): Promise<ReturnType<typeof ok> | ReturnType<typeof err>> {
+  const resolution = await resolveAndSnapshot(meta, filesDir, args, opts);
+  if (!resolution.ok) return resolution.result;
+
+  const { snapshotRawPath } = resolution;
+  let dispatch: DispatchFillResult;
+  try {
+    dispatch = await dispatchFill(snapshotRawPath, meta, args, opts);
+  } catch (e) {
+    cleanupSnapshot(snapshotRawPath);
+    throw e;
+  }
+
+  return recordCompletedFill(meta, args, opts, callerLabel, snapshotRawPath, dispatch);
 }
 
 export async function fillDocumentFieldImpl(
@@ -3737,7 +4513,7 @@ export async function fillDocumentFieldImpl(
   try {
     const documentQueryRaw = typeof args.document === 'string' ? args.document : undefined;
     const documentQuery = documentQueryRaw?.trim();
-    if (!documentQuery) return err('document is required — the saved document\'s name/slug/topic to fill.');
+    if (!documentQuery) return err("document is required — the saved document's name/slug/topic to fill.");
 
     const documentsDir = path.join(opts.baseDir, 'memory', 'documents');
     const filesDir = path.join(documentsDir, 'files');
@@ -3769,10 +4545,10 @@ export const fillDocumentField: McpToolDefinition = {
     name: 'fill_document_field',
     description:
       'Fill a value into a named target in a document already saved via save_document, and produce a new file ' +
-      "(the stored copy is never modified) — call send_file with the returned path to deliver it. For a .docx " +
+      '(the stored copy is never modified) — call send_file with the returned path to deliver it. For a .docx ' +
       "with a table: targets a table row (table/row, column optional — defaults to the row's last cell) — this " +
       'always wins over line targeting when row/table is given. For a .docx with no table (or when you give ' +
-      'lineNumber instead of row): targets a plain paragraph\'s fill-in-the-blank line — an underscore blank or ' +
+      "lineNumber instead of row): targets a plain paragraph's fill-in-the-blank line — an underscore blank or " +
       'a trailing-colon label — a first call with neither row nor lineNumber returns a discovery response ' +
       '(the detected blank lines, the table-row prompt, or both if the document has both a table and non-table ' +
       'blanks). Never pass row/table together with lineNumber. For a .pdf: targets an AcroForm field (fieldName) ' +
@@ -3780,7 +4556,7 @@ export const fillDocumentField: McpToolDefinition = {
       'detected lines to choose from) or, for a scanned PDF, a pixel position on a rendered page (a first call ' +
       'with no pixelX/pixelY renders page 1 and returns its pixel dimensions). For any file type, "signatureName" ' +
       '(instead of, or together with, "value") stamps a signature already saved via save_signature at whichever ' +
-      'target the call resolves to — for a .pdf: image only for the AcroForm case (the field\'s text is left ' +
+      "target the call resolves to — for a .pdf: image only for the AcroForm case (the field's text is left " +
       'unset), image plus text beside it if "value" is also given for the line/pixel cases; for a .docx: the ' +
       'image is always an additional inserted run (never a replacement) at the same table-cell or ' +
       'fill-in-the-blank-line target row/lineNumber would otherwise resolve, with an additional text run right ' +
@@ -3824,8 +4600,8 @@ export const fillDocumentField: McpToolDefinition = {
         lineNumber: {
           type: 'integer',
           description:
-            '1-indexed line (from a prior discovery call\'s numbered list) — for a .pdf text-layer, draws the ' +
-            'value after that line on the same baseline; for a .docx, fills that fill-in-the-blank paragraph\'s ' +
+            "1-indexed line (from a prior discovery call's numbered list) — for a .pdf text-layer, draws the " +
+            "value after that line on the same baseline; for a .docx, fills that fill-in-the-blank paragraph's " +
             'underscore run (each blank in a paragraph is its own numbered line) or trailing-colon label. ' +
             'Mutually exclusive with row/table for a .docx — passing both is an error.',
         },
@@ -4131,7 +4907,7 @@ export const saveDocument: McpToolDefinition = {
       'extractedText — and so does a scanned PDF in the rare case OCR finds little to no readable text), and ' +
       'records an entry in memory/index.md so it can be recalled later without resending it. Declines cleanly ' +
       'for any other file type. Give "document" to refresh an already-saved document in place instead of saving ' +
-      'a new one — see that argument\'s own description before using it.',
+      "a new one — see that argument's own description before using it.",
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -4155,14 +4931,14 @@ export const saveDocument: McpToolDefinition = {
           description:
             'Only set this when the user explicitly asked to replace/update/re-save an already-saved document ' +
             "with this new file's content — never as a default after a fill, and never just because the file " +
-            'looks related. Free-text match (same as every other tool here) against an already-saved document\'s ' +
+            "looks related. Free-text match (same as every other tool here) against an already-saved document's " +
             "slug/filename/description. When it resolves, that document's raw file and stored text are " +
             "overwritten in place with this call's content (same slug, extension changes if the new file is a " +
             'different type) — the pre-refresh version is snapshotted for recovery via list_document_versions, ' +
             'but this is still a real, deliberate overwrite, not a preview. Nothing checks that the file you pass ' +
             "actually corresponds to the document named in `document` — pointing it at the wrong document's " +
             'content is on you, not verified automatically. Omit entirely (the default) to save a new, ' +
-            "separately-slugged document as always. If it matches more than one saved document, returns a " +
+            'separately-slugged document as always. If it matches more than one saved document, returns a ' +
             'numbered candidate list instead of refreshing anything; if it matches none, errors instead of ' +
             'silently falling back to creating a new document.',
         },
@@ -4197,7 +4973,7 @@ export async function listDocumentVersionsImpl(
     const documentQueryRaw = typeof args.document === 'string' ? args.document : undefined;
     const documentQuery = documentQueryRaw?.trim();
     if (!documentQuery) {
-      return err('document is required — the saved document\'s name/slug/topic to list fill history for.');
+      return err("document is required — the saved document's name/slug/topic to list fill history for.");
     }
 
     const documentsDir = path.join(opts.baseDir, 'memory', 'documents');
@@ -4263,7 +5039,7 @@ export const listDocumentVersions: McpToolDefinition = {
     description:
       'List the version history of a document already saved via save_document, oldest to newest, each entry ' +
       'labeled with its kind: a completed fill_document_field/fill_document_field_batch output ("fill"), or a ' +
-      'save_document refresh\'s snapshot of the document as it was right before that refresh overwrote it ' +
+      "save_document refresh's snapshot of the document as it was right before that refresh overwrote it " +
       '("pre-refresh snapshot") — both share this same history index. Every entry still on disk gets a timestamp, ' +
       'a short description (e.g. "row 2", "fieldName: Date" for a fill; "pre-refresh snapshot" for a refresh), and ' +
       'its output path. Use this to find and resend an earlier version (an "undo") — pass the chosen output path ' +
@@ -4287,4 +5063,11 @@ export const listDocumentVersions: McpToolDefinition = {
   handler: (args) => listDocumentVersionsImpl(args, { baseDir: '/workspace/agent' }),
 };
 
-registerTools([saveDocument, listDocuments, fillDocumentField, fillDocumentFieldBatch, saveSignature, listDocumentVersions]);
+registerTools([
+  saveDocument,
+  listDocuments,
+  fillDocumentField,
+  fillDocumentFieldBatch,
+  saveSignature,
+  listDocumentVersions,
+]);

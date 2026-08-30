@@ -207,9 +207,10 @@ export const createCalendarEvent: McpToolDefinition = {
   tool: {
     name: 'create_calendar_event',
     description:
-      'Create a real event on one of this group\'s configured Google Calendars (at minimum Uriel\'s own; an ' +
-      'operator may add more, e.g. Devora\'s) — all reachable through one connected account, each other ' +
-      'calendar via sharing, not a separate connection.',
+      "Create a real event on one of this group's configured Google Calendars (at minimum Uriel's own; an " +
+      "operator may add more, e.g. Devora's) — all reachable through one connected account, each other " +
+      'calendar via sharing, not a separate connection. Runs a duplicate pre-check first (an extra read before ' +
+      'the write), so a successful call is two network round trips, not one.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -335,7 +336,13 @@ export const createCalendarEvent: McpToolDefinition = {
       );
     }
 
-    const duplicate = findDuplicateCandidate(precheck.events, title, startUtc, new Date(), Boolean(eventBody.recurrence));
+    const duplicate = findDuplicateCandidate(
+      precheck.events,
+      title,
+      startUtc,
+      new Date(),
+      Boolean(eventBody.recurrence),
+    );
     if (duplicate) {
       const ageDesc = formatAgeDesc(duplicate.ageMs);
       // A recurring create has a bigger blast radius than a one-off (an
@@ -355,7 +362,9 @@ export const createCalendarEvent: McpToolDefinition = {
           `Not created — "${title}" looks like a duplicate of an event already on ${calendar}'s calendar (created ${ageDesc}).`,
         );
       }
-      log(`create_calendar_event: possible duplicate of "${title}" on ${calendar}'s calendar — user confirmed create anyway`);
+      log(
+        `create_calendar_event: possible duplicate of "${title}" on ${calendar}'s calendar — user confirmed create anyway`,
+      );
     }
 
     let response: Response;
@@ -418,7 +427,8 @@ export const createCalendarEvent: McpToolDefinition = {
     // Same echo-preference as attendees above: Google's own response is the
     // source of truth for what recurrence was actually set, falling back to
     // what was sent only if the response happens to omit the field.
-    const confirmedRecurrence = Array.isArray(event.recurrence) && event.recurrence.length ? event.recurrence : eventBody.recurrence;
+    const confirmedRecurrence =
+      Array.isArray(event.recurrence) && event.recurrence.length ? event.recurrence : eventBody.recurrence;
     if (confirmedRecurrence && confirmedRecurrence.length > 0) {
       lines.push(`Recurrence: ${confirmedRecurrence.join(', ')}`);
     }
@@ -463,6 +473,14 @@ interface CalendarEventItem {
    * on `recurrence` above (spec cal-2.1 review loop 1 correction).
    */
   recurringEventId?: string;
+  /**
+   * Guest list, when present. Added 2026-08-28 (real gap found live: a
+   * diagnostic check of whether guest-resolution actually added an
+   * attendee to a created event had no way to confirm it — `formatEventLine`
+   * previously dropped this field entirely, so `list_calendar_events` and
+   * `update_calendar_event`'s candidate list could never show it either).
+   */
+  attendees?: Array<{ email: string }>;
 }
 
 interface EventsListApiResponse {
@@ -486,7 +504,10 @@ function startOfTodayUtc(): Date {
     day: '2-digit',
   });
   const parts = Object.fromEntries(
-    fmt.formatToParts(new Date()).filter((p) => p.type !== 'literal').map((p) => [p.type, p.value]),
+    fmt
+      .formatToParts(new Date())
+      .filter((p) => p.type !== 'literal')
+      .map((p) => [p.type, p.value]),
   );
   return parseZonedToUtc(`${parts.year}-${parts.month}-${parts.day}T00:00:00`, TIMEZONE);
 }
@@ -569,6 +590,10 @@ function formatEventLine(ev: CalendarEventItem): string {
   const title = ev.summary ?? '(no title)';
   let line = `[${ev.id}] ${title} — ${formatEventTimeRange(ev.start, ev.end)}`;
   if (ev.location) line += ` @ ${ev.location}`;
+  if (ev.attendees?.length) {
+    const noun = ev.attendees.length === 1 ? 'guest' : 'guests';
+    line += ` (${ev.attendees.length} ${noun}: ${ev.attendees.map((a) => a.email).join(', ')})`;
+  }
   if (ev.recurringEventId || ev.recurrence) line += ' (recurring)';
   return line;
 }
@@ -722,10 +747,7 @@ function formatAgeDesc(ageMs: number): string {
  * exact instant + recent `created`); this one's job is "does the NEW time
  * hit something ELSE" — a different question with a much simpler answer.
  */
-function findCollisionCandidate(
-  events: CalendarEventItem[],
-  targetEventId: string,
-): CalendarEventItem | undefined {
+function findCollisionCandidate(events: CalendarEventItem[], targetEventId: string): CalendarEventItem | undefined {
   return events.find((ev) => ev.id !== targetEventId);
 }
 
@@ -745,8 +767,7 @@ async function searchEvents(
   calendarId: string,
   params: { query?: string; from?: string; to?: string },
 ): Promise<
-  | { events: CalendarEventItem[]; truncated: boolean; timeMin: Date; timeMax: Date }
-  | { error: CallToolResult }
+  { events: CalendarEventItem[]; truncated: boolean; timeMin: Date; timeMax: Date } | { error: CallToolResult }
 > {
   const window = resolveTimeWindow(params.from, params.to);
   if ('error' in window) return { error: err(window.error) };
@@ -924,7 +945,8 @@ export const updateCalendarEvent: McpToolDefinition = {
         },
         from: {
           type: 'string',
-          description: 'Optional search window start, naive local wall-clock, used only with eventQuery. Defaults to start of today.',
+          description:
+            'Optional search window start, naive local wall-clock, used only with eventQuery. Defaults to start of today.',
         },
         to: {
           type: 'string',
@@ -1341,7 +1363,7 @@ export const deleteCalendarEvent: McpToolDefinition = {
     description:
       "Delete a real event from one of this group's configured Google Calendars (at minimum Uriel's own; an " +
       "operator may add more, e.g. Devora's). This cannot be undone. The tool itself " +
-      "blocks and asks the user to confirm (a real yes/no card, same mechanism as ask_user_question) before " +
+      'blocks and asks the user to confirm (a real yes/no card, same mechanism as ask_user_question) before ' +
       'issuing the actual delete — there is nothing else to orchestrate, one call resolves the target, gets a ' +
       'real confirmation, and deletes (or does not) in sequence. Target the event either by a known eventId or ' +
       'by eventQuery free-text search.',
@@ -1369,7 +1391,8 @@ export const deleteCalendarEvent: McpToolDefinition = {
         },
         from: {
           type: 'string',
-          description: 'Optional search window start, naive local wall-clock, used only with eventQuery. Defaults to start of today.',
+          description:
+            'Optional search window start, naive local wall-clock, used only with eventQuery. Defaults to start of today.',
         },
         to: {
           type: 'string',

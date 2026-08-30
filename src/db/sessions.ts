@@ -145,10 +145,34 @@ export function getRunningSessions(): Session[] {
     .all() as Session[];
 }
 
+/**
+ * `managed_by` is deliberately NOT part of this Pick — see `setSessionManagedBy`
+ * below. A `Record<string, unknown>` cast (a future copy-paste from a similar
+ * update call, a self-mod addition, etc.) could still smuggle the key past the
+ * type system, so the runtime guard below is the real backstop.
+ */
 export function updateSession(
   id: string,
-  updates: Partial<Pick<Session, 'status' | 'container_status' | 'last_active' | 'agent_provider' | 'managed_by'>>,
+  updates: Partial<Pick<Session, 'status' | 'container_status' | 'last_active' | 'agent_provider'>>,
 ): void {
+  // Guard against a future code path writing `managed_by` through the generic
+  // update path (AD-6 finding, deferred-work.md spec-eval-1-5-host-sweep-exclusion.md):
+  // an eval session's invisibility to host-sweep/delivery (getActiveSessions /
+  // getRunningSessions) depends entirely on `managed_by='eval'` being set ONLY
+  // by resolveEvalSession (eval/session.ts), via `setSessionManagedBy` below —
+  // never as a side effect of an ordinary status/heartbeat/provider update. A
+  // real session accidentally marked 'eval' would silently and permanently
+  // vanish from sweep/delivery with no error anywhere, so this rejects loudly
+  // (matching this codebase's convention for other "shouldn't be reachable via
+  // the generic path" cases, e.g. `--cli-scope` validation in groups.ts) rather
+  // than silently stripping the field.
+  if ('managed_by' in updates) {
+    throw new Error(
+      "updateSession() cannot set 'managed_by' — use setSessionManagedBy() instead " +
+        "(the narrow, sole legitimate writer, used only by eval/session.ts's resolveEvalSession).",
+    );
+  }
+
   const fields: string[] = [];
   const values: Record<string, unknown> = { id };
 
@@ -163,6 +187,18 @@ export function updateSession(
   getDb()
     .prepare(`UPDATE sessions SET ${fields.join(', ')} WHERE id = @id`)
     .run(values);
+}
+
+/**
+ * Narrow, sole legitimate writer for `managed_by` outside of `createSession`'s
+ * own initial insert. Used only by `eval/session.ts`'s `resolveEvalSession` to
+ * backfill the AD-6 exclusion marker onto a session created before the marker
+ * existed. Deliberately NOT reachable through the generic `updateSession()` —
+ * see its guard above — so no future code path can accidentally make a real
+ * session invisible to host-sweep/delivery by writing `managed_by='eval'`.
+ */
+export function setSessionManagedBy(id: string, managedBy: string | null): void {
+  getDb().prepare('UPDATE sessions SET managed_by = @managed_by WHERE id = @id').run({ id, managed_by: managedBy });
 }
 
 export function deleteSession(id: string): void {

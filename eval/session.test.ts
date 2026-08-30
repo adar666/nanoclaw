@@ -8,9 +8,19 @@ vi.mock('../src/config.js', async (importOriginal) => ({
   DATA_DIR: '/tmp/nanoclaw-eval-session-test/data',
 }));
 
+// Calls through to the real implementation by default (every existing test
+// below relies on the real filesystem/DB-schema side effects) — only the
+// rollback test overrides it, via mockImplementationOnce, to simulate the
+// follow-up filesystem step throwing after the DB insert already committed.
+vi.mock('../src/session-manager.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/session-manager.js')>();
+  return { ...actual, initSessionFolder: vi.fn(actual.initSessionFolder) };
+});
+
 import { closeDb, initTestDb, runMigrations } from '../src/db/index.js';
 import { createAgentGroup } from '../src/db/agent-groups.js';
 import { getSessionsByAgentGroup } from '../src/db/sessions.js';
+import { initSessionFolder } from '../src/session-manager.js';
 import { EVAL_THREAD_PREFIX, resolveEvalSession } from './session.js';
 
 const AG = 'ag-eval-session-test';
@@ -67,5 +77,31 @@ describe('resolveEvalSession', () => {
   it('throws for a thread id that merely contains the prefix without the leading anchor', () => {
     expect(() => resolveEvalSession(AG, 'system:evaluation:oops')).toThrow(/system:eval/);
     expect(getSessionsByAgentGroup(AG)).toHaveLength(0);
+  });
+
+  it('rolls back (deletes) the session row when the filesystem step throws after the DB insert commits (deferred-work.md, spec-eval-1-1)', () => {
+    vi.mocked(initSessionFolder).mockImplementationOnce(() => {
+      throw new Error('disk full');
+    });
+    const threadId = `${EVAL_THREAD_PREFIX}:rollback-test`;
+
+    expect(() => resolveEvalSession(AG, threadId)).toThrow(/disk full/);
+
+    // No orphaned row left behind for a later resolveEvalSession call to
+    // find and treat as already-provisioned.
+    expect(getSessionsByAgentGroup(AG).filter((s) => s.thread_id === threadId)).toHaveLength(0);
+  });
+
+  it('a later resolveEvalSession call for the same thread id after a rollback creates a fresh session rather than silently no-oping', () => {
+    vi.mocked(initSessionFolder).mockImplementationOnce(() => {
+      throw new Error('disk full');
+    });
+    const threadId = `${EVAL_THREAD_PREFIX}:rollback-retry`;
+    expect(() => resolveEvalSession(AG, threadId)).toThrow();
+
+    const { session, created } = resolveEvalSession(AG, threadId);
+
+    expect(created).toBe(true);
+    expect(session.thread_id).toBe(threadId);
   });
 });
