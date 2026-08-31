@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 08-16-2026 12:00
-last_updated: 08-25-2026 00:00
+last_updated: 08-31-2026 00:00
 project: nanoclaw-v2
 project_key: NOKEY
 tracking_system: file-system
@@ -114,20 +114,20 @@ action_items:
     action: "ocrPngText's 60s timeout does not cancel the underlying tesseract worker;
       orphaned background work and no coordination on concurrent .ocr-cache writes."
     owner: "dev"
-    status: open
-    ref: "_bmad-output/implementation-artifacts/epic-2-retro-2026-08-25.md"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/deferred-work.md (resolved 2026-08-28)"
   - id: "epic-2-retro-item-10-fillonedocument-has-accumulated-several"
     epic: 2
     action: "fillOneDocument has accumulated several distinct concerns (validation,
       locking, snapshotting, dispatch, history recording, cleanup) across all 4 epic-2
       stories - future refactor candidate."
     owner: "dev"
-    status: open
-    ref: "_bmad-output/implementation-artifacts/epic-2-retro-2026-08-25.md"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/deferred-work.md (resolved 2026-08-28)"
   - id: "epic-2-retro-item-11-fillonedocument-snapshot-then-dispatch-t"
     epic: 2
     action: "fillOneDocument snapshot-then-dispatch-then-delete assumes fillDocx/fillDoc/fillPdf
       fully finish reading the input path before returning - never directly audited."
     owner: "dev"
-    status: open
-    ref: "_bmad-output/implementation-artifacts/epic-2-retro-2026-08-25.md"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/deferred-work.md (resolved 2026-08-25)"
