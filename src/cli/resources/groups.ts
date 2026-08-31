@@ -565,6 +565,28 @@ registerResource({
         const containerPath = (args.container ?? args['container-path']) as string | undefined;
         if (!hostPath || !containerPath) throw new Error('Provide --host <host-path> and --container <container-path>');
 
+        // spec 1.1 ("Read a Fact Shared by Another Agent Group"): a
+        // `*-shared/` containerPath is the cross-group shared-facts
+        // convention `read_shared_context` scans — it must never land RW by
+        // accident (the CLI's default when `--ro` is omitted). Reject before
+        // the mount object is even built, so nothing is written to
+        // `additional_mounts` on this path. Any other containerPath is
+        // unaffected.
+        //
+        // review_loop_iteration 1 fix: match ANY path segment ending in
+        // `-shared`, not just a path containing a trailing `-shared/`. The
+        // original `/-shared\//` regex required a slash after the segment,
+        // so a bare `--container household-shared` (no filename) silently
+        // bypassed the guard — the exact footgun this story exists to
+        // close, just missed at the boundary (see Spec Change Log).
+        const isReadonly = Boolean(args.ro || args.readonly);
+        if (/(^|\/)[^/]+-shared(\/|$)/.test(containerPath) && !isReadonly) {
+          throw new Error(
+            `--container "${containerPath}" matches the shared-facts convention ("*-shared") — pass --ro to mount it read-only. ` +
+              'A read-write mount into a *-shared path is not allowed.',
+          );
+        }
+
         const row = getContainerConfig(id);
         if (!row) throw new Error(`No container config for group: ${id}`);
 
@@ -576,7 +598,7 @@ registerResource({
         const mount: AdditionalMountConfig = {
           hostPath,
           containerPath,
-          readonly: Boolean(args.ro || args.readonly),
+          readonly: isReadonly,
         };
         const existing = JSON.parse(row.additional_mounts) as AdditionalMountConfig[];
         if (!existing.some((m) => m.hostPath === hostPath && m.containerPath === containerPath)) {

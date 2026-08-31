@@ -276,6 +276,88 @@ describe('groups config add-mount / remove-mount (host-only)', () => {
       { hostPath: '/data/writable.db', containerPath: 'writable.db', readonly: false },
     ]);
   });
+
+  // spec 1.1 ("Read a Fact Shared by Another Agent Group"): a `*-shared/`
+  // containerPath is the cross-group shared-facts convention
+  // `read_shared_context` scans — it must never land RW by accident.
+  it('rejects a *-shared/ containerPath without --ro, and writes nothing', async () => {
+    const GID = 'ag-mount-shared-rw';
+    createAgentGroup({ id: GID, name: 'm', folder: 'm', agent_provider: null, created_at: now() });
+    ensureContainerConfig(GID);
+    const args = {
+      id: GID,
+      host: '/data/groups/household/memory/household/shared-facts.md',
+      container: 'household-shared/shared-facts.md',
+    };
+
+    const add = await dispatch({ id: 'r1', command: 'groups-config-add-mount', args }, { caller: 'host' });
+    expect(add.ok).toBe(false);
+    if (!add.ok) expect(add.error.message).toMatch(/--ro/);
+    expect(JSON.parse(getContainerConfig(GID)!.additional_mounts)).toEqual([]);
+  });
+
+  it('allows a *-shared/ containerPath with --ro, exactly like any other mount (real eval/prod precedent)', async () => {
+    // Exact containerPath shape already live in production (verified against
+    // the real DB: every dm-with-uriel/dm-with-partner/household-eval
+    // container_configs row already carries this exact hostPath/containerPath
+    // pair, always with readonly: true) and used verbatim by
+    // eval/setup.ts's ensureEvalPeopleMount. This confirms the new guard
+    // doesn't regress the mount this convention was named after.
+    const GID = 'ag-mount-shared-ro';
+    createAgentGroup({ id: GID, name: 'm', folder: 'm', agent_provider: null, created_at: now() });
+    ensureContainerConfig(GID);
+    const args = {
+      id: GID,
+      host: '/data/groups/household/memory/household/people.md',
+      container: 'household-shared/people.md',
+      ro: true,
+    };
+
+    const add = await dispatch({ id: 'r1', command: 'groups-config-add-mount', args }, { caller: 'host' });
+    expect(add.ok).toBe(true);
+    expect(JSON.parse(getContainerConfig(GID)!.additional_mounts)).toEqual([
+      {
+        hostPath: '/data/groups/household/memory/household/people.md',
+        containerPath: 'household-shared/people.md',
+        readonly: true,
+      },
+    ]);
+  });
+
+  // review_loop_iteration 1: the original `/-shared\//` regex required a
+  // trailing slash, so a bare `<folder>-shared` (no filename) silently
+  // bypassed the guard — the exact footgun this story exists to close.
+  it('rejects a bare "<folder>-shared" containerPath (no filename) without --ro', async () => {
+    const GID = 'ag-mount-shared-bare';
+    createAgentGroup({ id: GID, name: 'm', folder: 'm', agent_provider: null, created_at: now() });
+    ensureContainerConfig(GID);
+    const args = {
+      id: GID,
+      host: '/data/groups/household/memory/household',
+      container: 'household-shared',
+    };
+
+    const add = await dispatch({ id: 'r1', command: 'groups-config-add-mount', args }, { caller: 'host' });
+    expect(add.ok).toBe(false);
+    if (!add.ok) expect(add.error.message).toMatch(/--ro/);
+    expect(JSON.parse(getContainerConfig(GID)!.additional_mounts)).toEqual([]);
+  });
+
+  it('a containerPath with no "-shared/" segment, without --ro, is unaffected by the new guard', async () => {
+    const GID = 'ag-mount-plain';
+    createAgentGroup({ id: GID, name: 'm', folder: 'm', agent_provider: null, created_at: now() });
+    ensureContainerConfig(GID);
+    // No "-shared/" anywhere in this containerPath — the new guard's regex
+    // never fires, so behavior is exactly what add-mount already did before
+    // this story, unaffected.
+    const args = { id: GID, host: '/data/groups/household/memory/household/people.md', container: 'people.md' };
+
+    const add = await dispatch({ id: 'r1', command: 'groups-config-add-mount', args }, { caller: 'host' });
+    expect(add.ok).toBe(true);
+    expect(JSON.parse(getContainerConfig(GID)!.additional_mounts)).toEqual([
+      { hostPath: '/data/groups/household/memory/household/people.md', containerPath: 'people.md', readonly: false },
+    ]);
+  });
 });
 
 // spec cal-2.3: `ncl groups config add-calendar` / `config remove-calendar`,
