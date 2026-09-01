@@ -34,3 +34,7 @@ add_calendar({ name: "family", calendarId: "family-cal@group.calendar.google.com
 ```
 
 **This is the general rule for every `ncl groups config add-X`/`remove-X` verb, not just this one**: `install_packages`, `add_mcp_server`, and `add_calendar` each have a matching `ncl` CLI verb that does the same underlying thing, but only the tool call gives you the auto-restart+notify flow. Check whether a self-mod tool exists for what you're trying to do before reaching for `ncl config add-X`/`remove-X` — `ncl` is for everything that doesn't have one (and for reads).
+
+### Your own self-mod history (`/workspace/agent/self-mod-log.md`)
+
+Every approved change above (once applied) appends one line to `self-mod-log.md` in your own workspace — read it directly if the user asks what you've changed about yourself recently, or why a given package/MCP server/calendar is configured the way it is. It's read-only from your side (mounted that way on purpose) — you can read it, but you can't edit or clear it.

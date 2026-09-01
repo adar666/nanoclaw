@@ -508,6 +508,15 @@ export function buildMounts(
     mounts.push({ hostPath: containerJsonPath, containerPath: '/workspace/agent/container.json', readonly: true });
   }
 
+  // self-mod-log.md — nested RO mount, same conditional-existence pattern as
+  // container.json above. Host-side self-mod apply handlers
+  // (src/modules/self-mod/apply.ts) are its sole writer; the agent can read
+  // its own change-provenance log but never tamper with it.
+  const selfModLogPath = path.join(groupDir, 'self-mod-log.md');
+  if (fs.existsSync(selfModLogPath)) {
+    mounts.push({ hostPath: selfModLogPath, containerPath: '/workspace/agent/self-mod-log.md', readonly: true });
+  }
+
   // Composer-managed CLAUDE.md artifacts — nested RO mounts. These are
   // regenerated from the shared base + fragments on every spawn; any
   // agent-side writes would be clobbered, so enforce read-only. The shared

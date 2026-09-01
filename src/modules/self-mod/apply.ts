@@ -21,6 +21,20 @@ import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { notifyAgent } from '../approvals/index.js';
+import { appendSelfModLog } from './self-mod-log.js';
+
+// review round 1 (spec 2-2): appendSelfModLog does synchronous file I/O that
+// can throw (permission error, disk full) — never let a provenance-log
+// failure crash an apply that has already mutated real config/killed the
+// container. A log-write failure is worth knowing about, never worth losing
+// the actual applied change over.
+function logSelfModChange(agentGroupId: string, action: string, reason: string | undefined): void {
+  try {
+    appendSelfModLog(agentGroupId, action, reason);
+  } catch (e) {
+    log.error('self-mod-log append failed (change was still applied)', { agentGroupId, action, err: e });
+  }
+}
 
 export async function applyInstallPackages(payload: Record<string, unknown>, session: Session): Promise<void> {
   const agentGroup = getAgentGroup(session.agent_group_id);
@@ -58,6 +72,10 @@ export async function applyInstallPackages(payload: Record<string, unknown>, ses
   log.info('Package install approved', { agentGroupId: session.agent_group_id });
   try {
     await buildAgentGroupImage(session.agent_group_id);
+    // review round 1: log only once the rebuild actually succeeds — the
+    // catch branch below reports a failed rebuild, and a provenance entry
+    // claiming "applied" on a run that failed would be misleading.
+    logSelfModChange(agentGroup.id, 'install_packages', payload.reason as string | undefined);
     writeSessionMessage(session.agent_group_id, session.id, {
       id: `appr-note-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       kind: 'chat',
@@ -126,6 +144,7 @@ export async function applyAddMcpServer(payload: Record<string, unknown>, sessio
     const s = getSession(session.id);
     if (s) wakeContainer(s);
   });
+  logSelfModChange(agentGroup.id, 'add_mcp_server', payload.reason as string | undefined);
   log.info('MCP server add approved', { agentGroupId: session.agent_group_id });
 }
 
@@ -171,5 +190,6 @@ export async function applyAddCalendar(payload: Record<string, unknown>, session
     const s = getSession(session.id);
     if (s) wakeContainer(s);
   });
+  logSelfModChange(agentGroup.id, 'add_calendar', payload.reason as string | undefined);
   log.info('Calendar registry add approved', { agentGroupId: session.agent_group_id });
 }

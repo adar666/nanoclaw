@@ -374,3 +374,16 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-2-1-task-reminder-provenance.md`
   summary: There is no way to set or correct a task's `reason` after creation — `ncl tasks update` gains no `reason` field, so a wrong/stale/forgotten reason on a long-lived recurring series can only be fixed by deleting and recreating the whole task.
   evidence: Blind-hunter review finding. Real UX gap, but out of this story's scope (SPEC.md's own success signal only asks for a why-record at creation time, not editability) — revisit if it comes up in practice.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-2-self-mod-change-provenance.md`
+  summary: `add_mcp_server`'s own MCP tool schema (`container/agent-runner/src/mcp-tools/self-mod.ts`) has no `reason` field at all, unlike `install_packages`/`add_calendar` — so one of the three self-mod action types can never carry a reason in the provenance log.
+  evidence: Blind-hunter review finding. Pre-existing gap in that tool's own schema, not introduced by this story; adding a `reason` field there is a real but separate scope-expansion of an existing tool's arguments, not a logging-story change.
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-2-self-mod-change-provenance.md`
+  summary: No `ncl` CLI verb exists to list/read an agent group's self-mod history (unlike `tasks`, `approvals`, `sessions`) — an operator has to know to look at `groups/<folder>/self-mod-log.md` on disk directly.
+  evidence: Blind-hunter review finding. Real UX gap; Story 2.4 (on-demand cross-domain digest) is the natural place this gets a real query surface, not this narrow logging story.
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-2-self-mod-change-provenance.md`
+  summary: No test exercises the full request-approval-replay pipeline confirming `reason` actually survives JSON-stringify in the MCP tool, storage as a pending approval, and deserialization on replay before reaching `apply.ts` — only the direct-call level (`applyXxx(payload, session)`) is tested.
+  evidence: Blind-hunter review finding. Real coverage gap; building a full pipeline-level fixture is a bigger investment than this story's narrow scope, and the direct-call tests already pin the contract at the boundary this story actually changed.
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-2-self-mod-change-provenance.md`
+  summary: `SELF_MOD_LOG_CAP` (20) is hardcoded with no operator-facing config to raise/disable it for a group with heavy self-mod activity, and the cap/trim logic assumes every non-empty line is one well-formed entry (a hand-edited multi-line note in the host file could be miscounted and silently trimmed).
+  evidence: Blind-hunter review finding. Low-likelihood (self-mod events are naturally rare at household scale; hand-editing the log file is an out-of-band operator action) — revisit if either scenario surfaces in practice.
