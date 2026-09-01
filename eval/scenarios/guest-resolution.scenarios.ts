@@ -159,7 +159,7 @@ function isQuoted(text: string, matchStart: number, matchEnd: number): boolean {
  * itself (the "refusal" shape — reuses this file's existing `NEGATION_WORD`
  * check, same reasoning already applied to cleanup confirmation above).
  */
-function emailConfirmedInReply(text: string, email: string): boolean {
+export function emailConfirmedInReply(text: string, email: string): boolean {
   const escaped = email.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const matches = [...text.matchAll(new RegExp(escaped, 'g'))];
   if (matches.length === 0) return false;

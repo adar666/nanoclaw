@@ -21,6 +21,7 @@
 import type { OutboundMessage } from '../src/db/session-db.js';
 import type { DeterministicCheck } from './judge/deterministic.js';
 import { guestResolutionScenarioSet } from './scenarios/guest-resolution.scenarios.js';
+import { sharedContextScenarioSet } from './scenarios/shared-context.scenarios.js';
 
 /**
  * Runs as a same-thread follow-up turn after judging, regardless of verdict
@@ -57,6 +58,7 @@ export type ScenarioSetFactory = (agentGroupId: string) => ScenarioSet;
 /** Static registry — add a new scenario set by adding one entry here. */
 export const SCENARIO_SETS: Record<string, ScenarioSetFactory> = {
   'guest-resolution': guestResolutionScenarioSet,
+  'shared-context': sharedContextScenarioSet,
 };
 
 /**

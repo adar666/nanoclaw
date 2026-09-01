@@ -102,5 +102,63 @@ describe('loadScenarios', () => {
 
   it("the unknown-set error names the known sets so it's actionable", () => {
     expect(() => loadScenarios('nonexistent', AG)).toThrow(/guest-resolution/);
+    // review round 1 (story 1.2): the error message lists every registered
+    // set, not just the first one added — this test only exercised
+    // guest-resolution until shared-context was registered alongside it.
+    expect(() => loadScenarios('nonexistent', AG)).toThrow(/shared-context/);
+  });
+});
+
+describe('loadScenarios (shared-context)', () => {
+  it('is registered with a "shared-context" entry', () => {
+    expect(Object.keys(SCENARIO_SETS)).toContain('shared-context');
+  });
+
+  it('returns a ScenarioSet whose name matches the registered key and stamps every scenario with the given agentGroupId', () => {
+    const set = loadScenarios('shared-context', AG);
+
+    expect(set.name).toBe('shared-context');
+    expect(set.scenarios.length).toBeGreaterThan(0);
+    for (const scenario of set.scenarios) {
+      expect(scenario.agentGroupId).toBe(AG);
+    }
+  });
+
+  it('includes the shared-context-known-fact scenario with a deterministic judging check and no cleanup', () => {
+    const set = loadScenarios('shared-context', AG);
+    const scenario = set.scenarios.find((s) => s.id === 'shared-context-known-fact');
+
+    expect(scenario).toBeDefined();
+    expect(scenario!.judging.type).toBe('deterministic');
+    expect(scenario!.message).toContain('דבורה');
+    expect(scenario!.cleanup).toBeUndefined();
+  });
+
+  it('includes the shared-context-unshared-fact scenario with an llmJudge judging rubric and no cleanup', () => {
+    const set = loadScenarios('shared-context', AG);
+    const scenario = set.scenarios.find((s) => s.id === 'shared-context-unshared-fact');
+
+    expect(scenario).toBeDefined();
+    expect(scenario!.agentGroupId).toBe(AG);
+    expect(scenario!.judging.type).toBe('llmJudge');
+    if (scenario!.judging.type === 'llmJudge') {
+      expect(scenario!.judging.rubric).toMatch(/password/i);
+      expect(scenario!.judging.rubric).toMatch(/invent|guess|fabricat/i);
+    }
+    expect(scenario!.cleanup).toBeUndefined();
+  });
+
+  it('runs both shared-context scenarios (known-fact, unshared-fact) so pnpm eval run shared-context covers both', () => {
+    const set = loadScenarios('shared-context', AG);
+
+    expect(set.scenarios.map((s) => s.id)).toEqual(['shared-context-known-fact', 'shared-context-unshared-fact']);
+  });
+
+  it('re-running with a different agentGroupId produces freshly-stamped scenarios, not a cached/shared object', () => {
+    const first = loadScenarios('shared-context', 'ag-one');
+    const second = loadScenarios('shared-context', 'ag-two');
+
+    expect(first.scenarios[0].agentGroupId).toBe('ag-one');
+    expect(second.scenarios[0].agentGroupId).toBe('ag-two');
   });
 });
