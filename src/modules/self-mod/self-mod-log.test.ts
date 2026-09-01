@@ -20,7 +20,7 @@ const GROUP_FOLDER_DIR = `${TEST_DIR}/groups/ag-1`;
 const LOG_PATH = `${GROUP_FOLDER_DIR}/self-mod-log.md`;
 
 import { createAgentGroup, closeDb, initTestDb, runMigrations } from '../../db/index.js';
-import { appendSelfModLog, SELF_MOD_LOG_CAP } from './self-mod-log.js';
+import { appendSelfModLog, readSelfModLog, SELF_MOD_LOG_CAP } from './self-mod-log.js';
 
 function now(): string {
   return new Date().toISOString();
@@ -136,5 +136,81 @@ describe('appendSelfModLog', () => {
     const lines = readLines();
     expect(lines).toHaveLength(1);
     expect(lines[0].length).toBeLessThan(long.length);
+  });
+});
+
+// spec 2-4 (on-demand-cross-domain-digest): readSelfModLog is the Self-Mod
+// section's data source.
+describe('readSelfModLog', () => {
+  beforeEach(() => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+    const db = initTestDb();
+    runMigrations(db);
+    createAgentGroup({ id: 'ag-1', name: 'Agent', folder: 'ag-1', agent_provider: null, created_at: now() });
+  });
+
+  afterEach(() => {
+    closeDb();
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  });
+
+  it('returns [] when the log file does not exist yet (no self-mod history)', () => {
+    expect(fs.existsSync(LOG_PATH)).toBe(false);
+    expect(readSelfModLog('ag-1')).toEqual([]);
+  });
+
+  it('returns [] for an unknown agent group, never throws', () => {
+    expect(() => readSelfModLog('ag-does-not-exist')).not.toThrow();
+    expect(readSelfModLog('ag-does-not-exist')).toEqual([]);
+  });
+
+  it('returns every line when there are fewer than the limit', () => {
+    appendSelfModLog('ag-1', 'add_calendar', 'first');
+    appendSelfModLog('ag-1', 'add_mcp_server', undefined);
+
+    const lines = readSelfModLog('ag-1');
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toContain('add_calendar: first');
+    expect(lines[1]).toMatch(/add_mcp_server$/);
+  });
+
+  it('caps at the given limit, keeping the most recent lines (newest last)', () => {
+    for (let i = 0; i < 15; i++) {
+      appendSelfModLog('ag-1', 'add_mcp_server', `entry-${i}`);
+    }
+
+    const lines = readSelfModLog('ag-1', 10);
+    expect(lines).toHaveLength(10);
+    expect(lines[0]).toContain('entry-5');
+    expect(lines[lines.length - 1]).toContain('entry-14');
+  });
+
+  it('defaults the limit to 10 when not passed', () => {
+    for (let i = 0; i < 15; i++) {
+      appendSelfModLog('ag-1', 'add_mcp_server', `entry-${i}`);
+    }
+
+    expect(readSelfModLog('ag-1')).toHaveLength(10);
+  });
+
+  // review round 1: slice(-0) === slice(0), which is the WHOLE array, not
+  // none — a limit of 0 (or negative) must return nothing, not everything.
+  it('returns [] for a limit of 0 or less, never the whole log', () => {
+    appendSelfModLog('ag-1', 'add_calendar', 'first');
+    appendSelfModLog('ag-1', 'add_mcp_server', undefined);
+
+    expect(readSelfModLog('ag-1', 0)).toEqual([]);
+    expect(readSelfModLog('ag-1', -5)).toEqual([]);
+  });
+
+  // review round 1: existsSync-then-readFileSync was a TOCTOU gap — confirm
+  // a deleted-between-check-and-read file resolves to [], not a throw.
+  it('never throws even if the file becomes unreadable after being written', () => {
+    appendSelfModLog('ag-1', 'add_calendar', 'first');
+    fs.rmSync(LOG_PATH);
+
+    expect(() => readSelfModLog('ag-1')).not.toThrow();
+    expect(readSelfModLog('ag-1')).toEqual([]);
   });
 });

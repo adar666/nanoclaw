@@ -13,6 +13,7 @@ import {
   updateContainerConfigJson,
 } from '../../db/container-configs.js';
 import { initGroupFilesystem } from '../../group-init.js';
+import { buildProvenanceDigest } from '../../modules/provenance-digest.js';
 import { createAgentFromTemplate } from '../../templates/create-agent.js';
 import { isValidTimezone } from '../../timezone.js';
 import { log } from '../../log.js';
@@ -313,6 +314,18 @@ registerResource({
         const row = getContainerConfig(id);
         if (!row) throw new Error(`No container config for group: ${id}`);
         return presentConfig(row);
+      },
+    },
+    'provenance-digest': {
+      access: 'open',
+      description:
+        "Cross-domain provenance digest for a group — federates live task provenance, self-mod-log.md's " +
+        'recent entries, and document fill-history provenance into one read-only summary. Each section is ' +
+        'present even when it has nothing to show (never omitted, never an error). Use --id <group-id>.',
+      handler: async (args) => {
+        const id = args.id as string;
+        if (!id) throw new Error('--id is required');
+        return buildProvenanceDigest(id);
       },
     },
     'config update': {

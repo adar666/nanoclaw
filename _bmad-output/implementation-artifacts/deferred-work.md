@@ -397,3 +397,10 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-2-3-document-write-provenance.md`
   summary: The type-level assumption that `triggeredBy` is always `'agent'` for document provenance (documented in a code comment, "no host/CLI-caller path for these tools") has no compiler or test guard behind it — if a future change ever threads a non-agent caller into these MCP handlers, the comment and the `'agent'`-only literal type would go stale silently.
   evidence: Blind-hunter review finding. Architectural note for future awareness, not an actionable gap today.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-4-on-demand-cross-domain-digest.md`
+  summary: The digest's self-mod section returns raw unparsed log lines (`{ summary, entries: string[] }`) while tasks/documents both use a shared structured `ProvenanceDigestSection<T>` shape — an avoidable asymmetry in the function's public output.
+  evidence: Blind-hunter review finding. `self-mod-log.md` is deliberately plain text (AD-9's own explicit choice, mirroring `run-log.ts`'s style) — parsing it back into structured fields would mean either reversing that design decision or fragile regex-parsing of the write format. Not worth it for this story; revisit only if a consumer genuinely needs structured self-mod entries.
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-4-on-demand-cross-domain-digest.md`
+  summary: No equivalent MCP tool exists for `cli_scope: disabled` agent groups — the new `ncl groups provenance-digest` verb is entirely unreachable for them.
+  evidence: Blind-hunter review finding. Matches this codebase's existing, accepted pattern for every other `ncl`-only capability (tasks, sessions, destinations, members) — not a new gap introduced by this story.

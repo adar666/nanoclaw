@@ -509,3 +509,65 @@ describe('groups config add-calendar / remove-calendar', () => {
     expect(primary.ok).toBe(true);
   });
 });
+
+// spec 2-4 (on-demand-cross-domain-digest): `ncl groups provenance-digest`.
+describe('groups provenance-digest', () => {
+  beforeEach(() => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+    runMigrations(initTestDb());
+  });
+  afterEach(() => {
+    closeDb();
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  });
+
+  it('returns the three-section digest for a real group (host caller)', async () => {
+    const GID = 'ag-digest';
+    createAgentGroup({ id: GID, name: 'digest', folder: 'digest', agent_provider: null, created_at: now() });
+    ensureContainerConfig(GID);
+
+    const resp = await dispatch(
+      { id: 'r1', command: 'groups-provenance-digest', args: { id: GID } },
+      { caller: 'host' },
+    );
+
+    expect(resp.ok).toBe(true);
+    if (!resp.ok) return;
+    const data = resp.data as { tasks: unknown; self_mod: unknown; documents: unknown; agent_group_id: string };
+    expect(data.agent_group_id).toBe(GID);
+    // Every section is present even with nothing recorded — never omitted.
+    expect(data.tasks).toBeDefined();
+    expect(data.self_mod).toBeDefined();
+    expect(data.documents).toBeDefined();
+  });
+
+  it('fails clearly for a missing --id', async () => {
+    const resp = await dispatch({ id: 'r1', command: 'groups-provenance-digest', args: {} }, { caller: 'host' });
+    expect(resp.ok).toBe(false);
+    if (!resp.ok) expect(resp.error.message).toMatch(/--id is required/);
+  });
+
+  it("fails clearly for a group with no container config, matching config get's precedent", async () => {
+    const resp = await dispatch(
+      { id: 'r1', command: 'groups-provenance-digest', args: { id: 'ag-does-not-exist' } },
+      { caller: 'host' },
+    );
+    expect(resp.ok).toBe(false);
+    if (!resp.ok) expect(resp.error.message).toMatch(/No container config for group/);
+  });
+
+  it('an agent caller under cli_scope=group is auto-scoped to its own group', async () => {
+    const GID = 'ag-digest-agent';
+    createAgentGroup({ id: GID, name: 'digest', folder: 'digest-agent', agent_provider: null, created_at: now() });
+    ensureContainerConfig(GID);
+
+    const resp = await dispatch(
+      { id: 'r1', command: 'groups-provenance-digest', args: {} },
+      { caller: 'agent', agentGroupId: GID, sessionId: 'sess-1', messagingGroupId: 'mg-1' },
+    );
+    expect(resp.ok).toBe(true);
+    if (!resp.ok) return;
+    expect((resp.data as { agent_group_id: string }).agent_group_id).toBe(GID);
+  });
+});

@@ -52,3 +52,36 @@ export function appendSelfModLog(agentGroupId: string, action: string, reason?: 
   trimmed.push(line);
   fs.writeFileSync(file, trimmed.join('\n') + '\n');
 }
+
+/**
+ * Read the most recent `limit` lines of a group's self-mod-log.md, newest
+ * last (same order the file is written in). Never throws: an unknown group
+ * or a missing log file (no self-mod history yet) both resolve to `[]` —
+ * this is a read for a digest, not a mutating operation, so there is no
+ * "agent group not found" throw the way `appendSelfModLog` has.
+ */
+export function readSelfModLog(agentGroupId: string, limit = 10): string[] {
+  // review round 1: slice(-0) === slice(0), which returns the WHOLE array,
+  // not none — guard limit <= 0 explicitly rather than relying on that
+  // surprising JS behavior for a caller who means "give me nothing."
+  if (limit <= 0) return [];
+
+  const ag = getAgentGroup(agentGroupId);
+  if (!ag) return [];
+
+  const file = `${GROUPS_DIR}/${ag.folder}/self-mod-log.md`;
+  // review round 1: read directly rather than existsSync-then-read — a
+  // TOCTOU gap (deleted/unreadable between the check and the read) would
+  // otherwise throw despite this function's own contract of never doing so.
+  let raw: string;
+  try {
+    raw = fs.readFileSync(file, 'utf-8');
+  } catch {
+    return [];
+  }
+
+  return raw
+    .split('\n')
+    .filter((line) => line.length > 0)
+    .slice(-limit);
+}
