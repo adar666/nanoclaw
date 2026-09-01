@@ -128,6 +128,13 @@ description (same matching either way).
   conversation. If nothing matches, that _is_ an error — say so plainly
   rather than guessing.
 
+Both `fill_document_field` and `fill_document_field_batch` also take an
+optional `reason` — a short free-text note on why this fill is happening
+(e.g. "client requested update"). Pass it when the trigger isn't obvious
+from the value alone; it's recorded and later shown by
+`list_document_versions`, so a future "why does this say X" is answerable
+without reconstructing it from chat history.
+
 ## Filling a `.docx` (or a saved legacy `.doc`)
 
 A saved `.doc` is filled exactly like a `.docx` — same `document`/`row`/
@@ -490,6 +497,9 @@ already-produced file, not by mutating anything back in memory.
    `save_document` refresh — and its output path. A document that was only
    ever saved (never actually filled) reports an empty history — say so
    plainly rather than implying there's something to undo.
+   - A line may also show `(reason: ...)` if that fill was made with a
+     `reason` argument (see below) — this answers a later "why does this
+     say X" without you having to reconstruct it from chat history.
    - An entry whose output file was deleted from disk some other way is
      already dropped from this list — you'll never see or offer a path
      that can't actually be resent.

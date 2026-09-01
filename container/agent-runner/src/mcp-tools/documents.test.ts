@@ -5108,6 +5108,8 @@ interface FillHistoryEntryFixture {
   timestamp: string;
   outputPath: string;
   target: string;
+  kind?: string;
+  provenance?: { triggeredBy: 'agent'; requesterUserId?: string; reason?: string; at: string };
 }
 
 function readFillHistoryRaw(baseDirArg: string, slug: string): FillHistoryEntryFixture[] {
@@ -5420,6 +5422,210 @@ describe('list_document_versions — fill, then refresh, then fill again (spec-2
     expect(fill1Line).toContain('[fill]');
     expect(snapshotLine).toContain('[pre-refresh snapshot]');
     expect(fill2Line).toContain('[fill]');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Document write provenance (spec 2-3) — `reason` on the fill tools,
+// recorded as `provenance` on the FillHistoryEntry, surfaced by
+// list_document_versions.
+// ---------------------------------------------------------------------------
+
+describe('fill_document_field — reason argument records provenance', () => {
+  it('a call with reason: the rendered list_document_versions line includes it', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
+
+    const fill = await fillDocumentFieldImpl(
+      { document: 'report', row: 1, value: 'X', reason: 'client requested update' },
+      opts(),
+    );
+    expect(fill.isError).toBeFalsy();
+    const outPath = extractOutPath(fill.content[0].text);
+
+    const raw = readFillHistoryRaw(baseDir, 'report');
+    const entry = raw.find((e) => e.outputPath === outPath);
+    expect(entry?.provenance?.triggeredBy).toBe('agent');
+    expect(entry?.provenance?.reason).toBe('client requested update');
+    expect(entry?.provenance?.at).toBe(entry?.timestamp);
+
+    const result = await listDocumentVersionsImpl({ document: 'report' }, opts());
+    expect(result.isError).toBeFalsy();
+    const line = result.content[0].text.split('\n').find((l) => l.includes(outPath));
+    expect(line).toContain('(reason: client requested update)');
+  });
+
+  it('a call with no reason: provenance.triggeredBy/.at are set, .reason is absent, and no "(reason: )" text is rendered', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
+
+    const fill = await fillDocumentFieldImpl({ document: 'report', row: 1, value: 'X' }, opts());
+    expect(fill.isError).toBeFalsy();
+    const outPath = extractOutPath(fill.content[0].text);
+
+    const raw = readFillHistoryRaw(baseDir, 'report');
+    const entry = raw.find((e) => e.outputPath === outPath);
+    expect(entry?.provenance?.triggeredBy).toBe('agent');
+    expect(typeof entry?.provenance?.at).toBe('string');
+    expect(entry?.provenance?.reason).toBeUndefined();
+
+    const result = await listDocumentVersionsImpl({ document: 'report' }, opts());
+    const line = result.content[0].text.split('\n').find((l) => l.includes(outPath));
+    expect(line).not.toContain('(reason:');
+  });
+
+  // review round 1 (spec 2-3): whitespace-only reason must not render as a
+  // visually empty "(reason:   )".
+  it('a whitespace-only reason is treated as no reason at all', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
+
+    const fill = await fillDocumentFieldImpl({ document: 'report', row: 1, value: 'X', reason: '   ' }, opts());
+    const outPath = extractOutPath(fill.content[0].text);
+
+    const raw = readFillHistoryRaw(baseDir, 'report');
+    const entry = raw.find((e) => e.outputPath === outPath);
+    expect(entry?.provenance?.reason).toBeUndefined();
+  });
+
+  // review round 1: a literal newline would otherwise split the rendered
+  // list_document_versions line into several.
+  it('embedded newlines in reason are collapsed to spaces', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
+
+    const fill = await fillDocumentFieldImpl(
+      { document: 'report', row: 1, value: 'X', reason: 'line one\nline two\r\nline three' },
+      opts(),
+    );
+    const outPath = extractOutPath(fill.content[0].text);
+
+    const raw = readFillHistoryRaw(baseDir, 'report');
+    const entry = raw.find((e) => e.outputPath === outPath);
+    expect(entry?.provenance?.reason).toBe('line one line two line three');
+
+    const result = await listDocumentVersionsImpl({ document: 'report' }, opts());
+    const lines = result.content[0].text.split('\n');
+    expect(lines.filter((l) => l.includes(outPath))).toHaveLength(1);
+  });
+
+  // review round 1: a stored reason is a one-line annotation, not a document.
+  it('a reason over the max length is truncated', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
+    const long = 'x'.repeat(500);
+
+    const fill = await fillDocumentFieldImpl({ document: 'report', row: 1, value: 'X', reason: long }, opts());
+    const outPath = extractOutPath(fill.content[0].text);
+
+    const raw = readFillHistoryRaw(baseDir, 'report');
+    const entry = raw.find((e) => e.outputPath === outPath);
+    expect(entry?.provenance?.reason?.length).toBeLessThan(long.length);
+  });
+
+  // review round 1: a provenance object present but with an invalid shape
+  // (wrong triggeredBy, missing at) must be dropped, not fabricated or
+  // thrown on — this is the "malformed but present" branch, distinct from
+  // "no provenance key at all" (already covered below).
+  it('a malformed provenance object (bad triggeredBy) is dropped, not fabricated', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
+    const slug = 'report';
+    const fillsDir = path.join(baseDir, '.document-fills');
+    fs.mkdirSync(fillsDir, { recursive: true });
+    const outputPath = path.join(fillsDir, 'legacy.docx');
+    fs.writeFileSync(outputPath, 'dummy');
+    writeFillHistoryRaw(baseDir, slug, [
+      {
+        timestamp: new Date().toISOString(),
+        outputPath,
+        target: 'row 1',
+        provenance: { triggeredBy: 'ghost' } as unknown as FillHistoryEntryFixture['provenance'],
+      },
+    ]);
+
+    const result = await listDocumentVersionsImpl({ document: slug }, opts());
+    expect(result.isError).toBeFalsy();
+    const line = result.content[0].text.split('\n').find((l) => l.includes(outputPath));
+    expect(line).toBeDefined();
+    expect(line).not.toContain('(reason:');
+  });
+});
+
+describe('fill_document_field_batch — reason argument applies identically to every resolved document', () => {
+  it('records the same reason on every target', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
+    await saveDocumentImpl({ path: writeInboxFile('letter.docx', buildDocxWithTables([[['c1', 'd1']]])) }, opts());
+
+    const batchResult = await fillDocumentFieldBatchImpl(
+      { documents: ['report', 'letter'], row: 1, value: 'X', reason: 'annual renewal' },
+      opts(),
+    );
+    expect(batchResult.isError).toBeFalsy();
+    expect(batchResult.content[0].text).toContain('2/2 succeeded');
+
+    for (const slug of ['report', 'letter']) {
+      const raw = readFillHistoryRaw(baseDir, slug);
+      expect(raw.length).toBeGreaterThan(0);
+      const lastEntry = raw[raw.length - 1];
+      expect(lastEntry.provenance?.reason).toBe('annual renewal');
+    }
+  });
+
+  // review round 1: only the "reason given" batch case was covered — every
+  // succeeded target must also correctly have NO reason when none was given.
+  it('with no reason given, every target has provenance.triggeredBy/.at but no reason', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
+    await saveDocumentImpl({ path: writeInboxFile('letter.docx', buildDocxWithTables([[['c1', 'd1']]])) }, opts());
+
+    const batchResult = await fillDocumentFieldBatchImpl(
+      { documents: ['report', 'letter'], row: 1, value: 'X' },
+      opts(),
+    );
+    expect(batchResult.isError).toBeFalsy();
+
+    for (const slug of ['report', 'letter']) {
+      const raw = readFillHistoryRaw(baseDir, slug);
+      const lastEntry = raw[raw.length - 1];
+      expect(lastEntry.provenance?.triggeredBy).toBe('agent');
+      expect(lastEntry.provenance?.reason).toBeUndefined();
+    }
+  });
+});
+
+describe('save_document — refresh records provenance with no reason (spec 2-3)', () => {
+  it('provenance.triggeredBy/.at are set, no reason field', async () => {
+    await saveDocumentImpl(
+      { path: writeInboxFile('report.docx', buildDocxWithTables([[['original-a', 'original-b']]])) },
+      opts(),
+    );
+
+    fs.mkdirSync(path.join(inboxDir, 'msg2'), { recursive: true });
+    const editedPath = path.join(inboxDir, 'msg2', 'report-edited.docx');
+    fs.writeFileSync(editedPath, buildDocxWithTables([[['refreshed-a', 'refreshed-b']]]));
+    const refresh = await saveDocumentImpl({ path: editedPath, document: 'report' }, opts());
+    expect(refresh.isError).toBeFalsy();
+
+    const raw = readFillHistoryRaw(baseDir, 'report');
+    const snapshotEntry = raw.find((e) => e.kind === 'pre-refresh-snapshot');
+    expect(snapshotEntry?.provenance?.triggeredBy).toBe('agent');
+    expect(typeof snapshotEntry?.provenance?.at).toBe('string');
+    expect(snapshotEntry?.provenance).not.toHaveProperty('reason');
+  });
+});
+
+describe('list_document_versions — a pre-existing entry with no provenance key (spec 2-3)', () => {
+  it('is handled exactly as before this story — no error, no fabricated provenance, no "(reason: )" text', async () => {
+    await saveDocumentImpl({ path: writeInboxFile('report.docx', buildDocxWithTables([[['a1', 'b1']]])) }, opts());
+    const slug = 'report';
+
+    const fillsDir = path.join(baseDir, '.document-fills');
+    fs.mkdirSync(fillsDir, { recursive: true });
+    const outputPath = path.join(fillsDir, 'legacy.docx');
+    fs.writeFileSync(outputPath, 'dummy');
+    // No `provenance` key at all — the exact shape an entry written before
+    // this story shipped would have.
+    writeFillHistoryRaw(baseDir, slug, [{ timestamp: new Date().toISOString(), outputPath, target: 'row 1' }]);
+
+    const result = await listDocumentVersionsImpl({ document: slug }, opts());
+    expect(result.isError).toBeFalsy();
+    const line = result.content[0].text.split('\n').find((l) => l.includes(outputPath));
+    expect(line).toBeDefined();
+    expect(line).not.toContain('(reason:');
   });
 });
 

@@ -1868,11 +1868,16 @@ export async function saveDocumentImpl(
       // actually happened instead of unconditionally promising the good one.
       let historyRecorded = false;
       try {
+        const refreshTimestamp = new Date().toISOString();
         await recordFillHistory(opts.baseDir, lockResult.slug, {
-          timestamp: new Date().toISOString(),
+          timestamp: refreshTimestamp,
           outputPath: lockResult.snapshotPath,
           target: 'pre-refresh snapshot',
           kind: 'pre-refresh-snapshot',
+          // spec 2-3: no `reason` — a refresh's snapshot is an automatic
+          // side effect of a normal save, not a directed edit with a
+          // natural "why" to record (see Boundaries in the spec).
+          provenance: { triggeredBy: 'agent', at: refreshTimestamp },
         });
         historyRecorded = true;
       } catch (e) {
@@ -2895,6 +2900,44 @@ interface FillHistoryEntry {
    * shipped together).
    */
   kind: 'fill' | 'pre-refresh-snapshot';
+  /**
+   * Who/why this entry was written (spec 2-3) — additive and optional, so an
+   * entry written before this field existed (or by a writer that predates
+   * it) simply has none; every reader treats that as absent, never an
+   * error, matching `kind`'s own tolerant-normalization precedent above.
+   * `triggeredBy` is always 'agent' here — every MCP tool call is
+   * inherently agent-initiated, there is no host/CLI-caller path for these
+   * tools the way `ncl tasks`/self-mod have one. `requesterUserId` is never
+   * populated — an MCP tool handler receives only the call's `args`, no
+   * session/sender identity. `at` deliberately duplicates this entry's own
+   * `timestamp` (reuses the exact same computed value, not a second clock
+   * read) so a future cross-domain reader can rely on `provenance.at`
+   * existing uniformly across every domain that shares this shape.
+   */
+  provenance?: {
+    triggeredBy: 'agent';
+    requesterUserId?: string;
+    reason?: string;
+    at: string;
+  };
+}
+
+/** A stored reason longer than this is truncated — this is a one-line history annotation, not a document. */
+const MAX_REASON_CHARS = 200;
+
+/**
+ * review round 1 (spec 2-3): trims and requires non-whitespace content (a
+ * pure-spaces `reason` would otherwise render as an empty `(reason:  )`),
+ * collapses embedded newlines/control whitespace into single spaces (this
+ * is rendered as one line in `list_document_versions`'s output — a literal
+ * `\n` would visually split one history entry into several), and caps
+ * length the same way `self-mod-log.ts`'s `appendSelfModLog` caps its own
+ * stored reason (spec 2-2 precedent).
+ */
+function cleanReason(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const collapsed = raw.replace(/\s+/g, ' ').trim();
+  return collapsed.length > 0 ? collapsed.slice(0, MAX_REASON_CHARS) : undefined;
 }
 
 function fillHistoryDir(baseDir: string): string {
@@ -2984,12 +3027,38 @@ function readFillHistory(baseDir: string, slug: string): FillHistoryEntry[] {
         `fill history for "${slug}" had ${parsed.length - validRaw.length} malformed entr(y/ies) — dropped, keeping the rest`,
       );
     }
-    return validRaw.map((candidate) => ({
-      timestamp: candidate.timestamp as string,
-      outputPath: candidate.outputPath as string,
-      target: candidate.target as string,
-      kind: candidate.kind === 'pre-refresh-snapshot' ? 'pre-refresh-snapshot' : 'fill',
-    }));
+    return validRaw.map((candidate) => {
+      // spec 2-3: tolerant normalization for `provenance`, same precedent
+      // as `kind` just above — anything malformed (missing, not an object,
+      // wrong triggeredBy, non-string at) resolves to undefined rather than
+      // throwing or fabricating a value.
+      const rawProvenance = candidate.provenance;
+      let provenance: FillHistoryEntry['provenance'];
+      if (rawProvenance !== null && typeof rawProvenance === 'object') {
+        const p = rawProvenance as Record<string, unknown>;
+        if (p.triggeredBy === 'agent' && typeof p.at === 'string') {
+          provenance = {
+            triggeredBy: 'agent',
+            at: p.at,
+            ...(typeof p.requesterUserId === 'string' ? { requesterUserId: p.requesterUserId } : {}),
+            ...(typeof p.reason === 'string' ? { reason: p.reason } : {}),
+          };
+        } else {
+          // review round 1: a malformed-but-present provenance object was
+          // silently dropped with no trace — log it, same as the
+          // malformed-entry branch a few lines above already does for the
+          // rest of the entry.
+          log(`fill history for "${slug}": entry had a malformed provenance object — dropped, keeping the rest of the entry`);
+        }
+      }
+      return {
+        timestamp: candidate.timestamp as string,
+        outputPath: candidate.outputPath as string,
+        target: candidate.target as string,
+        kind: candidate.kind === 'pre-refresh-snapshot' ? 'pre-refresh-snapshot' : 'fill',
+        provenance,
+      };
+    });
   } catch (e) {
     log(
       `fill history for "${slug}" is not valid JSON — ignoring corrupted index, treating as empty: ${e instanceof Error ? e.message : String(e)}`,
@@ -4428,11 +4497,14 @@ async function recordCompletedFill(
       const outputPath = extractFillOutputPath(dispatch.resultText);
       if (outputPath) {
         try {
+          const fillTimestamp = new Date().toISOString();
+          const reason = cleanReason(args.reason);
           await recordFillHistory(opts.baseDir, meta.slug, {
-            timestamp: new Date().toISOString(),
+            timestamp: fillTimestamp,
             outputPath,
             target: describeFillTarget(args),
             kind: 'fill',
+            provenance: { triggeredBy: 'agent', at: fillTimestamp, ...(reason ? { reason } : {}) },
           });
         } catch (e) {
           // Best-effort: a fill-history write failure must never mask an
@@ -4622,6 +4694,12 @@ export const fillDocumentField: McpToolDefinition = {
             'lineNumber (.docx/.doc) the call resolves to — for a .docx/.doc this is always an additional ' +
             'inserted image, never a replacement of existing cell/paragraph text. Give "value" alongside it to ' +
             'also draw/insert a text run (e.g. a date) right beside/after the image in the same call.',
+        },
+        reason: {
+          type: 'string',
+          description:
+            'Optional free-text note on why this fill is happening — recorded as provenance, surfaced by ' +
+            'list_document_versions.',
         },
       },
       required: ['document'],
@@ -4891,6 +4969,12 @@ export const fillDocumentFieldBatch: McpToolDefinition = {
           type: 'number',
           description: '.pdf, scanned only: y pixel position, applied to every resolved scanned-PDF target.',
         },
+        reason: {
+          type: 'string',
+          description:
+            'Optional free-text note on why this fill is happening — recorded as provenance identically for ' +
+            'every resolved document, surfaced by list_document_versions.',
+        },
       },
     },
   },
@@ -5021,7 +5105,8 @@ export async function listDocumentVersionsImpl(
     // from the free-text `target` field alone.
     const lines = history.map((entry, i) => {
       const kindLabel = entry.kind === 'pre-refresh-snapshot' ? 'pre-refresh snapshot' : 'fill';
-      return `${i + 1}. [${kindLabel}] ${formatLocalTime(entry.timestamp, TIMEZONE)} — ${entry.target} — ${entry.outputPath}`;
+      const reasonSuffix = entry.provenance?.reason ? ` (reason: ${entry.provenance.reason})` : '';
+      return `${i + 1}. [${kindLabel}] ${formatLocalTime(entry.timestamp, TIMEZONE)} — ${entry.target} — ${entry.outputPath}${reasonSuffix}`;
     });
     log(`list_document_versions: ${history.length} entries for "${slug}"`);
     return ok(

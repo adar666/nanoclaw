@@ -387,3 +387,13 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-2-2-self-mod-change-provenance.md`
   summary: `SELF_MOD_LOG_CAP` (20) is hardcoded with no operator-facing config to raise/disable it for a group with heavy self-mod activity, and the cap/trim logic assumes every non-empty line is one well-formed entry (a hand-edited multi-line note in the host file could be miscounted and silently trimmed).
   evidence: Blind-hunter review finding. Low-likelihood (self-mod events are naturally rare at household scale; hand-editing the log file is an out-of-band operator action) — revisit if either scenario surfaces in practice.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-3-document-write-provenance.md`
+  summary: The new test fixture `FillHistoryEntryFixture` (`documents.test.ts`) hand-duplicates the shape of `FillHistoryEntry['provenance']` instead of importing/reusing the real (unexported) type — the fixture and production type could silently drift apart.
+  evidence: Blind-hunter review finding. Low priority — `FillHistoryEntry` itself is module-private (not exported from `documents.ts`), so the fixture would need that export to change first; existing tests already catch a real shape mismatch at the assertion level.
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-3-document-write-provenance.md`
+  summary: `provenance.at` deliberately duplicates each write site's own `timestamp` value, but this is enforced only by convention (two independent call sites each compute one local variable and reuse it) — no shared helper or structural check prevents a future edit to either site from reintroducing drift between the two fields.
+  evidence: Blind-hunter review finding. Real but speculative — low priority unless a future edit to either write site actually introduces the drift.
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-3-document-write-provenance.md`
+  summary: The type-level assumption that `triggeredBy` is always `'agent'` for document provenance (documented in a code comment, "no host/CLI-caller path for these tools") has no compiler or test guard behind it — if a future change ever threads a non-agent caller into these MCP handlers, the comment and the `'agent'`-only literal type would go stale silently.
+  evidence: Blind-hunter review finding. Architectural note for future awareness, not an actionable gap today.
