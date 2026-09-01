@@ -22,6 +22,8 @@ ncl tasks delete ping-a25c
 
 Use good judgement on whether it's appropriate to check in with the user about the task prompt before task creation, and if so, whether to share verbatim or a description of it.
 
+Pass `--reason "<why you're creating this>"` on create (e.g. `--reason "user asked to check every Monday"`) whenever the trigger isn't obvious from the prompt alone — it's recorded once, at creation, and never changes on later recurrence fires. A later "why do I get this reminder" is answerable from `ncl tasks get <id> --json` (`reason`/`triggered_by`/`provenance_at`) without you having to remember or reconstruct it from chat history.
+
 `--process-after` accepts UTC timestamps or naive local timestamps interpreted in the instance timezone (shown in the `<context timezone="..."/>` header).
 
 Run `ncl tasks create --help` for schedules, options, and pre-task gate scripts (checks that run before you wake).

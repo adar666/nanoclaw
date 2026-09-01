@@ -40,8 +40,8 @@ development_status:
   1-2-verify-cross-group-sharing-behaves-correctly-not-just-compil: review
   epic-1-retrospective: optional
 
-  epic-2: backlog
-  2-1-task-reminder-provenance: backlog
+  epic-2: in-progress
+  2-1-task-reminder-provenance: review
   2-2-self-mod-change-provenance: backlog
   2-3-document-write-provenance: backlog
   2-4-on-demand-cross-domain-digest: backlog

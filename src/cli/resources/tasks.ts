@@ -30,6 +30,7 @@ import {
   parseProcessAfter,
   prepareScheduledTask,
   type ScheduledTaskRow,
+  type TaskProvenance,
   validateRecurrence,
 } from '../../modules/scheduling/create.js';
 import { inboundDbPath, withInboundDb } from '../../session-manager.js';
@@ -106,18 +107,39 @@ function withInbound<T>(session: ScopedSession, fn: (db: Database.Database) => T
   return withInboundDb(session.agent_group_id, session.id, fn);
 }
 
-function parseContent(raw: string): { prompt: string; script: string | null; originSessionId: string | null } {
+// Present only when the parsed JSON has a `provenance` key of the right
+// shape — anything else (missing, wrong type, hand-corrupted) resolves to
+// undefined, never a thrown error. A pre-existing row from before this
+// shipped simply has no `provenance` key at all.
+function parseProvenance(value: unknown): TaskProvenance | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const p = value as Record<string, unknown>;
+  if (p.triggeredBy !== 'user' && p.triggeredBy !== 'agent') return undefined;
+  if (typeof p.at !== 'string') return undefined;
+  const provenance: TaskProvenance = { triggeredBy: p.triggeredBy, at: p.at };
+  if (typeof p.requesterUserId === 'string') provenance.requesterUserId = p.requesterUserId;
+  if (typeof p.reason === 'string') provenance.reason = p.reason;
+  return provenance;
+}
+
+function parseContent(raw: string): {
+  prompt: string;
+  script: string | null;
+  originSessionId: string | null;
+  provenance: TaskProvenance | undefined;
+} {
   try {
     const parsed = JSON.parse(raw) as Record<string, unknown>;
     return {
       prompt: typeof parsed.prompt === 'string' ? parsed.prompt : '',
       script: typeof parsed.script === 'string' ? parsed.script : null,
       originSessionId: typeof parsed.originSessionId === 'string' ? parsed.originSessionId : null,
+      provenance: parseProvenance(parsed.provenance),
     };
   } catch {
     // LEGACY-COMPAT(v1-tasks): plain-string content from rows that predate the
     // JSON envelope. Removable once no pre-v2 session DBs remain in the wild.
-    return { prompt: raw, script: null, originSessionId: null };
+    return { prompt: raw, script: null, originSessionId: null, provenance: undefined };
   }
 }
 
@@ -134,6 +156,20 @@ function toOutput(session: ScopedSession, row: TaskRow) {
     prompt: content.prompt.length > 120 ? content.prompt.slice(0, 117) + '...' : content.prompt,
     has_script: content.script ? 1 : 0,
     origin_session_id: content.originSessionId, // which session created the task (null for CLI-created)
+    triggered_by: content.provenance?.triggeredBy ?? null,
+    requester_user_id: content.provenance?.requesterUserId ?? null,
+    // review round 1 (spec 2-1): same 120-char display cap as `prompt`
+    // above — free text with no length cap on this initiative's own guard,
+    // and this field round-trips unbounded through every recurrence fire.
+    reason:
+      content.provenance?.reason && content.provenance.reason.length > 120
+        ? content.provenance.reason.slice(0, 117) + '...'
+        : (content.provenance?.reason ?? null),
+    // Named provenance_at, not at — bare "at" reads as generic/collision-prone
+    // in a flat output object; the provenance_ prefix keeps it grouped with
+    // its sibling fields above without implying it's the row's own timestamp
+    // (that's the separate created_at field below).
+    provenance_at: content.provenance?.at ?? null,
     created_at: row.timestamp,
     tries: row.tries,
   };
@@ -179,6 +215,11 @@ function createTask(args: Record<string, unknown>, ctx: CallerContext) {
   if (!prompt) throw new Error('--prompt is required');
   const recurrence = normalizeNullableString(args.recurrence) ?? null;
   const script = normalizeNullableString(args.script) ?? null;
+  // review round 1 (spec 2-1): str(), not normalizeNullableString() — that
+  // helper treats the literal strings "null"/"none" as a clear-the-field
+  // signal (right for --recurrence/--script, wrong here: a genuine reason
+  // of "null" or "none" would be silently discarded instead of stored).
+  const reason = str(args.reason);
   const prepared = prepareScheduledTask({
     name: str(args.name),
     prompt,
@@ -188,8 +229,14 @@ function createTask(args: Record<string, unknown>, ctx: CallerContext) {
     dangerouslyOverrideRecurrenceLimit: bool(args.dangerously_override_recurrence_limit),
     timezone: resolveGroupTimezone(group),
   });
+  const provenance: TaskProvenance = {
+    triggeredBy: ctx.caller === 'agent' ? 'agent' : 'user',
+    reason,
+    at: new Date().toISOString(),
+  };
   const { session, row } = createScheduledTask(group, prepared, {
     originSessionId: ctx.caller === 'agent' ? ctx.sessionId : null,
+    provenance,
   });
   return toOutput(session, row);
 }
@@ -531,6 +578,12 @@ registerResource({
           name: 'script',
           type: 'string',
           description: 'Pre-task gate script (bash) — see the --script contract above.',
+        },
+        {
+          name: 'reason',
+          type: 'string',
+          description:
+            'Optional free-text note on why you are creating this task (e.g. "user asked to check every Monday") — recorded as provenance and returned as `reason`/`triggered_by`/`provenance_at` on `tasks get` and `tasks list --json`, so a later "why do I get this reminder" has an answer. Not shown in the default human-readable `tasks list` table — use `--json` to see it.',
         },
         {
           name: 'group',
