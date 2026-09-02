@@ -20,7 +20,7 @@ const GROUP_FOLDER_DIR = `${TEST_DIR}/groups/ag-1`;
 const LOG_PATH = `${GROUP_FOLDER_DIR}/self-mod-log.md`;
 
 import { createAgentGroup, closeDb, initTestDb, runMigrations } from '../../db/index.js';
-import { appendSelfModLog, readSelfModLog, SELF_MOD_LOG_CAP } from './self-mod-log.js';
+import { appendSelfModLog, parseSelfModLogLine, readSelfModLog, SELF_MOD_LOG_CAP } from './self-mod-log.js';
 
 function now(): string {
   return new Date().toISOString();
@@ -212,5 +212,55 @@ describe('readSelfModLog', () => {
 
     expect(() => readSelfModLog('ag-1')).not.toThrow();
     expect(readSelfModLog('ag-1')).toEqual([]);
+  });
+});
+
+// spec 2-4 (on-demand-cross-domain-digest) / epic retro: the digest's
+// self_mod section needs appendSelfModLog's own line format parsed back
+// into {at, action, reason} — parseSelfModLogLine is the exact inverse.
+describe('parseSelfModLogLine', () => {
+  beforeEach(() => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+    const db = initTestDb();
+    runMigrations(db);
+    createAgentGroup({ id: 'ag-1', name: 'Agent', folder: 'ag-1', agent_provider: null, created_at: now() });
+  });
+
+  afterEach(() => {
+    closeDb();
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  });
+
+  it('parses a line with a reason', () => {
+    const parsed = parseSelfModLogLine('2026-01-01T00:00:00.000Z — add_calendar: family calendar for scheduling');
+    expect(parsed).toEqual({
+      at: '2026-01-01T00:00:00.000Z',
+      action: 'add_calendar',
+      reason: 'family calendar for scheduling',
+    });
+  });
+
+  it('parses a line with no reason as reason: null, not empty string', () => {
+    const parsed = parseSelfModLogLine('2026-01-01T00:00:00.000Z — add_mcp_server');
+    expect(parsed).toEqual({
+      at: '2026-01-01T00:00:00.000Z',
+      action: 'add_mcp_server',
+      reason: null,
+    });
+  });
+
+  it("round-trips against appendSelfModLog's own real output", () => {
+    appendSelfModLog('ag-1', 'install_packages', 'need ffmpeg for audio transcription');
+    const [line] = readSelfModLog('ag-1');
+
+    const parsed = parseSelfModLogLine(line);
+    expect(parsed?.action).toBe('install_packages');
+    expect(parsed?.reason).toBe('need ffmpeg for audio transcription');
+  });
+
+  it('returns undefined for a line that does not match the format', () => {
+    expect(parseSelfModLogLine('not a log line at all')).toBeUndefined();
+    expect(parseSelfModLogLine('')).toBeUndefined();
   });
 });

@@ -551,6 +551,24 @@ describe('tasks CLI resource', () => {
       expect((r.data as Record<string, unknown>).reason).toBe('null');
     });
 
+    // epic retro: an empty-string or whitespace-only --reason must resolve
+    // to no provenance reason at all (cleanReason returns undefined), not a
+    // stored empty string that a truthy-check ternary elsewhere could treat
+    // inconsistently from "no reason given."
+    it('an empty-string or whitespace-only --reason is treated as no reason, not stored empty', async () => {
+      const r = await dispatch(
+        {
+          id: 'prov-empty-reason',
+          command: 'tasks-create',
+          args: { prompt: 'x', name: 'prov-empty-reason', process_after: '2999-01-01T00:00:00Z', reason: '   ' },
+        },
+        agentCtx('ag-1', 'chat-1'),
+      );
+      expect(r.ok).toBe(true);
+      if (!r.ok) return;
+      expect((r.data as Record<string, unknown>).reason).toBeNull();
+    });
+
     // review round 1: reason gets the same 120-char display cap as prompt —
     // unbounded free text round-trips through every future recurrence fire.
     it('a reason over 120 characters is truncated for display, same as prompt', async () => {

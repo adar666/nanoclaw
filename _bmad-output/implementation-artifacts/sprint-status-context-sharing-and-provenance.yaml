@@ -29,20 +29,28 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 08-31-2026 21:43
-last_updated: 09-01-2026 11:35
+last_updated: 09-02-2026 09:15
 project: nanoclaw-v2
 project_key: NOKEY
 tracking_system: file-system
 story_location: _bmad-output/implementation-artifacts
 development_status:
   epic-1: in-progress
-  1-1-read-a-fact-shared-by-another-agent-group: review
-  1-2-verify-cross-group-sharing-behaves-correctly-not-just-compil: review
-  epic-1-retrospective: optional
+  1-1-read-a-fact-shared-by-another-agent-group: done
+  1-2-verify-cross-group-sharing-behaves-correctly-not-just-compil: done
+  epic-1-retrospective: done
 
   epic-2: in-progress
-  2-1-task-reminder-provenance: review
-  2-2-self-mod-change-provenance: review
-  2-3-document-write-provenance: review
-  2-4-on-demand-cross-domain-digest: review
-  epic-2-retrospective: optional
+  2-1-task-reminder-provenance: done
+  2-2-self-mod-change-provenance: done
+  2-3-document-write-provenance: done
+  2-4-on-demand-cross-domain-digest: done
+  epic-2-retrospective: done
+action_items:
+  - id: "epic-2-retro-item-1-thread-the-resolved-self-mod-approver-us"
+    epic: 2
+    action: "Thread the resolved self-mod approver user id through apply.ts into appendSelfModLog
+      (deferred-work.md, epic-2 retro entry)"
+    owner: "next dev pass on self-mod provenance"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-1-2-retro-context-sharing-and-provenance-2026-09-02.md"

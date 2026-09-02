@@ -33,6 +33,7 @@ import {
   type TaskProvenance,
   validateRecurrence,
 } from '../../modules/scheduling/create.js';
+import { cleanReason, parseProvenance } from '../../modules/provenance.js';
 import { inboundDbPath, withInboundDb } from '../../session-manager.js';
 import { registerResource } from '../crud.js';
 import { appendRunLog } from '../../modules/scheduling/run-log.js';
@@ -107,21 +108,6 @@ function withInbound<T>(session: ScopedSession, fn: (db: Database.Database) => T
   return withInboundDb(session.agent_group_id, session.id, fn);
 }
 
-// Present only when the parsed JSON has a `provenance` key of the right
-// shape — anything else (missing, wrong type, hand-corrupted) resolves to
-// undefined, never a thrown error. A pre-existing row from before this
-// shipped simply has no `provenance` key at all.
-function parseProvenance(value: unknown): TaskProvenance | undefined {
-  if (!value || typeof value !== 'object') return undefined;
-  const p = value as Record<string, unknown>;
-  if (p.triggeredBy !== 'user' && p.triggeredBy !== 'agent') return undefined;
-  if (typeof p.at !== 'string') return undefined;
-  const provenance: TaskProvenance = { triggeredBy: p.triggeredBy, at: p.at };
-  if (typeof p.requesterUserId === 'string') provenance.requesterUserId = p.requesterUserId;
-  if (typeof p.reason === 'string') provenance.reason = p.reason;
-  return provenance;
-}
-
 function parseContent(raw: string): {
   prompt: string;
   script: string | null;
@@ -158,13 +144,19 @@ function toOutput(session: ScopedSession, row: TaskRow) {
     origin_session_id: content.originSessionId, // which session created the task (null for CLI-created)
     triggered_by: content.provenance?.triggeredBy ?? null,
     requester_user_id: content.provenance?.requesterUserId ?? null,
-    // review round 1 (spec 2-1): same 120-char display cap as `prompt`
-    // above — free text with no length cap on this initiative's own guard,
-    // and this field round-trips unbounded through every recurrence fire.
-    reason:
-      content.provenance?.reason && content.provenance.reason.length > 120
+    // review round 1 (spec 2-1) + epic retro: same 120-char display cap as
+    // `prompt` above (the shared parseProvenance already caps storage at
+    // 200 via cleanReason). epic retro also found the old ternary's
+    // `reason && ...` truthy check let an empty string fall through to
+    // `?? null` and render as `''`, not `null` — moot now that
+    // `parseProvenance` never returns an empty-string reason in the first
+    // place, but written as a plain `?` check rather than `&&` so that
+    // stays true by construction, not by relying on the upstream guarantee.
+    reason: content.provenance?.reason
+      ? content.provenance.reason.length > 120
         ? content.provenance.reason.slice(0, 117) + '...'
-        : (content.provenance?.reason ?? null),
+        : content.provenance.reason
+      : null,
     // Named provenance_at, not at — bare "at" reads as generic/collision-prone
     // in a flat output object; the provenance_ prefix keeps it grouped with
     // its sibling fields above without implying it's the row's own timestamp
@@ -219,7 +211,11 @@ function createTask(args: Record<string, unknown>, ctx: CallerContext) {
   // helper treats the literal strings "null"/"none" as a clear-the-field
   // signal (right for --recurrence/--script, wrong here: a genuine reason
   // of "null" or "none" would be silently discarded instead of stored).
-  const reason = str(args.reason);
+  // epic retro: cleanReason() on top — this was the one provenance writer
+  // in the whole initiative storing reason completely unbounded (self-mod/
+  // documents both cap+clean at write time); it now round-trips through
+  // every recurrence fire capped and whitespace-collapsed like the others.
+  const reason = cleanReason(str(args.reason));
   const prepared = prepareScheduledTask({
     name: str(args.name),
     prompt,

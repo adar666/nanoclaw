@@ -129,29 +129,46 @@ describe('buildProvenanceDigest', () => {
 
   it('self-mod section says so plainly when there is no self-mod-log.md yet', () => {
     const digest = buildProvenanceDigest('ag-1');
-    expect(digest.self_mod.entries).toEqual([]);
+    expect(digest.self_mod.items).toEqual([]);
     expect(digest.self_mod.summary).toMatch(/no self-modification history/i);
   });
 
-  it('shows the most recent self-mod-log.md entries', () => {
+  it('shows the most recent self-mod-log.md entries, newest first, structured', () => {
     appendSelfModLog('ag-1', 'add_calendar', 'family calendar for scheduling');
     appendSelfModLog('ag-1', 'install_packages', 'need ffmpeg for audio transcription');
 
     const digest = buildProvenanceDigest('ag-1');
-    expect(digest.self_mod.entries).toHaveLength(2);
-    expect(digest.self_mod.entries[0]).toContain('add_calendar: family calendar for scheduling');
-    expect(digest.self_mod.entries[1]).toContain('install_packages: need ffmpeg for audio transcription');
+    expect(digest.self_mod.items).toHaveLength(2);
+    // Newest first — same ordering convention as tasks/documents.
+    expect(digest.self_mod.items[0].action).toBe('install_packages');
+    expect(digest.self_mod.items[0].reason).toBe('need ffmpeg for audio transcription');
+    expect(digest.self_mod.items[1].action).toBe('add_calendar');
+    expect(digest.self_mod.items[1].reason).toBe('family calendar for scheduling');
     expect(digest.self_mod.summary).toMatch(/2 most recent/i);
   });
 
-  it('caps self-mod entries at the digest limit (10), most recent last', () => {
+  // epic retro: a line parseSelfModLogLine can't parse (hand-edited/corrupted
+  // file, outside this module's control) must be skipped, not thrown or
+  // silently included as garbage — same tolerant-reader posture as the
+  // document/task sections use for their own malformed input.
+  it('skips a self-mod-log.md line it cannot parse, keeping the valid ones', () => {
+    appendSelfModLog('ag-1', 'add_calendar', 'valid entry');
+    fs.appendFileSync(`${GROUP_FOLDER_DIR}/self-mod-log.md`, 'not a valid log line at all\n');
+
+    const digest = buildProvenanceDigest('ag-1');
+    expect(digest.self_mod.items).toHaveLength(1);
+    expect(digest.self_mod.items[0].action).toBe('add_calendar');
+  });
+
+  it('caps self-mod entries at the digest limit (10), newest first', () => {
     for (let i = 0; i < 15; i++) {
       appendSelfModLog('ag-1', 'add_mcp_server', `entry-${i}`);
     }
 
     const digest = buildProvenanceDigest('ag-1');
-    expect(digest.self_mod.entries).toHaveLength(10);
-    expect(digest.self_mod.entries[digest.self_mod.entries.length - 1]).toContain('entry-14');
+    expect(digest.self_mod.items).toHaveLength(10);
+    // entry-14 (last appended) sorts to the top, newest first.
+    expect(digest.self_mod.items[0].reason).toBe('entry-14');
   });
 
   // ── Documents ──
@@ -233,6 +250,25 @@ describe('buildProvenanceDigest', () => {
     expect(digest.documents.items[0].target).toBe('field-14');
   });
 
+  // epic retro: a malformed-but-present provenance object (wrong
+  // triggeredBy, missing `at`) used to drop with no trace, reintroducing a
+  // gap documents.ts's own reader already fixed. Now logged, and still
+  // excluded from items (indistinguishable from "no provenance" downstream).
+  it('logs and skips a fill-history entry whose provenance object is malformed', () => {
+    writeFillHistory('form-a', [
+      {
+        timestamp: '2026-01-01T00:00:00.000Z',
+        outputPath: '/x',
+        target: 'bad provenance field',
+        kind: 'fill',
+        provenance: { triggeredBy: 'not-a-valid-value', at: '2026-01-01T00:00:00.000Z' },
+      },
+    ]);
+
+    const digest = buildProvenanceDigest('ag-1');
+    expect(digest.documents.items).toEqual([]);
+  });
+
   it('tolerates a corrupted fill-history file (malformed JSON) without throwing', () => {
     const dir = fillHistoryDir();
     fs.mkdirSync(dir, { recursive: true });
@@ -265,7 +301,7 @@ describe('buildProvenanceDigest', () => {
 
     const digest = buildProvenanceDigest('ag-1');
     expect(digest.tasks.items).toEqual([]);
-    expect(digest.self_mod.entries).toEqual([]);
+    expect(digest.self_mod.items).toEqual([]);
     expect(digest.documents.items).toEqual([]);
   });
 });
