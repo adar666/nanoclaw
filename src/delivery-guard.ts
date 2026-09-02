@@ -10,8 +10,19 @@ import { guard, type GuardedAction } from './guard/index.js';
 import { log } from './log.js';
 import type { PendingApproval, Session } from './types.js';
 
-/** Handler shape for guard-wrapped actions — must not touch inDb (replays run without one). */
-export type GuardedDeliveryHandler = (content: Record<string, unknown>, session: Session) => Promise<void>;
+/**
+ * Handler shape for guard-wrapped actions — must not touch inDb (replays run
+ * without one). `approverUserId` is set only on an approved replay (the
+ * admin who actually clicked approve, per `ApprovalHandlerContext.userId` —
+ * epic retro action item: self-mod's own approval flow already resolves
+ * this identity, it just wasn't threaded down to the handler body before).
+ * A fresh (non-approval) dispatch never has one.
+ */
+export type GuardedDeliveryHandler = (
+  content: Record<string, unknown>,
+  session: Session,
+  approverUserId?: string,
+) => Promise<void>;
 
 export interface DeliveryGuardSpec {
   /** Guard action consulted before the handler runs — the defined value, not a name. */
@@ -41,6 +52,7 @@ export async function runGuarded(
   content: Record<string, unknown>,
   session: Session,
   grant: PendingApproval | null,
+  approverUserId?: string,
 ): Promise<void> {
   if (spec.precheck && !(await spec.precheck(content, session))) return;
 
@@ -59,5 +71,5 @@ export async function runGuarded(
     await spec.requestHold(content, session);
     return;
   }
-  await handler(content, session);
+  await handler(content, session, approverUserId);
 }

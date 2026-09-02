@@ -21,7 +21,7 @@ import { cleanReason } from '../provenance.js';
 /** Oldest entries beyond this count are trimmed before the new line is appended. */
 export const SELF_MOD_LOG_CAP = 20;
 
-export function appendSelfModLog(agentGroupId: string, action: string, reason?: string): void {
+export function appendSelfModLog(agentGroupId: string, action: string, reason?: string, approverUserId?: string): void {
   const ag = getAgentGroup(agentGroupId);
   if (!ag) throw new Error(`agent group not found: ${agentGroupId}`);
 
@@ -45,7 +45,15 @@ export function appendSelfModLog(agentGroupId: string, action: string, reason?: 
   // fragment this '\n'-split file into extra "entries" either way.
   const reasonClean = cleanReason(reason);
 
-  const line = `${new Date().toISOString()} — ${action}${reasonClean ? ': ' + reasonClean : ''}`;
+  // epic retro action item: approverUserId (a namespaced id like
+  // "telegram:dana", never containing whitespace — see the entity model's
+  // own `<channel>:<handle>` convention) sits in a fixed bracketed slot
+  // between action and reason, so parseSelfModLogLine's regex can find it
+  // unambiguously even though `reason` is free text that could otherwise
+  // collide with any other delimiter choice.
+  const approverPart = approverUserId ? ` [approved-by:${approverUserId}]` : '';
+
+  const line = `${new Date().toISOString()} — ${action}${approverPart}${reasonClean ? ': ' + reasonClean : ''}`;
   trimmed.push(line);
   fs.writeFileSync(file, trimmed.join('\n') + '\n');
 }
@@ -86,12 +94,14 @@ export function readSelfModLog(agentGroupId: string, limit = 10): string[] {
 export interface SelfModLogEntry {
   at: string;
   action: string;
+  /** The admin who approved, when recorded — absent on any line written before this field existed. */
+  approverUserId: string | null;
   reason: string | null;
 }
 
 /**
  * Parses one line back into its structured parts — the exact inverse of
- * `appendSelfModLog`'s own `${at} — ${action}${reason ? ': ' + reason : ''}`
+ * `appendSelfModLog`'s own `${at} — ${action}${approverPart}${reason ? ': ' + reason : ''}`
  * format, which this file alone controls (never hand-edited by anything
  * else in this codebase). Not a fragile guess at someone else's format —
  * parsing this module's own well-defined output.
@@ -102,11 +112,17 @@ export interface SelfModLogEntry {
  * one place meant to federate all three domains under one shared shape.
  * This gives self-mod entries the same `{at, action, reason}` structure
  * without changing the file's own plain-text format (AD-9's own explicit
- * choice, unchanged).
+ * choice, unchanged). The `[approved-by:...]` group is optional so every
+ * pre-existing line (written before that field existed) still parses.
  */
 export function parseSelfModLogLine(line: string): SelfModLogEntry | undefined {
-  const match = /^(\S+) — (\S+)(?:: (.*))?$/.exec(line);
+  const match = /^(\S+) — (\S+)(?: \[approved-by:(\S+)\])?(?:: (.*))?$/.exec(line);
   if (!match) return undefined;
-  const [, at, action, reason] = match;
-  return { at, action, reason: reason && reason.length > 0 ? reason : null };
+  const [, at, action, approverUserId, reason] = match;
+  return {
+    at,
+    action,
+    approverUserId: approverUserId && approverUserId.length > 0 ? approverUserId : null,
+    reason: reason && reason.length > 0 ? reason : null,
+  };
 }

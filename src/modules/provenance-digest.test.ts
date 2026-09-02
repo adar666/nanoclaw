@@ -147,6 +147,18 @@ describe('buildProvenanceDigest', () => {
     expect(digest.self_mod.summary).toMatch(/2 most recent/i);
   });
 
+  // epic retro action item: the resolved approver identity (previously
+  // discarded before ever reaching the log) now surfaces through the digest.
+  it('surfaces the approver on a self-mod entry that recorded one, null on one that did not', () => {
+    appendSelfModLog('ag-1', 'add_calendar', 'family calendar for scheduling', 'telegram:dana');
+    appendSelfModLog('ag-1', 'add_mcp_server', undefined);
+
+    const digest = buildProvenanceDigest('ag-1');
+    expect(digest.self_mod.items).toHaveLength(2);
+    expect(digest.self_mod.items[0].approver_user_id).toBeNull(); // add_mcp_server, no approver given
+    expect(digest.self_mod.items[1].approver_user_id).toBe('telegram:dana'); // add_calendar
+  });
+
   // epic retro: a line parseSelfModLogLine can't parse (hand-edited/corrupted
   // file, outside this module's control) must be skipped, not thrown or
   // silently included as garbage — same tolerant-reader posture as the

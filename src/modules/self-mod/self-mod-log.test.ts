@@ -67,6 +67,23 @@ describe('appendSelfModLog', () => {
     expect(lines[0]).toContain(' — install_packages: need ffmpeg for audio transcription');
   });
 
+  // epic retro action item: the resolved approver identity is now recorded
+  // in a fixed bracketed slot between action and reason.
+  it('includes the approver in a bracketed slot when one is given', () => {
+    appendSelfModLog('ag-1', 'add_calendar', 'shared family schedule', 'telegram:dana');
+
+    const lines = readLines();
+    expect(lines[0]).toContain(' — add_calendar [approved-by:telegram:dana]: shared family schedule');
+  });
+
+  it('omits the bracketed approver slot entirely when none is given', () => {
+    appendSelfModLog('ag-1', 'add_calendar', 'shared family schedule');
+
+    const lines = readLines();
+    expect(lines[0]).not.toContain('approved-by');
+    expect(lines[0]).toContain(' — add_calendar: shared family schedule');
+  });
+
   it('omits the trailing colon/reason text when no reason is given (add_mcp_server case)', () => {
     appendSelfModLog('ag-1', 'add_mcp_server', undefined);
 
@@ -232,11 +249,12 @@ describe('parseSelfModLogLine', () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   });
 
-  it('parses a line with a reason', () => {
+  it('parses a line with a reason and no approver (pre-existing line format)', () => {
     const parsed = parseSelfModLogLine('2026-01-01T00:00:00.000Z — add_calendar: family calendar for scheduling');
     expect(parsed).toEqual({
       at: '2026-01-01T00:00:00.000Z',
       action: 'add_calendar',
+      approverUserId: null,
       reason: 'family calendar for scheduling',
     });
   });
@@ -246,17 +264,48 @@ describe('parseSelfModLogLine', () => {
     expect(parsed).toEqual({
       at: '2026-01-01T00:00:00.000Z',
       action: 'add_mcp_server',
+      approverUserId: null,
       reason: null,
     });
   });
 
-  it("round-trips against appendSelfModLog's own real output", () => {
-    appendSelfModLog('ag-1', 'install_packages', 'need ffmpeg for audio transcription');
-    const [line] = readSelfModLog('ag-1');
+  // epic retro action item: approverUserId sits in a fixed bracketed slot
+  // between action and reason.
+  it('parses a line with an approver and a reason', () => {
+    const parsed = parseSelfModLogLine(
+      '2026-01-01T00:00:00.000Z — add_calendar [approved-by:telegram:dana]: family calendar for scheduling',
+    );
+    expect(parsed).toEqual({
+      at: '2026-01-01T00:00:00.000Z',
+      action: 'add_calendar',
+      approverUserId: 'telegram:dana',
+      reason: 'family calendar for scheduling',
+    });
+  });
 
-    const parsed = parseSelfModLogLine(line);
-    expect(parsed?.action).toBe('install_packages');
-    expect(parsed?.reason).toBe('need ffmpeg for audio transcription');
+  it('parses a line with an approver but no reason', () => {
+    const parsed = parseSelfModLogLine('2026-01-01T00:00:00.000Z — add_mcp_server [approved-by:telegram:dana]');
+    expect(parsed).toEqual({
+      at: '2026-01-01T00:00:00.000Z',
+      action: 'add_mcp_server',
+      approverUserId: 'telegram:dana',
+      reason: null,
+    });
+  });
+
+  it("round-trips against appendSelfModLog's own real output, with and without an approver", () => {
+    appendSelfModLog('ag-1', 'install_packages', 'need ffmpeg for audio transcription', 'telegram:dana');
+    appendSelfModLog('ag-1', 'add_mcp_server', undefined);
+    const [withApprover, withoutApprover] = readSelfModLog('ag-1');
+
+    const parsedWith = parseSelfModLogLine(withApprover);
+    expect(parsedWith?.action).toBe('install_packages');
+    expect(parsedWith?.approverUserId).toBe('telegram:dana');
+    expect(parsedWith?.reason).toBe('need ffmpeg for audio transcription');
+
+    const parsedWithout = parseSelfModLogLine(withoutApprover);
+    expect(parsedWithout?.action).toBe('add_mcp_server');
+    expect(parsedWithout?.approverUserId).toBeNull();
   });
 
   it('returns undefined for a line that does not match the format', () => {

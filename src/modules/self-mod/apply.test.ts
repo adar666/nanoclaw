@@ -152,7 +152,21 @@ describe('applyAddCalendar', () => {
 
     await applyAddCalendar({ name: 'family', calendarId: 'family@x.com', reason: 'shared family schedule' }, session);
 
-    expect(appendSelfModLog).toHaveBeenCalledWith('ag-1', 'add_calendar', 'shared family schedule');
+    expect(appendSelfModLog).toHaveBeenCalledWith('ag-1', 'add_calendar', 'shared family schedule', undefined);
+  });
+
+  // epic retro action item: the approved-replay path threads the resolved
+  // approver identity down to this call — no longer discarded.
+  it('threads approverUserId through to appendSelfModLog when the caller provides one', async () => {
+    const { appendSelfModLog } = await import('./self-mod-log.js');
+
+    await applyAddCalendar(
+      { name: 'family', calendarId: 'family@x.com', reason: 'shared family schedule' },
+      session,
+      'telegram:dana',
+    );
+
+    expect(appendSelfModLog).toHaveBeenCalledWith('ag-1', 'add_calendar', 'shared family schedule', 'telegram:dana');
   });
 
   it('does not append a self-mod-log entry when the agent group is missing (nothing was applied)', async () => {
@@ -189,7 +203,12 @@ describe('applyInstallPackages', () => {
 
     await applyInstallPackages({ apt: ['ffmpeg'], reason: 'need it for audio transcription' }, session);
 
-    expect(appendSelfModLog).toHaveBeenCalledWith('ag-1', 'install_packages', 'need it for audio transcription');
+    expect(appendSelfModLog).toHaveBeenCalledWith(
+      'ag-1',
+      'install_packages',
+      'need it for audio transcription',
+      undefined,
+    );
   });
 
   it('does not append a self-mod-log entry when the agent group is missing (nothing was applied)', async () => {
@@ -252,7 +271,7 @@ describe('applyAddMcpServer', () => {
 
     await applyAddMcpServer({ name: 'weather', command: 'npx', args: [] }, session);
 
-    expect(appendSelfModLog).toHaveBeenCalledWith('ag-1', 'add_mcp_server', undefined);
+    expect(appendSelfModLog).toHaveBeenCalledWith('ag-1', 'add_mcp_server', undefined, undefined);
   });
 
   it('does not append a self-mod-log entry when the agent group is missing (nothing was applied)', async () => {

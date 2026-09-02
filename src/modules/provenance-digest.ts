@@ -81,6 +81,8 @@ export interface DocumentDigestItem {
  */
 export interface SelfModDigestItem {
   action: string;
+  /** The admin who approved, when recorded — null for any entry written before this field existed (epic retro action item). */
+  approver_user_id: string | null;
   reason: string | null;
   provenance_at: string;
   provenance_at_local: string;
@@ -353,6 +355,7 @@ export function buildProvenanceDigest(agentGroupId: string): ProvenanceDigest {
     }
     selfModItems.push({
       action: parsed.action,
+      approver_user_id: parsed.approverUserId,
       reason: parsed.reason,
       provenance_at: parsed.at,
       provenance_at_local: formatLocalTime(parsed.at, timezone),
