@@ -1,8 +1,9 @@
 import fs from 'fs';
 import path from 'path';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  buildMounts,
   clearActiveContainersForTest,
   EVAL_CLI_ONESHOT_TOKEN,
   getActiveContainerCount,
@@ -13,10 +14,35 @@ import {
   resolveProviderName,
 } from './container-runner.js';
 import { stopContainer } from './container-runtime.js';
+import type { ContainerConfig } from './container-config.js';
+import type { ProviderContainerContribution } from './providers/provider-container-registry.js';
+import type { AgentGroup, Session } from './types.js';
 
 vi.mock('./container-runtime.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./container-runtime.js')>();
   return { ...actual, stopContainer: vi.fn() };
+});
+
+// buildMounts (below) composes the agent's CLAUDE.md as a side effect when
+// the resolved provider doesn't declare providesAgentSurfaces (the case for
+// every provider registered in this trunk today) — that path needs a real
+// central DB row this suite has no reason to set up, so it's stubbed out.
+// Nothing else in this file touches claude-md-compose.js.
+vi.mock('./claude-md-compose.js', () => ({
+  composeGroupClaudeMd: vi.fn(),
+}));
+
+// GROUPS_DIR/DATA_DIR default to the real project's groups/ and data/ dirs
+// (process.cwd()-relative) — only the self-mod-log mount test below needs a
+// real (but disposable) group folder to check fs.existsSync against, so it's
+// redirected to a scratch dir rather than writing into the real repo.
+vi.mock('./config.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./config.js')>();
+  return {
+    ...actual,
+    GROUPS_DIR: '/tmp/nanoclaw-test-container-runner/groups',
+    DATA_DIR: '/tmp/nanoclaw-test-container-runner/data',
+  };
 });
 
 describe('resolveProviderName', () => {
@@ -266,5 +292,70 @@ describe('killAllActiveContainers', () => {
     // container-ok: still reached and killed normally.
     expect(stopContainer).toHaveBeenCalledWith('container-ok');
     expect(killOk).not.toHaveBeenCalled(); // stopContainer succeeded for it — no fallback needed
+  });
+});
+
+// spec-2-2: self-mod-change-provenance — self-mod-log.md's nested RO mount,
+// same conditional-existence convention already covered by container.json
+// two lines above it in buildMounts.
+describe('buildMounts self-mod-log.md mount', () => {
+  const TEST_DIR = '/tmp/nanoclaw-test-container-runner';
+  const GROUP_DIR = `${TEST_DIR}/groups/ag-1`;
+  const SELF_MOD_LOG_PATH = `${GROUP_DIR}/self-mod-log.md`;
+
+  const agentGroup: AgentGroup = {
+    id: 'ag-1',
+    name: 'Agent',
+    folder: 'ag-1',
+    agent_provider: null,
+    created_at: new Date().toISOString(),
+  };
+  const session: Session = {
+    id: 'sess-1',
+    agent_group_id: 'ag-1',
+    messaging_group_id: null,
+    thread_id: null,
+    agent_provider: null,
+    status: 'active',
+    container_status: 'stopped',
+    last_active: null,
+    created_at: new Date().toISOString(),
+  };
+  const containerConfig: ContainerConfig = {
+    mcpServers: {},
+    packages: { apt: [], npm: [] },
+    additionalMounts: [],
+    skills: [],
+    calendarRegistry: [],
+  };
+  const providerContribution: ProviderContainerContribution = {};
+
+  beforeEach(() => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(GROUP_DIR, { recursive: true });
+  });
+
+  afterEach(() => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  });
+
+  it('mounts self-mod-log.md read-only at /workspace/agent/self-mod-log.md when the file exists', () => {
+    fs.writeFileSync(SELF_MOD_LOG_PATH, '2026-01-01T00:00:00.000Z — add_calendar: test\n');
+
+    const mounts = buildMounts(agentGroup, session, containerConfig, 'claude', providerContribution);
+
+    expect(mounts).toContainEqual({
+      hostPath: SELF_MOD_LOG_PATH,
+      containerPath: '/workspace/agent/self-mod-log.md',
+      readonly: true,
+    });
+  });
+
+  it('adds no self-mod-log.md mount when the file does not exist', () => {
+    expect(fs.existsSync(SELF_MOD_LOG_PATH)).toBe(false);
+
+    const mounts = buildMounts(agentGroup, session, containerConfig, 'claude', providerContribution);
+
+    expect(mounts.some((m) => m.containerPath === '/workspace/agent/self-mod-log.md')).toBe(false);
   });
 });

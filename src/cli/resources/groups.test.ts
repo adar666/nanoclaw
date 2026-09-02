@@ -276,6 +276,88 @@ describe('groups config add-mount / remove-mount (host-only)', () => {
       { hostPath: '/data/writable.db', containerPath: 'writable.db', readonly: false },
     ]);
   });
+
+  // spec 1.1 ("Read a Fact Shared by Another Agent Group"): a `*-shared/`
+  // containerPath is the cross-group shared-facts convention
+  // `read_shared_context` scans — it must never land RW by accident.
+  it('rejects a *-shared/ containerPath without --ro, and writes nothing', async () => {
+    const GID = 'ag-mount-shared-rw';
+    createAgentGroup({ id: GID, name: 'm', folder: 'm', agent_provider: null, created_at: now() });
+    ensureContainerConfig(GID);
+    const args = {
+      id: GID,
+      host: '/data/groups/household/memory/household/shared-facts.md',
+      container: 'household-shared/shared-facts.md',
+    };
+
+    const add = await dispatch({ id: 'r1', command: 'groups-config-add-mount', args }, { caller: 'host' });
+    expect(add.ok).toBe(false);
+    if (!add.ok) expect(add.error.message).toMatch(/--ro/);
+    expect(JSON.parse(getContainerConfig(GID)!.additional_mounts)).toEqual([]);
+  });
+
+  it('allows a *-shared/ containerPath with --ro, exactly like any other mount (real eval/prod precedent)', async () => {
+    // Exact containerPath shape already live in production (verified against
+    // the real DB: every dm-with-uriel/dm-with-partner/household-eval
+    // container_configs row already carries this exact hostPath/containerPath
+    // pair, always with readonly: true) and used verbatim by
+    // eval/setup.ts's ensureEvalPeopleMount. This confirms the new guard
+    // doesn't regress the mount this convention was named after.
+    const GID = 'ag-mount-shared-ro';
+    createAgentGroup({ id: GID, name: 'm', folder: 'm', agent_provider: null, created_at: now() });
+    ensureContainerConfig(GID);
+    const args = {
+      id: GID,
+      host: '/data/groups/household/memory/household/people.md',
+      container: 'household-shared/people.md',
+      ro: true,
+    };
+
+    const add = await dispatch({ id: 'r1', command: 'groups-config-add-mount', args }, { caller: 'host' });
+    expect(add.ok).toBe(true);
+    expect(JSON.parse(getContainerConfig(GID)!.additional_mounts)).toEqual([
+      {
+        hostPath: '/data/groups/household/memory/household/people.md',
+        containerPath: 'household-shared/people.md',
+        readonly: true,
+      },
+    ]);
+  });
+
+  // review_loop_iteration 1: the original `/-shared\//` regex required a
+  // trailing slash, so a bare `<folder>-shared` (no filename) silently
+  // bypassed the guard — the exact footgun this story exists to close.
+  it('rejects a bare "<folder>-shared" containerPath (no filename) without --ro', async () => {
+    const GID = 'ag-mount-shared-bare';
+    createAgentGroup({ id: GID, name: 'm', folder: 'm', agent_provider: null, created_at: now() });
+    ensureContainerConfig(GID);
+    const args = {
+      id: GID,
+      host: '/data/groups/household/memory/household',
+      container: 'household-shared',
+    };
+
+    const add = await dispatch({ id: 'r1', command: 'groups-config-add-mount', args }, { caller: 'host' });
+    expect(add.ok).toBe(false);
+    if (!add.ok) expect(add.error.message).toMatch(/--ro/);
+    expect(JSON.parse(getContainerConfig(GID)!.additional_mounts)).toEqual([]);
+  });
+
+  it('a containerPath with no "-shared/" segment, without --ro, is unaffected by the new guard', async () => {
+    const GID = 'ag-mount-plain';
+    createAgentGroup({ id: GID, name: 'm', folder: 'm', agent_provider: null, created_at: now() });
+    ensureContainerConfig(GID);
+    // No "-shared/" anywhere in this containerPath — the new guard's regex
+    // never fires, so behavior is exactly what add-mount already did before
+    // this story, unaffected.
+    const args = { id: GID, host: '/data/groups/household/memory/household/people.md', container: 'people.md' };
+
+    const add = await dispatch({ id: 'r1', command: 'groups-config-add-mount', args }, { caller: 'host' });
+    expect(add.ok).toBe(true);
+    expect(JSON.parse(getContainerConfig(GID)!.additional_mounts)).toEqual([
+      { hostPath: '/data/groups/household/memory/household/people.md', containerPath: 'people.md', readonly: false },
+    ]);
+  });
 });
 
 // spec cal-2.3: `ncl groups config add-calendar` / `config remove-calendar`,
@@ -425,5 +507,67 @@ describe('groups config add-calendar / remove-calendar', () => {
       { caller: 'host' },
     );
     expect(primary.ok).toBe(true);
+  });
+});
+
+// spec 2-4 (on-demand-cross-domain-digest): `ncl groups provenance-digest`.
+describe('groups provenance-digest', () => {
+  beforeEach(() => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+    runMigrations(initTestDb());
+  });
+  afterEach(() => {
+    closeDb();
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  });
+
+  it('returns the three-section digest for a real group (host caller)', async () => {
+    const GID = 'ag-digest';
+    createAgentGroup({ id: GID, name: 'digest', folder: 'digest', agent_provider: null, created_at: now() });
+    ensureContainerConfig(GID);
+
+    const resp = await dispatch(
+      { id: 'r1', command: 'groups-provenance-digest', args: { id: GID } },
+      { caller: 'host' },
+    );
+
+    expect(resp.ok).toBe(true);
+    if (!resp.ok) return;
+    const data = resp.data as { tasks: unknown; self_mod: unknown; documents: unknown; agent_group_id: string };
+    expect(data.agent_group_id).toBe(GID);
+    // Every section is present even with nothing recorded — never omitted.
+    expect(data.tasks).toBeDefined();
+    expect(data.self_mod).toBeDefined();
+    expect(data.documents).toBeDefined();
+  });
+
+  it('fails clearly for a missing --id', async () => {
+    const resp = await dispatch({ id: 'r1', command: 'groups-provenance-digest', args: {} }, { caller: 'host' });
+    expect(resp.ok).toBe(false);
+    if (!resp.ok) expect(resp.error.message).toMatch(/--id is required/);
+  });
+
+  it("fails clearly for a group with no container config, matching config get's precedent", async () => {
+    const resp = await dispatch(
+      { id: 'r1', command: 'groups-provenance-digest', args: { id: 'ag-does-not-exist' } },
+      { caller: 'host' },
+    );
+    expect(resp.ok).toBe(false);
+    if (!resp.ok) expect(resp.error.message).toMatch(/No container config for group/);
+  });
+
+  it('an agent caller under cli_scope=group is auto-scoped to its own group', async () => {
+    const GID = 'ag-digest-agent';
+    createAgentGroup({ id: GID, name: 'digest', folder: 'digest-agent', agent_provider: null, created_at: now() });
+    ensureContainerConfig(GID);
+
+    const resp = await dispatch(
+      { id: 'r1', command: 'groups-provenance-digest', args: {} },
+      { caller: 'agent', agentGroupId: GID, sessionId: 'sess-1', messagingGroupId: 'mg-1' },
+    );
+    expect(resp.ok).toBe(true);
+    if (!resp.ok) return;
+    expect((resp.data as { agent_group_id: string }).agent_group_id).toBe(GID);
   });
 });

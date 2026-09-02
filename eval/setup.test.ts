@@ -59,6 +59,7 @@ import {
   ensureEvalJudgeGroup,
   ensureEvalPeopleMount,
   ensureEvalScenarioGroup,
+  ensureEvalSharedContextMount,
 } from './setup.js';
 
 const mockedReadEnvFile = vi.mocked(readEnvFile);
@@ -105,7 +106,7 @@ describe('ensureEvalScenarioGroup', () => {
     expect(getAllAgentGroups().filter((g) => g.folder === 'eval')).toHaveLength(1);
   });
 
-  it('provisions the calendar override and the people.md mount in one call', () => {
+  it('provisions the calendar override, the people.md mount, and the shared-facts.md mount in one call', () => {
     const group = ensureEvalScenarioGroup();
 
     const config = getContainerConfig(group.id)!;
@@ -115,6 +116,11 @@ describe('ensureEvalScenarioGroup', () => {
     expect(JSON.parse(config.additional_mounts)).toContainEqual({
       hostPath: `${TEST_ROOT}/groups/household/memory/household/people.md`,
       containerPath: 'household-shared/people.md',
+      readonly: true,
+    });
+    expect(JSON.parse(config.additional_mounts)).toContainEqual({
+      hostPath: `${TEST_ROOT}/groups/household/memory/household/people.md`,
+      containerPath: 'household-shared/shared-facts.md',
       readonly: true,
     });
   });
@@ -362,6 +368,115 @@ describe('ensureEvalPeopleMount', () => {
     ensureEvalPeopleMount(group.id);
 
     expect(getContainerConfig(group.id)!.additional_mounts).toBe(before);
+  });
+});
+
+describe('ensureEvalSharedContextMount', () => {
+  it('mounts household/memory/household/people.md read-only at household-shared/shared-facts.md', () => {
+    const group = ensureAgentGroup('eval-shared-mount', 'Eval Shared Context Mount Test');
+
+    ensureEvalSharedContextMount(group.id);
+
+    const config = getContainerConfig(group.id)!;
+    expect(JSON.parse(config.additional_mounts)).toEqual([
+      {
+        hostPath: `${TEST_ROOT}/groups/household/memory/household/people.md`,
+        containerPath: 'household-shared/shared-facts.md',
+        readonly: true,
+      },
+    ]);
+  });
+
+  it('is idempotent: re-running adds no duplicate entry', () => {
+    const group = ensureAgentGroup('eval-shared-mount-idempotent', 'Eval Shared Context Mount Test (idempotent)');
+
+    ensureEvalSharedContextMount(group.id);
+    ensureEvalSharedContextMount(group.id);
+
+    const config = getContainerConfig(group.id)!;
+    expect(JSON.parse(config.additional_mounts)).toHaveLength(1);
+  });
+
+  it('throws loud, writing nothing, when people.md does not exist on disk', () => {
+    fs.rmSync(PEOPLE_MD_PATH);
+    const group = ensureAgentGroup('eval-shared-mount-missing-source', 'Eval Shared Context Mount Test (missing source)');
+
+    expect(() => ensureEvalSharedContextMount(group.id)).toThrow(/people\.md/);
+
+    const config = getContainerConfig(group.id)!;
+    expect(JSON.parse(config.additional_mounts)).toEqual([]);
+  });
+
+  it('validates the mount against mount-security before writing it, passing the real hostPath/containerPath/readonly', () => {
+    const group = ensureAgentGroup('eval-shared-mount-validate-call', 'Eval Shared Context Mount Test (validate call)');
+
+    ensureEvalSharedContextMount(group.id);
+
+    expect(validateMount).toHaveBeenCalledWith({
+      hostPath: `${TEST_ROOT}/groups/household/memory/household/people.md`,
+      containerPath: 'household-shared/shared-facts.md',
+      readonly: true,
+    });
+  });
+
+  it('throws loud, writing nothing, when mount-security would reject the mount (missing allowlist entry) — never a silent WARN-rejection at spawn time', () => {
+    vi.mocked(validateMount).mockReturnValue({
+      allowed: false,
+      reason:
+        'Path "/tmp/nanoclaw-eval-setup-test/groups/household/memory/household/people.md" is not under any allowed root',
+    });
+    const group = ensureAgentGroup('eval-shared-mount-not-allowlisted', 'Eval Shared Context Mount Test (not allowlisted)');
+
+    expect(() => ensureEvalSharedContextMount(group.id)).toThrow(/mount-allowlist\.json/);
+
+    const config = getContainerConfig(group.id)!;
+    expect(JSON.parse(config.additional_mounts)).toEqual([]);
+  });
+
+  it('reconciles a pre-existing (hostPath, containerPath) entry whose readonly value disagrees with true, rather than leaving it writable', () => {
+    const group = ensureAgentGroup('eval-shared-mount-reconcile', 'Eval Shared Context Mount Test (reconcile)');
+    const hostPath = `${TEST_ROOT}/groups/household/memory/household/people.md`;
+    const containerPath = 'household-shared/shared-facts.md';
+    // Seed a pre-existing entry for the identical (hostPath, containerPath)
+    // pair, but writable — simulates a hand-edited/stale config row the old
+    // (hostPath, containerPath)-only dedup check would have silently kept as-is.
+    updateContainerConfigJson(group.id, 'additional_mounts', [{ hostPath, containerPath, readonly: false }]);
+
+    ensureEvalSharedContextMount(group.id);
+
+    const config = getContainerConfig(group.id)!;
+    expect(JSON.parse(config.additional_mounts)).toEqual([{ hostPath, containerPath, readonly: true }]);
+  });
+
+  it('does not rewrite the config when the existing entry already matches exactly', () => {
+    const group = ensureAgentGroup('eval-shared-mount-no-op', 'Eval Shared Context Mount Test (no-op)');
+    ensureEvalSharedContextMount(group.id);
+    const before = getContainerConfig(group.id)!.additional_mounts;
+
+    ensureEvalSharedContextMount(group.id);
+
+    expect(getContainerConfig(group.id)!.additional_mounts).toBe(before);
+  });
+
+  it('coexists with ensureEvalPeopleMount\'s own mount of the same host file at a different containerPath — both entries present, neither overwrites the other', () => {
+    const group = ensureAgentGroup('eval-shared-mount-coexist', 'Eval Shared Context Mount Test (coexist)');
+
+    ensureEvalPeopleMount(group.id);
+    ensureEvalSharedContextMount(group.id);
+
+    const config = getContainerConfig(group.id)!;
+    const mounts = JSON.parse(config.additional_mounts);
+    expect(mounts).toHaveLength(2);
+    expect(mounts).toContainEqual({
+      hostPath: `${TEST_ROOT}/groups/household/memory/household/people.md`,
+      containerPath: 'household-shared/people.md',
+      readonly: true,
+    });
+    expect(mounts).toContainEqual({
+      hostPath: `${TEST_ROOT}/groups/household/memory/household/people.md`,
+      containerPath: 'household-shared/shared-facts.md',
+      readonly: true,
+    });
   });
 });
 

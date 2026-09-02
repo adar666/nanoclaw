@@ -18,7 +18,11 @@ ncl tasks cancel ping-a25c      # or --all as a kill switch
 ncl tasks delete ping-a25c
 ```
 
+**If the user asks to stop/cancel a reminder, or says the condition it was tracking is resolved** (e.g. "stop reminding me", "already done", "don't need to check that anymore"), a verbal acknowledgment alone does NOT stop it — recurrence is driven purely by the task's DB row, with no awareness of what you say in chat. You MUST run `ncl tasks list` to find the task/series, then `ncl tasks cancel <id>` (or `pause` if it should resume later), before replying that you'll stop. Do this even from a normal chat session — `ncl tasks` resolves by agent group, not by which session you're in.
+
 Use good judgement on whether it's appropriate to check in with the user about the task prompt before task creation, and if so, whether to share verbatim or a description of it.
+
+Pass `--reason "<why you're creating this>"` on create (e.g. `--reason "user asked to check every Monday"`) whenever the trigger isn't obvious from the prompt alone — it's recorded once, at creation, and never changes on later recurrence fires. A later "why do I get this reminder" is answerable from `ncl tasks get <id> --json` (`reason`/`triggered_by`/`provenance_at`) without you having to remember or reconstruct it from chat history.
 
 `--process-after` accepts UTC timestamps or naive local timestamps interpreted in the instance timezone (shown in the `<context timezone="..."/>` header).
 

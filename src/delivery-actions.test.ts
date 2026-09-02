@@ -17,10 +17,50 @@ vi.mock('./container-runner.js', () => ({
   buildAgentGroupImage: vi.fn().mockResolvedValue(undefined),
 }));
 
-import { registerDeliveryAction, getDeliveryAction, type DeliveryActionHandler } from './delivery.js';
-import { defineGuardedAction, HOLD, unguarded } from './guard/index.js';
+import {
+  registerDeliveryAction,
+  getDeliveryAction,
+  reenterGuardedDeliveryAction,
+  type DeliveryActionHandler,
+} from './delivery.js';
+import { defineGuardedAction, ALLOW, HOLD, unguarded } from './guard/index.js';
+import type { PendingApproval, Session } from './types.js';
 
 const testUnguarded = unguarded('test — registry mechanics only');
+
+function fakeSession(): Session {
+  return {
+    id: 'sess-test',
+    agent_group_id: 'ag-test',
+    messaging_group_id: null,
+    thread_id: null,
+    agent_provider: null,
+    status: 'active',
+    container_status: 'stopped',
+    last_active: new Date().toISOString(),
+    created_at: new Date().toISOString(),
+  };
+}
+
+function fakeApproval(): PendingApproval {
+  return {
+    approval_id: 'appr-test',
+    session_id: 'sess-test',
+    request_id: 'req-test',
+    action: 'test_reenter_action',
+    payload: '{}',
+    created_at: new Date().toISOString(),
+    agent_group_id: 'ag-test',
+    channel_type: null,
+    platform_id: null,
+    platform_message_id: null,
+    expires_at: null,
+    status: 'approved',
+    title: 't',
+    options_json: '[]',
+    approver_user_id: null,
+  };
+}
 
 describe('delivery action registry', () => {
   it('getDeliveryAction returns the handler registerDeliveryAction registered', () => {
@@ -65,5 +105,50 @@ describe('delivery action registry', () => {
       requestHold: async () => {},
     });
     expect(getDeliveryAction('test_guarded_overwrite')).toBeDefined();
+  });
+
+  // epic retro action item: `reenterGuardedDeliveryAction`'s ctx used to
+  // drop `userId` — the admin who actually clicked approve
+  // (ApprovalHandlerContext.userId, already resolved by response-handler.ts
+  // before this callback ever runs) — on the floor before it ever reached
+  // the handler body. Confirms it now threads through end to end.
+  it('reenterGuardedDeliveryAction threads the approving userId through to the handler', async () => {
+    const guardAction = defineGuardedAction({
+      action: 'test.reenter-userid',
+      decide: () => ALLOW('grant satisfies the hold'),
+    });
+    let receivedApproverUserId: string | undefined;
+    registerDeliveryAction(
+      'test_reenter_action',
+      async (_content, _session, approverUserId) => {
+        receivedApproverUserId = approverUserId;
+      },
+      { guardAction, requestHold: async () => {} },
+    );
+
+    const reenter = reenterGuardedDeliveryAction('test_reenter_action');
+    await reenter({ session: fakeSession(), payload: {}, approval: fakeApproval(), userId: 'telegram:dana' });
+
+    expect(receivedApproverUserId).toBe('telegram:dana');
+  });
+
+  it('reenterGuardedDeliveryAction normalizes an empty-string userId to undefined, never a falsy-but-present value', async () => {
+    const guardAction = defineGuardedAction({
+      action: 'test.reenter-empty-userid',
+      decide: () => ALLOW('grant satisfies the hold'),
+    });
+    let receivedApproverUserId: string | undefined = 'unset';
+    registerDeliveryAction(
+      'test_reenter_empty_action',
+      async (_content, _session, approverUserId) => {
+        receivedApproverUserId = approverUserId;
+      },
+      { guardAction, requestHold: async () => {} },
+    );
+
+    const reenter = reenterGuardedDeliveryAction('test_reenter_empty_action');
+    await reenter({ session: fakeSession(), payload: {}, approval: fakeApproval(), userId: '' });
+
+    expect(receivedApproverUserId).toBeUndefined();
   });
 });

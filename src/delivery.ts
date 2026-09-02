@@ -484,13 +484,33 @@ export function registerDeliveryAction(
  * same line that registers the action.
  */
 export function reenterGuardedDeliveryAction(action: string) {
-  return async (ctx: { session: Session; payload: Record<string, unknown>; approval: PendingApproval }) => {
+  // epic retro action item: `userId` here is `ApprovalHandlerContext.userId`
+  // — the admin who actually clicked approve, already resolved by
+  // response-handler.ts before this callback ever runs. It used to be
+  // dropped on the floor (this ctx type didn't even name it) between
+  // resolution and the handler body that logs provenance.
+  return async (ctx: {
+    session: Session;
+    payload: Record<string, unknown>;
+    approval: PendingApproval;
+    userId?: string;
+  }) => {
     const entry = deliveryActions.get(action);
     if (!entry || isUnguardedEntry(entry)) {
       log.warn('Approved replay for an action that is not guard-wrapped — dropping', { action });
       return;
     }
-    await runGuarded(action, entry.guard, entry.handler, ctx.payload, ctx.session, ctx.approval);
+    // "Empty string if unknown" (ApprovalHandlerContext's own contract) — normalize to
+    // undefined so a handler's `approverUserId ? ... : ...` check never sees ''.
+    await runGuarded(
+      action,
+      entry.guard,
+      entry.handler,
+      ctx.payload,
+      ctx.session,
+      ctx.approval,
+      ctx.userId || undefined,
+    );
   };
 }
 

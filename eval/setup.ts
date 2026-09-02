@@ -82,6 +82,7 @@ export function ensureEvalScenarioGroup(): AgentGroup {
   const group = ensureAgentGroup('eval', 'Eval Harness (Scenario)');
   ensureEvalCalendarOverride(group.id);
   ensureEvalPeopleMount(group.id);
+  ensureEvalSharedContextMount(group.id);
   return group;
 }
 
@@ -195,6 +196,83 @@ export function ensureEvalPeopleMount(agentGroupId: string): void {
     // rather than failing loud, since there's exactly one correct value here
     // and no caller intent to conflict with (deferred-work.md finding,
     // spec-eval-1-2).
+    existing[existingIndex] = mount;
+    updateContainerConfigJson(agentGroupId, 'additional_mounts', existing);
+  }
+}
+
+/**
+ * Read-only-mounts household's real `people.md` a SECOND time into the eval
+ * group, at containerPath `household-shared/shared-facts.md` — the exact
+ * fixed filename `read_shared_context`'s own scan
+ * (`container/agent-runner/src/mcp-tools/shared-context.ts`'s
+ * `SHARED_FACTS_FILENAME`) looks for inside any `*-shared/` directory.
+ * `ensureEvalPeopleMount`'s existing `household-shared/people.md` mount is
+ * NOT picked up by that tool (wrong filename) — this is a second, distinct
+ * mount of the identical host file, landing at a different container-side
+ * path in the same directory, purely so `read_shared_context` has something
+ * real to find. No new `~/.config/nanoclaw/mount-allowlist.json` entry: same
+ * already-allowed host path as `ensureEvalPeopleMount`, just a different
+ * containerPath.
+ *
+ * Mirrors `ensureEvalPeopleMount`'s exact shape: same fail-loud existence
+ * check, same `validateMount` call, same readonly-reconcile-by-index logic.
+ *
+ * Cross-runtime drift risk (review round 1, story 1.2 — same accepted
+ * tradeoff already logged in `shared-context.ts`'s own comments for story
+ * 1.1): the literal `'household-shared/shared-facts.md'` below must keep
+ * agreeing with `SHARED_SUFFIX`/`SHARED_FACTS_FILENAME` in
+ * `container/agent-runner/src/mcp-tools/shared-context.ts` — a different
+ * package/runtime (Bun, its own dependency tree), so no shared TS constant is
+ * practical across the boundary. No test spans it automatically; a drift here
+ * would silently make `pnpm eval run shared-context` exercise nothing real.
+ */
+export function ensureEvalSharedContextMount(agentGroupId: string): void {
+  const hostPath = path.join(GROUPS_DIR, 'household', 'memory', 'household', 'people.md');
+  const containerPath = 'household-shared/shared-facts.md';
+
+  // Fail loud, not silent — same AD-4 reasoning as ensureEvalPeopleMount: a
+  // missing/renamed source file would otherwise produce a mount config that
+  // only breaks much later, at container spawn.
+  if (!fs.existsSync(hostPath)) {
+    throw new Error(
+      `ensureEvalSharedContextMount: expected household's people.md at "${hostPath}" but it doesn't exist — ` +
+        'the eval group would otherwise get a shared-context mount config pointing at nothing.',
+    );
+  }
+
+  // Fail loud at setup time, not silently at container-spawn time — same
+  // reasoning as ensureEvalPeopleMount: reuses mount-security's own
+  // allowlist-loading/validation logic so this check can never drift from
+  // what buildMounts()/validateAdditionalMounts() will actually enforce at
+  // spawn time.
+  const mountCheck = validateMount({ hostPath, containerPath, readonly: true });
+  if (!mountCheck.allowed) {
+    throw new Error(
+      `ensureEvalSharedContextMount: mount-security would reject this mount at container spawn time — ${mountCheck.reason}. ` +
+        `Add "${hostPath}" as an allowed root in ~/.config/nanoclaw/mount-allowlist.json before running eval setup.`,
+    );
+  }
+
+  const row = getContainerConfig(agentGroupId);
+  if (!row) throw new Error(`No container config for group: ${agentGroupId}`);
+
+  const mount: AdditionalMountConfig = { hostPath, containerPath, readonly: true };
+  const existing = safeJsonParse(
+    row.additional_mounts,
+    [] as AdditionalMountConfig[],
+    'additional_mounts',
+    agentGroupId,
+  );
+  const existingIndex = existing.findIndex((m) => m.hostPath === hostPath && m.containerPath === containerPath);
+  if (existingIndex === -1) {
+    existing.push(mount);
+    updateContainerConfigJson(agentGroupId, 'additional_mounts', existing);
+  } else if (existing[existingIndex].readonly !== mount.readonly) {
+    // Reconcile a same-(hostPath, containerPath) entry whose `readonly`
+    // value disagrees with what this function always wants (`true`,
+    // hardcoded — never caller-supplied), same convention as
+    // ensureEvalPeopleMount.
     existing[existingIndex] = mount;
     updateContainerConfigJson(agentGroupId, 'additional_mounts', existing);
   }

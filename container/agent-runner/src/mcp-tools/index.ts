@@ -13,6 +13,7 @@ import './recorder.js';
 import './transcribe-audio.js';
 import './documents.js';
 import './calendar.js';
+import './shared-context.js';
 import { startMcpServer } from './server.js';
 import { loadConfig } from '../config.js';
 

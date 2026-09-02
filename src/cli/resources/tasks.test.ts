@@ -24,6 +24,7 @@ const TEST_DIR = '/tmp/nanoclaw-test-cli-tasks';
 import { initTestDb, closeDb, runMigrations, createAgentGroup } from '../../db/index.js';
 import { createSession, findSessionByAgentGroup, getSessionsByAgentGroup, taskThreadId } from '../../db/sessions.js';
 import { countDueMessages } from '../../db/session-db.js';
+import { insertRecurrence } from '../../modules/scheduling/db.js';
 import { inboundDbPath, initSessionFolder } from '../../session-manager.js';
 import { dispatch } from '../dispatch.js';
 import { formatTasksTable } from '../format-tasks.js';
@@ -349,6 +350,346 @@ describe('tasks CLI resource', () => {
     const d = r.data as { origin_session_id: string | null; created_at: string };
     expect(d.origin_session_id).toBe('chat-1'); // the session that created it
     expect(d.created_at).toBeTruthy();
+  });
+
+  describe('task provenance (spec-2-1)', () => {
+    it('agent-created task with no --reason: triggeredBy agent, requester/reason both absent', async () => {
+      const r = await dispatch(
+        {
+          id: 'prov-1',
+          command: 'tasks-create',
+          args: { prompt: 'x', name: 'prov-agent', process_after: '2999-01-01T00:00:00Z' },
+        },
+        agentCtx('ag-1', 'chat-1'),
+      );
+      expect(r.ok).toBe(true);
+      if (!r.ok) return;
+      const d = r.data as Record<string, unknown>;
+      expect(d.triggered_by).toBe('agent');
+      expect(d.requester_user_id).toBeNull();
+      expect(d.reason).toBeNull();
+      expect(d.provenance_at).toBeTruthy();
+
+      const { series_id } = d as { series_id: string };
+      const got = await dispatch({ id: 'prov-1-get', command: 'tasks-get', args: { id: series_id } }, agentCtx());
+      expect(got.ok).toBe(true);
+      if (got.ok) {
+        const gd = got.data as Record<string, unknown>;
+        expect(gd.triggered_by).toBe('agent');
+        expect(gd.reason).toBeNull();
+      }
+    });
+
+    it('agent-created task with --reason: reason is captured verbatim', async () => {
+      const r = await dispatch(
+        {
+          id: 'prov-2',
+          command: 'tasks-create',
+          args: {
+            prompt: 'x',
+            name: 'prov-reason',
+            process_after: '2999-01-01T00:00:00Z',
+            reason: 'user asked to check every Monday',
+          },
+        },
+        agentCtx('ag-1', 'chat-1'),
+      );
+      expect(r.ok).toBe(true);
+      if (!r.ok) return;
+      const d = r.data as Record<string, unknown>;
+      expect(d.triggered_by).toBe('agent');
+      expect(d.reason).toBe('user asked to check every Monday');
+    });
+
+    it('host-typed create: triggeredBy is user', async () => {
+      const r = await dispatch(
+        {
+          id: 'prov-3',
+          command: 'tasks-create',
+          args: { prompt: 'x', name: 'prov-host', process_after: '2999-01-01T00:00:00Z', group: 'ag-1' },
+        },
+        { caller: 'host' },
+      );
+      expect(r.ok).toBe(true);
+      if (!r.ok) return;
+      const d = r.data as Record<string, unknown>;
+      expect(d.triggered_by).toBe('user');
+      expect(d.reason).toBeNull();
+    });
+
+    it('a pre-existing row with no provenance key returns cleanly with null fields, never throws', async () => {
+      const created = await dispatch(
+        {
+          id: 'prov-4',
+          command: 'tasks-create',
+          args: { prompt: 'x', name: 'legacy-row', process_after: '2999-01-01T00:00:00Z' },
+        },
+        agentCtx('ag-1', 'chat-1'),
+      );
+      expect(created.ok).toBe(true);
+      if (!created.ok) return;
+      const { session_id, series_id, row_id } = created.data as {
+        session_id: string;
+        series_id: string;
+        row_id: string;
+      };
+
+      // Simulate a row created before this shipped: content has no `provenance` key.
+      const db = new Database(inboundDbPath('ag-1', session_id));
+      db.prepare('UPDATE messages_in SET content = ? WHERE id = ?').run(
+        JSON.stringify({ prompt: 'x', script: null, originSessionId: 'chat-1' }),
+        row_id,
+      );
+      db.close();
+
+      const got = await dispatch({ id: 'prov-4-get', command: 'tasks-get', args: { id: series_id } }, agentCtx());
+      expect(got.ok).toBe(true);
+      if (got.ok) {
+        const gd = got.data as Record<string, unknown>;
+        expect(gd.triggered_by).toBeNull();
+        expect(gd.requester_user_id).toBeNull();
+        expect(gd.reason).toBeNull();
+        expect(gd.provenance_at).toBeNull();
+      }
+
+      const list = await dispatch({ id: 'prov-4-list', command: 'tasks-list', args: {} }, agentCtx());
+      expect(list.ok).toBe(true);
+      if (list.ok) {
+        const row = (list.data as Array<Record<string, unknown>>).find((t) => t.series_id === series_id);
+        expect(row).toBeDefined();
+        expect(row?.triggered_by).toBeNull();
+      }
+    });
+
+    it("a recurring series' second fire copies provenance byte-identical to the first occurrence", async () => {
+      const created = await dispatch(
+        {
+          id: 'prov-5',
+          command: 'tasks-create',
+          args: {
+            prompt: 'x',
+            name: 'recurring-prov',
+            recurrence: '0 9 * * *',
+            reason: 'weekly nag',
+          },
+        },
+        agentCtx('ag-1', 'chat-1'),
+      );
+      expect(created.ok).toBe(true);
+      if (!created.ok) return;
+      const { session_id, series_id, row_id } = created.data as {
+        session_id: string;
+        series_id: string;
+        row_id: string;
+      };
+
+      const db = new Database(inboundDbPath('ag-1', session_id));
+      const original = db.prepare('SELECT content FROM messages_in WHERE id = ?').get(row_id) as {
+        content: string;
+      };
+      const originalProvenance = JSON.parse(original.content).provenance;
+
+      // Simulate handleRecurrence's insertRecurrence: verbatim content copy into a new row.
+      insertRecurrence(
+        db,
+        { id: row_id, content: original.content, recurrence: '0 9 * * *', series_id },
+        `${row_id}-next`,
+        '2999-01-02T09:00:00.000Z',
+      );
+      db.close();
+
+      const got = await dispatch({ id: 'prov-5-get', command: 'tasks-get', args: { id: series_id } }, agentCtx());
+      expect(got.ok).toBe(true);
+      if (got.ok) {
+        const gd = got.data as Record<string, unknown>;
+        // getTask/toOutput picks the live row — the newly-inserted next occurrence.
+        expect(gd.row_id).toBe(`${row_id}-next`);
+        expect(gd.reason).toBe('weekly nag');
+        expect(gd.provenance_at).toBe(originalProvenance.at);
+      }
+    });
+
+    // review round 1 (spec 2-1): host-caller path was only tested WITHOUT
+    // --reason; the arg is accepted from either caller, unverified for host.
+    it('host-typed create with --reason: reason is captured the same way as the agent path', async () => {
+      const r = await dispatch(
+        {
+          id: 'prov-6',
+          command: 'tasks-create',
+          args: {
+            prompt: 'x',
+            name: 'prov-host-reason',
+            process_after: '2999-01-01T00:00:00Z',
+            group: 'ag-1',
+            reason: 'operator set this up manually',
+          },
+        },
+        { caller: 'host' },
+      );
+      expect(r.ok).toBe(true);
+      if (!r.ok) return;
+      const d = r.data as Record<string, unknown>;
+      expect(d.triggered_by).toBe('user');
+      expect(d.reason).toBe('operator set this up manually');
+    });
+
+    // review round 1: --reason "null"/"none" must be stored verbatim, not
+    // silently discarded the way normalizeNullableString would (right
+    // behavior for --recurrence/--script's clear-the-field convention,
+    // wrong for a genuine free-text reason).
+    it('a --reason value of the literal string "null" or "none" is stored verbatim, not discarded', async () => {
+      const r = await dispatch(
+        {
+          id: 'prov-7',
+          command: 'tasks-create',
+          args: { prompt: 'x', name: 'prov-literal-null', process_after: '2999-01-01T00:00:00Z', reason: 'null' },
+        },
+        agentCtx('ag-1', 'chat-1'),
+      );
+      expect(r.ok).toBe(true);
+      if (!r.ok) return;
+      expect((r.data as Record<string, unknown>).reason).toBe('null');
+    });
+
+    // epic retro: an empty-string or whitespace-only --reason must resolve
+    // to no provenance reason at all (cleanReason returns undefined), not a
+    // stored empty string that a truthy-check ternary elsewhere could treat
+    // inconsistently from "no reason given."
+    it('an empty-string or whitespace-only --reason is treated as no reason, not stored empty', async () => {
+      const r = await dispatch(
+        {
+          id: 'prov-empty-reason',
+          command: 'tasks-create',
+          args: { prompt: 'x', name: 'prov-empty-reason', process_after: '2999-01-01T00:00:00Z', reason: '   ' },
+        },
+        agentCtx('ag-1', 'chat-1'),
+      );
+      expect(r.ok).toBe(true);
+      if (!r.ok) return;
+      expect((r.data as Record<string, unknown>).reason).toBeNull();
+    });
+
+    // review round 1: reason gets the same 120-char display cap as prompt —
+    // unbounded free text round-trips through every future recurrence fire.
+    it('a reason over 120 characters is truncated for display, same as prompt', async () => {
+      const long = 'x'.repeat(150);
+      const r = await dispatch(
+        {
+          id: 'prov-8',
+          command: 'tasks-create',
+          args: { prompt: 'x', name: 'prov-long-reason', process_after: '2999-01-01T00:00:00Z', reason: long },
+        },
+        agentCtx('ag-1', 'chat-1'),
+      );
+      expect(r.ok).toBe(true);
+      if (!r.ok) return;
+      const reason = (r.data as Record<string, unknown>).reason as string;
+      expect(reason.length).toBeLessThan(long.length);
+      expect(reason.endsWith('...')).toBe(true);
+    });
+
+    // review round 1: parseProvenance's own defensive branches (blind-hunter
+    // finding) — only the "no provenance key at all" shape was exercised
+    // before; these are the malformed-but-present shapes it explicitly
+    // guards against.
+    it('a malformed provenance shape (bad triggeredBy, missing at) is treated as absent, not thrown', async () => {
+      const created = await dispatch(
+        {
+          id: 'prov-9',
+          command: 'tasks-create',
+          args: { prompt: 'x', name: 'prov-malformed', process_after: '2999-01-01T00:00:00Z' },
+        },
+        agentCtx('ag-1', 'chat-1'),
+      );
+      expect(created.ok).toBe(true);
+      if (!created.ok) return;
+      const { session_id, series_id, row_id } = created.data as {
+        session_id: string;
+        series_id: string;
+        row_id: string;
+      };
+
+      const db = new Database(inboundDbPath('ag-1', session_id));
+      db.prepare('UPDATE messages_in SET content = ? WHERE id = ?').run(
+        JSON.stringify({ prompt: 'x', script: null, originSessionId: null, provenance: { triggeredBy: 'ghost' } }),
+        row_id,
+      );
+      db.close();
+
+      const got = await dispatch({ id: 'prov-9-get', command: 'tasks-get', args: { id: series_id } }, agentCtx());
+      expect(got.ok).toBe(true);
+      if (got.ok) {
+        const gd = got.data as Record<string, unknown>;
+        expect(gd.triggered_by).toBeNull();
+        expect(gd.reason).toBeNull();
+      }
+    });
+
+    it('a provenance key explicitly present but null is treated identically to an absent key', async () => {
+      const created = await dispatch(
+        {
+          id: 'prov-10',
+          command: 'tasks-create',
+          args: { prompt: 'x', name: 'prov-explicit-null', process_after: '2999-01-01T00:00:00Z' },
+        },
+        agentCtx('ag-1', 'chat-1'),
+      );
+      expect(created.ok).toBe(true);
+      if (!created.ok) return;
+      const { session_id, series_id, row_id } = created.data as {
+        session_id: string;
+        series_id: string;
+        row_id: string;
+      };
+
+      const db = new Database(inboundDbPath('ag-1', session_id));
+      db.prepare('UPDATE messages_in SET content = ? WHERE id = ?').run(
+        JSON.stringify({ prompt: 'x', script: null, originSessionId: null, provenance: null }),
+        row_id,
+      );
+      db.close();
+
+      const got = await dispatch({ id: 'prov-10-get', command: 'tasks-get', args: { id: series_id } }, agentCtx());
+      expect(got.ok).toBe(true);
+      if (got.ok) expect((got.data as Record<string, unknown>).triggered_by).toBeNull();
+    });
+
+    // review round 1 (blind-hunter): "provenance is fixed at creation" is a
+    // hard invariant elsewhere in this initiative — confirm ncl tasks
+    // update's prompt-merge path doesn't accidentally wipe it.
+    it("ncl tasks update (prompt change) leaves the task's own provenance untouched", async () => {
+      const created = await dispatch(
+        {
+          id: 'prov-11',
+          command: 'tasks-create',
+          args: {
+            prompt: 'original',
+            name: 'prov-update',
+            process_after: '2999-01-01T00:00:00Z',
+            reason: 'original reason',
+          },
+        },
+        agentCtx('ag-1', 'chat-1'),
+      );
+      expect(created.ok).toBe(true);
+      if (!created.ok) return;
+      const { series_id } = created.data as { series_id: string };
+
+      const updated = await dispatch(
+        { id: 'prov-11-update', command: 'tasks-update', args: { id: series_id, prompt: 'changed' } },
+        agentCtx(),
+      );
+      expect(updated.ok).toBe(true);
+
+      const got = await dispatch({ id: 'prov-11-get', command: 'tasks-get', args: { id: series_id } }, agentCtx());
+      expect(got.ok).toBe(true);
+      if (got.ok) {
+        const gd = got.data as Record<string, unknown>;
+        expect(gd.prompt).toBe('changed');
+        expect(gd.reason).toBe('original reason');
+        expect(gd.triggered_by).toBe('agent');
+      }
+    });
   });
 
   it('each task gets its own isolated session, and list fans out across them', async () => {

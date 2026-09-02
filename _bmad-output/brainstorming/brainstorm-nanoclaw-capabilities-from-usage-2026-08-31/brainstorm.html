@@ -1,0 +1,717 @@
+<title>Three Bots, One Kitchen</title>
+<style>
+  :root {
+    --board: #e7e0cb;
+    --board-deep: #dcd0ac;
+    --ink: #2b2116;
+    --ink-soft: #5d4d3a;
+    --ink-faint: #8a7a62;
+    --paper: #fbf6e8;
+    --paper-alt: #f2e9d2;
+    --line: rgba(43,33,22,0.2);
+    --line-soft: rgba(43,33,22,0.1);
+    --teal: #2c6d61;
+    --teal-ink: #1c463d;
+    --rust: #b5541f;
+    --rust-ink: #7c3814;
+    --mustard: #ad7c15;
+    --mustard-ink: #7a5a11;
+    --rose: #a24a5e;
+    --rose-ink: #712f3e;
+    --plum: #5c4470;
+    --shadow: 0 10px 24px -14px rgba(43,33,22,0.45);
+    --shadow-lg: 0 22px 40px -20px rgba(43,33,22,0.5);
+    --serif: Georgia, 'Iowan Old Style', 'Noto Serif', 'Times New Roman', serif;
+    --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
+    --hand: 'Segoe Print', 'Bradley Hand', 'Comic Sans MS', var(--sans);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --board: #221c14;
+      --board-deep: #171209;
+      --ink: #f1e6cf;
+      --ink-soft: #cdbc9a;
+      --ink-faint: #a3927278;
+      --paper: #2b2317;
+      --paper-alt: #251e14;
+      --line: rgba(241,230,207,0.22);
+      --line-soft: rgba(241,230,207,0.1);
+      --teal: #63b6a5;
+      --teal-ink: #a9dccf;
+      --rust: #e2884f;
+      --rust-ink: #f3bd8f;
+      --mustard: #e0b04b;
+      --mustard-ink: #f1cd85;
+      --rose: #dc8ba0;
+      --rose-ink: #f0b9c6;
+      --plum: #b79bd1;
+      --shadow: 0 10px 24px -14px rgba(0,0,0,0.6);
+      --shadow-lg: 0 22px 44px -18px rgba(0,0,0,0.7);
+    }
+  }
+  :root[data-theme="dark"] {
+    --board: #221c14;
+    --board-deep: #171209;
+    --ink: #f1e6cf;
+    --ink-soft: #cdbc9a;
+    --ink-faint: #a3927278;
+    --paper: #2b2317;
+    --paper-alt: #251e14;
+    --line: rgba(241,230,207,0.22);
+    --line-soft: rgba(241,230,207,0.1);
+    --teal: #63b6a5;
+    --teal-ink: #a9dccf;
+    --rust: #e2884f;
+    --rust-ink: #f3bd8f;
+    --mustard: #e0b04b;
+    --mustard-ink: #f1cd85;
+    --rose: #dc8ba0;
+    --rose-ink: #f0b9c6;
+    --plum: #b79bd1;
+    --shadow: 0 10px 24px -14px rgba(0,0,0,0.6);
+    --shadow-lg: 0 22px 44px -18px rgba(0,0,0,0.7);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    background:
+      radial-gradient(circle at 8% 4%, var(--board-deep) 0, transparent 55%),
+      radial-gradient(circle at 92% 92%, var(--board-deep) 0, transparent 55%),
+      repeating-radial-gradient(circle at 20% 30%, rgba(43,33,22,0.05) 0 1px, transparent 1px 60px),
+      repeating-radial-gradient(circle at 70% 80%, rgba(43,33,22,0.04) 0 1px, transparent 1px 44px),
+      var(--board);
+    color: var(--ink);
+    font-family: var(--sans);
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+  h1, h2, h3, h4 { font-family: var(--serif); text-wrap: balance; margin: 0; }
+  p { margin: 0; }
+  ::selection { background: var(--rust); color: var(--paper); }
+  a { color: inherit; }
+  a:focus-visible, button:focus-visible { outline: 2px solid var(--teal); outline-offset: 3px; }
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+  }
+
+  .wrap { max-width: 900px; margin: 0 auto; padding: 0 20px 120px; }
+
+  /* ---------- NAV TAB INDEX ---------- */
+  .tabindex {
+    position: fixed; top: 0; right: 0; height: 100vh; width: 44px;
+    display: none; flex-direction: column; justify-content: center; gap: 3px;
+    z-index: 20; padding: 20px 0;
+  }
+  @media (min-width: 1180px) { .tabindex { display: flex; } }
+  .tabindex a {
+    display: block; text-decoration: none; font-family: var(--mono); font-size: 9px;
+    letter-spacing: 0.06em; color: var(--ink-soft); background: var(--paper-alt);
+    border: 1px solid var(--line-soft); border-right: none;
+    padding: 6px 4px; writing-mode: vertical-rl; text-orientation: mixed;
+    border-radius: 6px 0 0 6px; transition: background .15s, color .15s, padding-right .15s;
+  }
+  .tabindex a:hover, .tabindex a:focus-visible { background: var(--teal); color: var(--paper); padding-right: 8px; }
+
+  /* ---------- HERO ---------- */
+  .hero {
+    padding: 76px 20px 40px; text-align: center; position: relative;
+  }
+  .hero .board-tape {
+    display: inline-block; font-family: var(--mono); font-size: 11px; letter-spacing: 0.16em;
+    text-transform: uppercase; color: var(--ink-faint); background: var(--paper-alt);
+    border: 1px solid var(--line-soft); padding: 5px 14px; border-radius: 3px;
+    transform: rotate(-1.5deg);
+  }
+  .hero h1 {
+    font-size: clamp(2.4rem, 6vw, 4rem); font-weight: 700; margin: 22px 0 10px;
+    color: var(--rust-ink); letter-spacing: -0.01em;
+  }
+  .hero .sub {
+    max-width: 560px; margin: 0 auto; color: var(--ink-soft); font-size: 1.05rem;
+  }
+  .hero .meta {
+    margin: 30px auto 0; max-width: 640px; display: flex; flex-wrap: wrap; justify-content: center;
+    gap: 10px 22px; font-family: var(--mono); font-size: 11.5px; color: var(--ink-faint);
+  }
+  .hero .meta b { color: var(--ink-soft); font-weight: 600; }
+  .hero .stitch {
+    margin: 44px auto 0; max-width: 760px; height: 1px;
+    background: repeating-linear-gradient(90deg, var(--line) 0 8px, transparent 8px 16px);
+  }
+
+  /* ---------- SECTION SCAFFOLD ---------- */
+  .tech { margin-top: 84px; position: relative; }
+  .eyebrow { display: flex; align-items: center; gap: 14px; margin-bottom: 6px; }
+  .pin {
+    width: 15px; height: 15px; border-radius: 50%; flex: none;
+    background: radial-gradient(circle at 32% 30%, #fff8, transparent 40%), var(--dot, var(--rust));
+    box-shadow: 0 3px 5px rgba(0,0,0,0.35), inset 0 -2px 3px rgba(0,0,0,0.25);
+  }
+  .eyebrow .num { font-family: var(--mono); font-size: 12px; color: var(--ink-faint); letter-spacing: 0.08em; }
+  .eyebrow .tag {
+    font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.1em; text-transform: uppercase;
+    color: var(--dot, var(--rust)); border: 1px solid currentColor; padding: 2px 8px; border-radius: 20px;
+  }
+  .tech h2 { font-size: clamp(1.5rem, 3.4vw, 2rem); margin: 6px 0 6px; color: var(--ink); }
+  .tech .blurb { color: var(--ink-soft); max-width: 62ch; font-size: 0.97rem; margin-bottom: 26px; }
+  .tech .blurb em { font-style: italic; color: var(--dot, var(--rust-ink)); }
+
+  /* ============ 1. PIRATE LEDGER ============ */
+  .ledger {
+    background: var(--paper); border: 1px solid var(--line-soft); border-radius: 4px;
+    box-shadow: var(--shadow); padding: 26px 26px 18px;
+    background-image: linear-gradient(var(--line-soft) 1px, transparent 1px);
+    background-size: 100% 40px;
+  }
+  .ledger-head {
+    display: flex; justify-content: space-between; align-items: baseline; border-bottom: 2px solid var(--rust);
+    padding-bottom: 10px; margin-bottom: 6px;
+  }
+  .ledger-head .seal {
+    font-size: 20px; color: var(--rust);
+  }
+  .ledger-head span { font-family: var(--mono); font-size: 11px; letter-spacing: 0.14em; color: var(--ink-faint); }
+  .loot { padding: 10px 0; border-bottom: 1px dashed var(--line); }
+  .loot:last-child { border-bottom: none; }
+  .loot .steal { font-family: var(--mono); font-size: 12px; color: var(--rust-ink); }
+  .loot .steal b { text-transform: uppercase; letter-spacing: 0.05em; }
+  .loot .booty { margin-top: 3px; font-size: 0.96rem; }
+  .loot .booty::before { content: '\2192\00a0'; color: var(--rust); font-weight: 700; }
+
+  /* ============ 2. RECEIPT ============ */
+  .receipt-wrap { display: flex; justify-content: center; }
+  .receipt {
+    width: 100%; max-width: 460px; background: var(--paper); color: var(--ink);
+    font-family: var(--mono); font-size: 12.5px; padding: 22px 22px 14px; box-shadow: var(--shadow);
+    position: relative;
+  }
+  .receipt::before, .receipt::after {
+    content: ''; position: absolute; left: 0; right: 0; height: 10px;
+    background-image: linear-gradient(-45deg, transparent 6px, var(--board) 6px), linear-gradient(45deg, transparent 6px, var(--board) 6px);
+    background-size: 12px 12px; background-repeat: repeat-x;
+  }
+  .receipt::before { top: -9px; background-position: left top; transform: scaleY(-1); }
+  .receipt::after { bottom: -9px; }
+  .receipt h3 { font-family: var(--mono); text-align: center; font-size: 13px; letter-spacing: 0.15em; margin-bottom: 2px; }
+  .receipt .store { text-align: center; color: var(--ink-faint); font-size: 10.5px; margin-bottom: 12px; }
+  .rline { display: flex; justify-content: space-between; gap: 10px; padding: 5px 0; border-bottom: 1px dotted var(--line); }
+  .rline .desc { flex: 1; }
+  .rline .price { color: var(--mustard-ink); font-weight: 700; white-space: nowrap; }
+  .rtotal { display: flex; justify-content: space-between; margin-top: 10px; padding-top: 10px; border-top: 2px solid var(--ink); font-weight: 700; }
+  .rfoot { text-align: center; margin-top: 14px; font-size: 10.5px; letter-spacing: 0.12em; color: var(--ink-faint); }
+
+  /* ============ 3. YES-AND CHAIN ============ */
+  .chain { position: relative; padding-left: 26px; }
+  .chain::before { content: ''; position: absolute; left: 8px; top: 6px; bottom: 6px; width: 2px; background: linear-gradient(var(--teal), var(--rose)); }
+  .link { position: relative; margin-bottom: 4px; }
+  .link::before {
+    content: ''; position: absolute; left: -26px; top: 6px; width: 12px; height: 12px; border-radius: 50%;
+    background: var(--teal); border: 2px solid var(--paper); box-shadow: 0 0 0 1px var(--line);
+  }
+  .link .card { background: var(--paper); border: 1px solid var(--line-soft); border-radius: 10px; padding: 12px 16px; box-shadow: var(--shadow); }
+  .link .yesand {
+    font-family: var(--hand); font-size: 13px; color: var(--rose-ink); margin: 6px 0 6px 4px; transform: rotate(-1deg);
+    display: inline-block;
+  }
+  .link:first-child .yesand { display: none; }
+  .link .card p { font-size: 0.95rem; }
+  .link.punch .card { border-color: var(--mustard); background: var(--paper-alt); }
+  .link.punch::before { background: var(--mustard); }
+
+  /* ============ 4. COLLISION CARDS ============ */
+  .collide-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px,1fr)); gap: 16px; }
+  .collide {
+    background: var(--paper); border: 1px solid var(--line-soft); border-radius: 10px; padding: 16px 18px;
+    box-shadow: var(--shadow);
+  }
+  .atoms { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-family: var(--mono); font-size: 11.5px; }
+  .atom { background: var(--paper-alt); border: 1px solid var(--line); border-radius: 20px; padding: 4px 10px; }
+  .atom.a { color: var(--teal-ink); border-color: var(--teal); }
+  .atom.b { color: var(--rust-ink); border-color: var(--rust); }
+  .atoms .op { color: var(--ink-faint); font-weight: 700; }
+  .collide .result { margin-top: 12px; font-size: 0.95rem; }
+  .collide .result::before { content: '\21d2\00a0'; color: var(--plum); font-weight: 700; }
+
+  /* ============ 5. INFOMERCIAL ============ */
+  .tv {
+    background: linear-gradient(160deg, #16110a, #241a0e 60%, #16110a);
+    border-radius: 16px; padding: 4px; box-shadow: var(--shadow-lg);
+  }
+  :root[data-theme="light"] .tv, .tv { background: linear-gradient(160deg, #1b140b, #2c2011 60%, #1b140b); }
+  .tv-screen {
+    background: repeating-linear-gradient(180deg, #241b10 0 2px, #1c150c 2px 4px);
+    border-radius: 12px; padding: 22px 20px; position: relative; overflow: hidden;
+  }
+  .tv-screen::after {
+    content: 'AS SEEN ON NANOCLAW'; position: absolute; top: 10px; right: 14px; font-family: var(--mono);
+    font-size: 9px; letter-spacing: 0.14em; color: #ffd77a; opacity: 0.7;
+  }
+  .infomercial-item { margin-bottom: 18px; }
+  .infomercial-item:last-child { margin-bottom: 0; }
+  .infomercial-item .badge {
+    display: inline-block; background: #ffde59; color: #3a2400; font-weight: 800; font-family: var(--sans);
+    font-size: 1.05rem; letter-spacing: 0.02em; padding: 3px 10px; border-radius: 3px;
+    transform: rotate(-1deg); box-shadow: 2px 2px 0 #a5710a;
+  }
+  .infomercial-item p { color: #f4e6c8; margin-top: 8px; font-size: 0.96rem; }
+  .butwait {
+    text-align: center; font-family: var(--sans); font-weight: 800; font-style: italic; color: #ff8f6b;
+    margin: 16px 0; font-size: 0.9rem; letter-spacing: 0.03em;
+  }
+  .butwait::before, .butwait::after { content: '\2726'; margin: 0 8px; color: #ffde59; }
+
+  /* ============ 6. GHOST USER INTERVIEW ============ */
+  .notebook {
+    background:
+      linear-gradient(90deg, transparent 34px, var(--rose) 34px, var(--rose) 35px, transparent 35px),
+      repeating-linear-gradient(var(--paper) 0 31px, var(--line-soft) 31px 32px);
+    border-radius: 4px; box-shadow: var(--shadow); padding: 22px 24px 22px 46px;
+  }
+  .ghost { margin-bottom: 22px; }
+  .ghost:last-child { margin-bottom: 0; }
+  .ghost .bubble {
+    position: relative; background: var(--paper-alt); border: 1px solid var(--line); border-radius: 14px 14px 14px 2px;
+    padding: 10px 14px; font-style: italic; color: var(--ink-soft); display: inline-block; max-width: 90%;
+  }
+  .ghost .bubble::before { content: '\201C'; font-family: var(--serif); }
+  .ghost .bubble::after { content: '\201D'; font-family: var(--serif); }
+  .ghost .response { margin-top: 8px; font-size: 0.95rem; }
+  .ghost .response b { color: var(--rose-ink); font-family: var(--mono); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; }
+
+  /* ============ 7. NO RULES ROADMAP ============ */
+  .roadrow { display: grid; grid-template-columns: 1fr auto 1fr; gap: 14px; align-items: center; margin-bottom: 18px; }
+  .roadrow:last-child { margin-bottom: 0; }
+  .ideal, .walkback { padding: 14px 16px; border-radius: 10px; font-size: 0.92rem; }
+  .ideal {
+    background: radial-gradient(circle at 20% 0%, rgba(92,68,112,0.18), transparent 70%), var(--paper);
+    border: 1px dashed var(--plum); color: var(--ink-soft);
+  }
+  .ideal b { display: block; font-family: var(--mono); font-size: 10px; letter-spacing: 0.12em; color: var(--plum); margin-bottom: 4px; }
+  .walkback {
+    background:
+      linear-gradient(var(--line-soft) 1px, transparent 1px), linear-gradient(90deg, var(--line-soft) 1px, transparent 1px),
+      var(--paper);
+    background-size: 12px 12px; border: 1px solid var(--teal);
+  }
+  .walkback b { display: block; font-family: var(--mono); font-size: 10px; letter-spacing: 0.12em; color: var(--teal-ink); margin-bottom: 4px; }
+  .road-arrow { font-size: 1.3rem; color: var(--ink-faint); }
+  @media (max-width: 640px) { .roadrow { grid-template-columns: 1fr; } .road-arrow { display: none; } }
+
+  /* ============ 8. STICKY NOTES ============ */
+  .stickygrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px,1fr)); gap: 20px 18px; padding: 6px; }
+  .sticky {
+    background: var(--mustard); color: #2a1d05; padding: 16px 16px 14px; border-radius: 2px;
+    box-shadow: 4px 6px 10px -4px rgba(0,0,0,0.35); font-size: 0.92rem; position: relative;
+  }
+  :root[data-theme="dark"] .sticky, .sticky { color: #2a1d05; }
+  .sticky:nth-child(6n+1) { background: var(--mustard); transform: rotate(-2deg); }
+  .sticky:nth-child(6n+2) { background: #d99a7c; transform: rotate(1.5deg); }
+  .sticky:nth-child(6n+3) { background: #c9d6a3; transform: rotate(-1deg); }
+  .sticky:nth-child(6n+4) { background: #e8c7d6; transform: rotate(2deg); }
+  .sticky:nth-child(6n+5) { background: #b9dbd6; transform: rotate(-1.5deg); }
+  .sticky:nth-child(6n+6) { background: #f0d98a; transform: rotate(1deg); }
+  .sticky .q { font-family: var(--serif); font-weight: 700; font-size: 1.02rem; line-height: 1.3; }
+  .sticky .a { margin-top: 10px; font-family: var(--mono); font-size: 11px; letter-spacing: 0.02em; opacity: 0.82; }
+  .sticky .a::before { content: '\2192 '; }
+
+  /* ============ 9. SCRAPBOOK ============ */
+  .scrapbook { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px,1fr)); gap: 22px 16px; }
+  .polaroid {
+    background: var(--paper); padding: 10px 10px 14px; box-shadow: var(--shadow);
+    position: relative;
+  }
+  .polaroid:nth-child(odd) { transform: rotate(-1.6deg); }
+  .polaroid:nth-child(even) { transform: rotate(1.6deg); }
+  .polaroid::before {
+    content: ''; position: absolute; top: -8px; left: 50%; transform: translateX(-50%) rotate(-3deg);
+    width: 46px; height: 16px; background: rgba(230,220,180,0.55); border: 1px solid rgba(43,33,22,0.15);
+  }
+  .polaroid .shot {
+    height: 74px; border-radius: 2px; display: flex; align-items: center; justify-content: center;
+    font-size: 22px; color: var(--paper); font-family: var(--serif); font-weight: 700;
+  }
+  .polaroid .cap { margin-top: 10px; font-size: 0.85rem; }
+  .polaroid .cap b { display: block; font-family: var(--hand); font-size: 1rem; margin-bottom: 3px; }
+
+  /* ============ 10. TWO BOTS CHAT ============ */
+  .chatlog { display: flex; flex-direction: column; gap: 10px; }
+  .msg { max-width: 78%; padding: 10px 14px; border-radius: 16px; font-size: 0.93rem; box-shadow: var(--shadow); }
+  .msg.yulanda { align-self: flex-start; background: var(--paper-alt); border: 1px solid var(--teal); border-bottom-left-radius: 4px; }
+  .msg.tina { align-self: flex-end; background: var(--paper-alt); border: 1px solid var(--rose); border-bottom-right-radius: 4px; }
+  .msg .who { font-family: var(--mono); font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; display: block; margin-bottom: 4px; }
+  .msg.yulanda .who { color: var(--teal-ink); }
+  .msg.tina .who { color: var(--rose-ink); }
+  .msg.idea {
+    align-self: center; max-width: 88%; background: var(--plum); color: #fff; border-radius: 10px;
+    text-align: center; margin: 2px 0 14px;
+  }
+  .msg.idea .who { color: #e7dcf0; }
+  .round + .round { margin-top: 2px; }
+
+  /* ============ 11. HELP WANTED ============ */
+  .jobgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px,1fr)); gap: 16px; }
+  .job {
+    background: var(--paper); border: 1px solid var(--line-soft); border-radius: 3px; padding: 16px 16px 12px;
+    box-shadow: var(--shadow); position: relative;
+  }
+  .job::before {
+    content: ''; position: absolute; top: -6px; left: 16px; width: 20px; height: 12px;
+    background: rgba(230,220,180,0.6); border: 1px solid var(--line-soft); transform: rotate(-4deg);
+  }
+  .job .hired {
+    font-family: var(--mono); font-size: 10px; letter-spacing: 0.1em; color: var(--rust-ink); text-transform: uppercase;
+  }
+  .job h4 { font-size: 1.02rem; margin: 4px 0 8px; }
+  .job .role { font-size: 0.92rem; color: var(--ink-soft); }
+  .job-tear { margin-top: 12px; border-top: 1px dashed var(--line); padding-top: 6px; font-family: var(--mono); font-size: 9.5px; color: var(--ink-faint); text-align: right; letter-spacing: 0.08em; }
+
+  /* ============ CLOSING SYNTHESIS ============ */
+  .finale { margin-top: 110px; }
+  .finale-lead { text-align: center; max-width: 620px; margin: 0 auto 40px; }
+  .finale-lead .kicker {
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.2em; color: var(--rose-ink); text-transform: uppercase;
+  }
+  .finale-lead h2 { font-size: clamp(1.8rem, 4.4vw, 2.6rem); margin: 10px 0 14px; color: var(--rust-ink); }
+  .finale-lead p { color: var(--ink-soft); font-size: 1.02rem; }
+
+  .recipe {
+    background: var(--paper); border: 1px solid var(--line-soft); border-radius: 6px; box-shadow: var(--shadow-lg);
+    padding: 34px 34px 30px; position: relative;
+  }
+  .recipe::before {
+    content: ''; position: absolute; top: -10px; left: 50%; transform: translateX(-50%);
+    width: 18px; height: 18px; border-radius: 50%;
+    background: radial-gradient(circle at 32% 30%, #fff8, transparent 40%), var(--rose);
+    box-shadow: 0 4px 6px rgba(0,0,0,0.35), inset 0 -2px 3px rgba(0,0,0,0.25);
+  }
+  .recipe-title { text-align: center; margin-bottom: 4px; font-size: clamp(1.4rem, 3vw, 1.9rem); }
+  .recipe-sub { text-align: center; font-family: var(--mono); font-size: 11px; letter-spacing: 0.1em; color: var(--ink-faint); margin-bottom: 26px; text-transform: uppercase; }
+
+  .threads { display: grid; gap: 16px; }
+  .thread {
+    display: grid; grid-template-columns: 44px 1fr; gap: 14px; align-items: start;
+    padding: 16px 0; border-bottom: 1px solid var(--line-soft);
+  }
+  .thread:last-child { border-bottom: none; }
+  .thread .n {
+    font-family: var(--serif); font-size: 1.7rem; font-weight: 700; color: var(--tcolor, var(--teal));
+    text-align: center; line-height: 1;
+  }
+  .thread h3 { font-size: 1.08rem; margin-bottom: 5px; color: var(--ink); }
+  .thread p { font-size: 0.93rem; color: var(--ink-soft); }
+  .thread .tags { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 6px; }
+  .thread .tags span {
+    font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.05em; text-transform: uppercase;
+    background: var(--paper-alt); border: 1px solid var(--line); border-radius: 20px; padding: 2px 8px; color: var(--ink-faint);
+  }
+  .thread .note {
+    margin-top: 8px; font-size: 0.85rem; font-style: italic; color: var(--tcolor, var(--teal-ink));
+    border-left: 2px solid var(--tcolor, var(--teal)); padding-left: 8px;
+  }
+
+  .special {
+    margin-top: 28px; background: linear-gradient(135deg, var(--rust) 0%, var(--rose) 100%);
+    color: #fff8ef; border-radius: 10px; padding: 22px 24px; box-shadow: var(--shadow);
+    position: relative; overflow: hidden;
+  }
+  .special::before {
+    content: 'TONIGHT\2019S SPECIAL'; position: absolute; top: 10px; right: -34px; transform: rotate(28deg);
+    background: rgba(255,255,255,0.18); font-family: var(--mono); font-size: 10px; letter-spacing: 0.12em;
+    padding: 3px 40px; font-weight: 700;
+  }
+  .special h3 { font-size: 1.15rem; margin-bottom: 8px; color: #fff; }
+  .special ol { margin: 0; padding-left: 20px; font-size: 0.95rem; }
+  .special li { margin-bottom: 6px; }
+  .special .from { margin-top: 12px; font-size: 0.82rem; opacity: 0.88; font-style: italic; }
+
+  .colophon {
+    text-align: center; margin-top: 52px; font-family: var(--mono); font-size: 11px; color: var(--ink-faint);
+    letter-spacing: 0.06em;
+  }
+</style>
+
+<nav class="tabindex" aria-label="Jump to technique">
+  <a href="#pirate">01 Pirate</a>
+  <a href="#zero">02 $0 Mandate</a>
+  <a href="#yesand">03 Yes And</a>
+  <a href="#forced">04 Forced Rel.</a>
+  <a href="#infomercial">05 Infomercial</a>
+  <a href="#ghost">06 Ghost User</a>
+  <a href="#norules">07 No Rules</a>
+  <a href="#onesentence">08 One Sentence</a>
+  <a href="#delight">09 Delight Audit</a>
+  <a href="#twobots">10 Two Bots</a>
+  <a href="#jtbd">11 JTBD</a>
+  <a href="#finale">The Recipe</a>
+</nav>
+
+<header class="hero">
+  <span class="board-tape">household brainstorm &middot; autonomous session</span>
+  <h1>Three Bots, One Kitchen</h1>
+  <p class="sub">A chronological memlog of every idea NanoClaw's brainstorm turned up while asking: what should a personal-assistant multi-agent household system learn to do next?</p>
+  <div class="meta">
+    <span><b>Topic</b> NanoClaw capabilities from usage patterns</span>
+    <span><b>Goal</b> open exploration, no fixed agenda</span>
+    <span><b>Mode</b> autonomous</span>
+    <span><b>Status</b> complete</span>
+    <span><b>Updated</b> 2026-08-31 21:09</span>
+  </div>
+  <div class="stitch"></div>
+</header>
+
+<div class="wrap">
+
+  <section class="tech" id="pirate" style="--dot:var(--rust)">
+    <div class="eyebrow"><span class="pin"></span><span class="num">TECHNIQUE 01 / 11</span><span class="tag">Wild</span></div>
+    <h2>Pirate Code Brainstorm</h2>
+    <p class="blurb">Steal the best bits from anywhere, remix without asking. Eleven pieces of loot, hauled from apps that have nothing to do with a household bot.</p>
+    <div class="ledger">
+      <div class="ledger-head"><span class="seal">&#9760;</span><span>SHIP'S LOOT LEDGER &middot; NO QUESTIONS ASKED</span></div>
+      <div class="loot"><div class="steal"><b>Stolen from</b> Slack's "remind me about this message"</div><div class="booty">React to any inbound message to spawn an <code>ncl</code> task from it.</div></div>
+      <div class="loot"><div class="steal"><b>Stolen from</b> Google Photos memories</div><div class="booty">Agent proactively resurfaces past household events/documents on anniversaries.</div></div>
+      <div class="loot"><div class="steal"><b>Stolen from</b> Notion databases</div><div class="booty">A lightweight shared table (chores, groceries) the agent updates from chat &mdash; no new DB tool.</div></div>
+      <div class="loot"><div class="steal"><b>Stolen from</b> banking apps' auto spend-categorization</div><div class="booty">Auto-tag saved documents by type (bill, contract, medical) for filtered recall.</div></div>
+      <div class="loot"><div class="steal"><b>Stolen from</b> Apple Shortcuts' Suggested Automations</div><div class="booty">After N similar requests, the agent offers to turn a repeated ask into a scheduled task.</div></div>
+      <div class="loot"><div class="steal"><b>Stolen from</b> concierge-app anticipation</div><div class="booty">Opt-in morning pre-fetch of tomorrow's calendar/weather, pushed without being asked.</div></div>
+      <div class="loot"><div class="steal"><b>Stolen from</b> Home Assistant routines</div><div class="booty">Named macros combining calendar + scheduling + documents (e.g. "close out the month").</div></div>
+      <div class="loot"><div class="steal"><b>Stolen from</b> support tools' canned-response templates</div><div class="booty">User teaches a reusable text snippet the agent quotes back verbatim.</div></div>
+      <div class="loot"><div class="steal"><b>Stolen from</b> git blame</div><div class="booty">Household memory facts carry who-added-it / when, for provenance when memory conflicts.</div></div>
+      <div class="loot"><div class="steal"><b>Stolen from</b> airline check-in's 24h-before nudge</div><div class="booty">A generic "N hours before X" nudge pattern, reusable for any calendar item &mdash; not just flights.</div></div>
+    </div>
+  </section>
+
+  <section class="tech" id="zero" style="--dot:var(--mustard)">
+    <div class="eyebrow"><span class="pin"></span><span class="num">TECHNIQUE 02 / 11</span><span class="tag">Constraint</span></div>
+    <h2>The $0 Mandate</h2>
+    <p class="blurb">Achieve the goal spending nothing &mdash; only what NanoClaw already owns. Eight line items, every single one a receipt for a mechanism that already exists.</p>
+    <div class="receipt-wrap">
+      <div class="receipt">
+        <h3>NANOCLAW GENERAL STORE</h3>
+        <div class="store">*** REUSE ONLY &middot; NO NEW PURCHASES ***</div>
+        <div class="rline"><span class="desc">Calendar events tagged "chore:" as a shared task board</span><span class="price">$0.00</span></div>
+        <div class="rline"><span class="desc"><code>ncl</code> tasks as the whole subscription-renewal reminder system</span><span class="price">$0.00</span></div>
+        <div class="rline"><span class="desc">Document-memory recall doubling as a lightweight knowledge base</span><span class="price">$0.00</span></div>
+        <div class="rline"><span class="desc">Existing read-only mounts sharing one grocery list across household + both DMs</span><span class="price">$0.00</span></div>
+        <div class="rline"><span class="desc">Every future integration routed through OneCLI &mdash; never a new secret store</span><span class="price">$0.00</span></div>
+        <div class="rline"><span class="desc">Eval harness scenarios doubling as living behavior docs</span><span class="price">$0.00</span></div>
+        <div class="rline"><span class="desc">Self-mod's approval card as the general "ask permission" UI</span><span class="price">$0.00</span></div>
+        <div class="rline"><span class="desc"><code>ask_user_question</code> / <code>send_card</code> as the entire interactive-form mechanism</span><span class="price">$0.00</span></div>
+        <div class="rtotal"><span>TOTAL</span><span>$0.00</span></div>
+        <div class="rfoot">THANK YOU FOR REUSING WHAT YOU ALREADY BUILT</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="tech" id="yesand" style="--dot:var(--teal)">
+    <div class="eyebrow"><span class="pin"></span><span class="num">TECHNIQUE 03 / 11</span><span class="tag">Collaborative</span></div>
+    <h2>Yes And Building</h2>
+    <p class="blurb">A chain of accepted additions, never negated. One idea about noticing a repeated request grows, link by link, into a whole trust-and-transparency system for automation.</p>
+    <div class="chain">
+      <div class="link"><div class="card"><p>The agent notices a repeated request and offers to automate it.</p></div></div>
+      <div class="link"><span class="yesand">yes, and&hellip;</span><div class="card"><p>it shows the exact <code>ncl tasks create</code> command before confirming.</p></div></div>
+      <div class="link"><span class="yesand">yes, and&hellip;</span><div class="card"><p>the user can edit the cadence in plain language and get it re-rendered.</p></div></div>
+      <div class="link"><span class="yesand">yes, and&hellip;</span><div class="card"><p>once accepted, it logs which chat message triggered the task &mdash; for a later "why do I get this."</p></div></div>
+      <div class="link"><span class="yesand">yes, and&hellip;</span><div class="card"><p>after N runs it asks "still useful?" instead of running forever silently.</p></div></div>
+      <div class="link"><span class="yesand">yes, and&hellip;</span><div class="card"><p>that self-check generalizes into a staleness flag on any recurring task, computed rather than stored.</p></div></div>
+      <div class="link"><span class="yesand">yes, and&hellip;</span><div class="card"><p>the household group gets a monthly digest of everything being quietly tracked, for trust.</p></div></div>
+      <div class="link"><span class="yesand">yes, and&hellip;</span><div class="card"><p>the digest lists exactly what to say to turn any given automation off.</p></div></div>
+      <div class="link"><span class="yesand">yes, and&hellip;</span><div class="card"><p>the digest is itself produced by an <code>ncl</code> task &mdash; dogfooding the very mechanism it explains.</p></div></div>
+      <div class="link punch"><span class="yesand">yes, and&hellip;</span><div class="card"><p><strong>a first-run version of the digest ships the day any automation is created</strong> &mdash; not just monthly.</p></div></div>
+    </div>
+  </section>
+
+  <section class="tech" id="forced" style="--dot:var(--plum)">
+    <div class="eyebrow"><span class="pin"></span><span class="num">TECHNIQUE 04 / 11</span><span class="tag">Creative &middot; random pick</span></div>
+    <h2>Forced Relationships</h2>
+    <p class="blurb">A random object, forced into collision with a NanoClaw system. Eight crashes, eight survivors.</p>
+    <div class="collide-grid">
+      <div class="collide"><div class="atoms"><span class="atom a">sourdough starter (dies of neglect)</span><span class="op">+</span><span class="atom b">calendar</span></div><p class="result">Track "living" recurring commitments (plants, meds, filters) with a neglect signal, not just fire-and-forget.</p></div>
+      <div class="collide"><div class="atoms"><span class="atom a">airport baggage claim (visible wait, ETA)</span><span class="op">+</span><span class="atom b">document memory</span></div><p class="result">Reply immediately with an ETA when a request is mid-OCR/fill, instead of silence.</p></div>
+      <div class="collide"><div class="atoms"><span class="atom a">orchestra conductor (independent parts)</span><span class="op">+</span><span class="atom b">scheduling</span></div><p class="result">Cross-agent-group task coordination, where a household task depends on sub-tasks inside Yulanda's / Tina's own sessions.</p></div>
+      <div class="collide"><div class="atoms"><span class="atom a">compost bin (waste &rarr; soil, over time)</span><span class="op">+</span><span class="atom b">self-mod</span></div><p class="result">Periodically mine <code>deferred-work.md</code> itself for fresh capability suggestions, automated.</p></div>
+      <div class="collide"><div class="atoms"><span class="atom a">lighthouse (passive, always-on signal)</span><span class="op">+</span><span class="atom b">guest resolution</span></div><p class="result">An ambient, on-demand "who's who" lookup, independent of any calendar action.</p></div>
+      <div class="collide"><div class="atoms"><span class="atom a">vending machine (one button, no conversation)</span><span class="op">+</span><span class="atom b">document memory</span></div><p class="result">One-word quick-recall shortcuts for the most-requested documents (insurance card, ID).</p></div>
+      <div class="collide"><div class="atoms"><span class="atom a">tide chart (predictable, known in advance)</span><span class="op">+</span><span class="atom b">calendar</span></div><p class="result">Auto-detect recurring life cycles (school terms, subscription renewals) from existing patterns instead of manual recurrence setup.</p></div>
+      <div class="collide"><div class="atoms"><span class="atom a">flight recorder (reviewed only after a crash)</span><span class="op">+</span><span class="atom b">self-mod</span></div><p class="result">A "what changed right before this broke" query for the operator &mdash; no manual log correlation.</p></div>
+    </div>
+  </section>
+
+  <section class="tech" id="infomercial" style="--dot:#ffb057">
+    <div class="eyebrow"><span class="pin"></span><span class="num">TECHNIQUE 05 / 11</span><span class="tag">Absurdist &middot; random pick</span></div>
+    <h2>Infomercial at 3AM</h2>
+    <p class="blurb">Sell the half-baked idea. <em>But wait, there's more.</em> Six products, none of them for sale, all of them shouting.</p>
+    <div class="tv"><div class="tv-screen">
+      <div class="infomercial-item"><span class="badge">REMINDER RECEIPTS&trade;</span><p>Every <code>ncl</code> task ships with a one-line WHY baked in at creation, readable back any time &mdash; plus who asked for it.</p></div>
+      <div class="butwait">but wait, there's more</div>
+      <div class="infomercial-item"><span class="badge">SESSION SCARS&trade;</span><p>A one-line "previously on this chat" recap on every fresh container spawn, told with a little drama.</p></div>
+      <div class="butwait">but wait, there's more</div>
+      <div class="infomercial-item"><span class="badge">THE MORNING BRIEF&trade;</span><p>Delivered before coffee &mdash; and it doesn't just say what's on today, it says what's MISSING (no RSVP, no signed form yet).</p></div>
+      <div class="butwait">but wait, there's more</div>
+      <div class="infomercial-item"><span class="badge">SELF-MOD INSURANCE&trade;</span><p>Every approved self-mod change ships with a one-command undo. Act now and never fear your own agent.</p></div>
+      <div class="butwait">but wait, there's more</div>
+      <div class="infomercial-item"><span class="badge">THE HOUSEHOLD ROLODEX&trade;</span><p>Every name your family mentions gets remembered automatically &mdash; and it tells you when it's NOT sure, so you never get ghosted.</p></div>
+      <div class="butwait">but wait, there's more</div>
+      <div class="infomercial-item"><span class="badge">DOCUMENT RECEIPTS&trade;</span><p>Texts you back the moment anything's saved / filled / signed &mdash; plus a free monthly "here's everything I'm holding for you" recap.</p></div>
+    </div></div>
+  </section>
+
+  <section class="tech" id="ghost" style="--dot:var(--rose)">
+    <div class="eyebrow"><span class="pin"></span><span class="num">TECHNIQUE 06 / 11</span><span class="tag">Invented &middot; unscoped</span></div>
+    <h2>Ghost User Interview</h2>
+    <p class="blurb">A skeptical, tired end-user narrates their day using the product out loud. Every complaint gets mined for a fix.</p>
+    <div class="notebook">
+      <div class="ghost"><div class="bubble">why do I have to say "ncl" anything, I don't even know what that is</div><div class="response"><b>Response</b> Never require CLI vocabulary from the user; the agent silently translates asks into task creation.</div></div>
+      <div class="ghost"><div class="bubble">it filled the form but I don't know which version is real now</div><div class="response"><b>Response</b> Proactively surface version history in chat when overwriting, not just on request.</div></div>
+      <div class="ghost"><div class="bubble">I sent a voice note about groceries and it just did nothing</div><div class="response"><b>Response</b> Audit that every attachment type gets an acknowledgment, even when the ask is ambiguous.</div></div>
+      <div class="ghost"><div class="bubble">why doesn't the household bot know what Yulanda already told me</div><div class="response"><b>Response</b> A lightweight cross-group delegation query &mdash; not a full memory merge.</div></div>
+      <div class="ghost"><div class="bubble">I said cancel everything and it asked me sixteen questions</div><div class="response"><b>Response</b> A panic-button bulk action that skips per-item confirmation on an explicit bulk request.</div></div>
+    </div>
+  </section>
+
+  <section class="tech" id="norules" style="--dot:var(--plum)">
+    <div class="eyebrow"><span class="pin"></span><span class="num">TECHNIQUE 07 / 11</span><span class="tag">Invented &middot; spirit of Wild</span></div>
+    <h2>No Rules Roadmap</h2>
+    <p class="blurb">Describe the unconstrained ideal, then walk it all the way back to something buildable.</p>
+    <div class="roadrow"><div class="ideal"><b>The ideal</b>the agent just knows everything happening in the house and never needs telling twice</div><div class="road-arrow">&rarr;</div><div class="walkback"><b>The walk-back</b>a cross-group read-only "context memory" search tool, gated by the existing mount-allowlist</div></div>
+    <div class="roadrow"><div class="ideal"><b>The ideal</b>any family member talks and the right agent always picks up, no wiring config</div><div class="road-arrow">&rarr;</div><div class="walkback"><b>The walk-back</b>an engage-pattern auto-scorer replacing the fixed regex, still human-approved before it goes live</div></div>
+    <div class="roadrow"><div class="ideal"><b>The ideal</b>the agent fixes its own bugs live, before you even notice</div><div class="road-arrow">&rarr;</div><div class="walkback"><b>The walk-back</b>capture-and-flag auto-drafts a persona-instruction patch for admin approval &mdash; never auto-applied</div></div>
+    <div class="roadrow"><div class="ideal"><b>The ideal</b>no restart ever needed for any change</div><div class="road-arrow">&rarr;</div><div class="walkback"><b>The walk-back</b>hot-reload <code>instructions.prepend.md</code> text-only edits on next wake, skipping a full container respawn where safe</div></div>
+  </section>
+
+  <section class="tech" id="onesentence" style="--dot:var(--mustard)">
+    <div class="eyebrow"><span class="pin"></span><span class="num">TECHNIQUE 08 / 11</span><span class="tag">Invented &middot; spirit of Constraint</span></div>
+    <h2>One Sentence Spec</h2>
+    <p class="blurb">Every new capability must fit one plain sentence a non-technical user would actually say. Six notes stuck to the board.</p>
+    <div class="stickygrid">
+      <div class="sticky"><div class="q">"Tell me what I forgot before I leave the house."</div><div class="a">Daily pre-departure checklist synthesized from calendar + open document asks.</div></div>
+      <div class="sticky"><div class="q">"Don't make me repeat myself to a different bot."</div><div class="a">Shared fact resolution across the three groups &mdash; promoted from pitfall to real initiative.</div></div>
+      <div class="sticky"><div class="q">"Let me undo the last thing you did."</div><div class="a">A generic last-action undo, one command, mirrors the proven calendar confirm/delete UX pattern.</div></div>
+      <div class="sticky"><div class="q">"Tell me when you're not sure, don't guess."</div><div class="a">A uniform low-confidence disclosure rule across all tools, not just guest resolution.</div></div>
+      <div class="sticky"><div class="q">"Let me ask any of my bots and get the same right answer."</div><div class="a">Shared-fact resolution again &mdash; reinforced as the clear cross-cutting theme.</div></div>
+      <div class="sticky"><div class="q">"Never surprise me with a reminder I don't remember asking for."</div><div class="a">Promotes the receipts / why idea from joke to real spec candidate.</div></div>
+    </div>
+  </section>
+
+  <section class="tech" id="delight" style="--dot:var(--teal)">
+    <div class="eyebrow"><span class="pin"></span><span class="num">TECHNIQUE 09 / 11</span><span class="tag">Invented &middot; spirit of Introspective Delight</span></div>
+    <h2>Delight Audit</h2>
+    <p class="blurb">Recall the moments NanoClaw felt <em>good</em>, not just useful &mdash; then manufacture more of that on purpose.</p>
+    <div class="scrapbook">
+      <div class="polaroid"><div class="shot" style="background:linear-gradient(135deg,var(--teal),var(--plum))">?&rarr;&#10003;</div><div class="cap"><b>The relief of being asked</b>Generalize ask-don't-guess (guest resolution) into a visible trust feature &mdash; maybe a confidence indicator.</div></div>
+      <div class="polaroid"><div class="shot" style="background:linear-gradient(135deg,var(--rust),var(--mustard))">&#10003;</div><div class="cap"><b>The perfect form</b>Extend the "no touch-up needed" bar from one form type to more document types.</div></div>
+      <div class="polaroid"><div class="shot" style="background:linear-gradient(135deg,var(--rose),var(--plum))">&#8635;</div><div class="cap"><b>Nothing was lost</b>Make host-sweep crash recovery <em>felt</em> &mdash; a rare "recovered from a hiccup, nothing lost" note, instead of hiding it.</div></div>
+      <div class="polaroid"><div class="shot" style="background:linear-gradient(135deg,var(--mustard),var(--teal))">&#10004;</div><div class="cap"><b>Caught before you saw it</b>Occasionally surface a "verified this still works" note from the eval harness, so trust is earned consciously.</div></div>
+      <div class="polaroid"><div class="shot" style="background:linear-gradient(135deg,var(--plum),var(--rose))">&#9889;</div><div class="cap"><b>Fast, not global</b>Generalize scoped-admin approval delegation more broadly, beyond just permissions.</div></div>
+    </div>
+  </section>
+
+  <section class="tech" id="twobots" style="--dot:var(--rose)">
+    <div class="eyebrow"><span class="pin"></span><span class="num">TECHNIQUE 10 / 11</span><span class="tag">Invented &middot; spirit of Collaborative</span></div>
+    <h2>Two Bots, One Brain</h2>
+    <p class="blurb">Two installed personas debate a capability from their own lens, alternating. Yulanda runs the household calendar's cousin; Tina keeps things quiet in a personal DM.</p>
+    <div class="chatlog">
+      <div class="round">
+        <div class="msg yulanda"><span class="who">Yulanda</span>I want more CLI power.</div>
+        <div class="msg tina"><span class="who">Tina</span>I never want to see "ncl" in chat, ever.</div>
+        <div class="msg idea"><span class="who">Idea</span>Extend <code>cli_scope</code>'s pattern to tool-response verbosity, not just command access.</div>
+      </div>
+      <div class="round">
+        <div class="msg yulanda"><span class="who">Yulanda</span>Self-mod approvals going to admin? Fine by me.</div>
+        <div class="msg tina"><span class="who">Tina</span>What if I want to approve MY bot's tiny changes without waking Uriel at midnight?</div>
+        <div class="msg idea"><span class="who">Idea</span>Scoped self-approval for low-risk self-mod categories, still logged.</div>
+      </div>
+      <div class="round">
+        <div class="msg yulanda"><span class="who">Yulanda</span>I coordinate two people's calendars at once.</div>
+        <div class="msg tina"><span class="who">Tina</span>My personal bots each only see one.</div>
+        <div class="msg idea"><span class="who">Idea</span>An opt-in one-way summary push from a personal DM into household &mdash; not a full memory merge.</div>
+      </div>
+      <div class="round">
+        <div class="msg yulanda"><span class="who">Yulanda</span>I need explicit confirmation for anything destructive.</div>
+        <div class="msg tina"><span class="who">Tina</span>My world is almost all read-only chat.</div>
+        <div class="msg idea"><span class="who">Idea</span>A per-agent-group risk profile tuning default confirmation friction, instead of one global default.</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="tech" id="jtbd" style="--dot:var(--rust)">
+    <div class="eyebrow"><span class="pin"></span><span class="num">TECHNIQUE 11 / 11</span><span class="tag">Chosen &middot; Structured</span></div>
+    <h2>Job to Be Done</h2>
+    <p class="blurb">What is the household actually hiring NanoClaw to do, independent of any existing feature? Seven job postings, all currently filled by one very tired assistant.</p>
+    <div class="jobgrid">
+      <div class="job"><div class="hired">Help Wanted</div><h4>Family's shared memory</h4><p class="role">So no one has to be the one who remembers everything &mdash; a lightweight cross-group "family facts" layer beyond calendar/documents (birthdays, sizes, preferences).</p><div class="job-tear">ref&nbsp;#86</div></div>
+      <div class="job"><div class="hired">Help Wanted</div><h4>Turn scattered admin into <em>done</em></h4><p class="role">Not just tracked &mdash; a "close the loop" nudge when a form is filled/saved but never actually sent anywhere.</p><div class="job-tear">ref&nbsp;#87</div></div>
+      <div class="job"><div class="hired">Help Wanted</div><h4>Buffer against social cost</h4><p class="role">Forgetting a gift or an RSVP hurts more than forgetting a chore &mdash; relationship-context reminders get different urgency framing than a plain chore.</p><div class="job-tear">ref&nbsp;#88</div></div>
+      <div class="job"><div class="hired">Help Wanted</div><h4>Make bureaucracy less painful</h4><p class="role">A guided multi-step macro chaining save&rarr;fill&rarr;sign&rarr;done for known bundles like school forms.</p><div class="job-tear">ref&nbsp;#89</div></div>
+      <div class="job"><div class="hired">Help Wanted</div><h4>Extend itself, stay trustworthy</h4><p class="role">A monthly self-mod audit digest, building on the existing approval log.</p><div class="job-tear">ref&nbsp;#90</div></div>
+      <div class="job"><div class="hired">Help Wanted</div><h4>Catch the repeated favor</h4><p class="role">Generalize the calendar idempotency/duplicate-confirm pattern to documents and tasks.</p><div class="job-tear">ref&nbsp;#91</div></div>
+      <div class="job"><div class="hired">Help Wanted</div><h4>Know urgent from someday</h4><p class="role">An explicit priority field, surfaced consistently across tasks, reminders, and documents.</p><div class="job-tear">ref&nbsp;#92</div></div>
+    </div>
+  </section>
+
+  <section class="finale" id="finale">
+    <div class="finale-lead">
+      <div class="kicker">The synthesis</div>
+      <h2>The Recipe That Emerged</h2>
+      <p>Eleven techniques, one long night of reuse and absurdity and quiet honesty about a tired user's day. Boiled down, the same five flavors kept coming back &mdash; sometimes as a joke, sometimes as a walk-back, sometimes twice in the same technique.</p>
+    </div>
+    <div class="recipe">
+      <div class="recipe-title">Five Threads, One Household</div>
+      <div class="recipe-sub">Raw yield: 76 ideas across 11 techniques</div>
+      <div class="threads">
+        <div class="thread" style="--tcolor:var(--teal-ink)">
+          <div class="n">1</div>
+          <div>
+            <h3>Shared-fact / context resolution across the three agent groups</h3>
+            <p>Independently reinvented four separate times &mdash; the strongest, most-repeated signal in the whole session. Yulanda, the household group, and Tina are isolated on purpose, but the ideas kept asking the same question: why should a fact told to one bot be a stranger to the other two.</p>
+            <div class="tags"><span>Ghost User Interview</span><span>One Sentence Spec &times;2</span><span>Two Bots One Brain</span></div>
+            <div class="note">Matches a pitfall already logged in CLAUDE.md &mdash; this isn't a new problem, it's a recurring one finally getting counted.</div>
+          </div>
+        </div>
+        <div class="thread" style="--tcolor:var(--rust-ink)">
+          <div class="n">2</div>
+          <div>
+            <h3>Transparency &amp; provenance for anything automated</h3>
+            <p>Receipts, "why," and "who asked for it" &mdash; one idea wearing three different costumes across the night: a chain-build, an infomercial punchline, and a plain-English spec.</p>
+            <div class="tags"><span>Yes And Building</span><span>Infomercial at 3AM</span><span>One Sentence Spec</span></div>
+          </div>
+        </div>
+        <div class="thread" style="--tcolor:var(--plum)">
+          <div class="n">3</div>
+          <div>
+            <h3>Trust via visible uncertainty</h3>
+            <p>"Ask, don't guess." What already works for guest resolution wants to become a cross-cutting persona rule &mdash; generalized from one delightful moment into a standing promise.</p>
+            <div class="tags"><span>Delight Audit</span><span>One Sentence Spec</span></div>
+          </div>
+        </div>
+        <div class="thread" style="--tcolor:var(--mustard-ink)">
+          <div class="n">4</div>
+          <div>
+            <h3>Two proven patterns, ready to generalize system-wide</h3>
+            <p>The calendar idempotency/duplicate-guard and document version-history/undo already work and are already loved. The idea isn't to invent something new &mdash; it's to stop keeping them calendar-only and document-only.</p>
+            <div class="tags"><span>Job to Be Done</span><span>Infomercial at 3AM</span><span>One Sentence Spec</span></div>
+          </div>
+        </div>
+        <div class="thread" style="--tcolor:var(--rose-ink)">
+          <div class="n">5</div>
+          <div>
+            <h3>Persona-tuned friction &amp; risk profiles</h3>
+            <p>A per-agent-group risk profile that scopes self-mod and confirmation strictness &mdash; Yulanda's CLI-power household calendar isn't Tina's read-only-chat world, and the guardrails shouldn't pretend they are.</p>
+            <div class="tags"><span>Two Bots One Brain</span><span>The $0 Mandate</span><span>No Rules Roadmap</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="special">
+        <h3>Carried forward to a future spec pass</h3>
+        <ol>
+          <li><strong>Shared-fact resolution</strong> across Yulanda, household, and Tina.</li>
+          <li><strong>Provenance / receipts</strong> for anything the agent does on its own.</li>
+        </ol>
+        <div class="from">Chosen as the two most buildable, highest-repeat-signal candidates &mdash; next stop, a <code>bmad-spec</code> pass.</div>
+      </div>
+    </div>
+    <div class="colophon">brainstorm-nanoclaw-capabilities-from-usage-2026-08-31 &middot; mode: autonomous &middot; status: complete</div>
+  </section>
+
+</div>
